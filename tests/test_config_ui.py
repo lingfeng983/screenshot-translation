@@ -28,14 +28,20 @@ from PyQt5.QtCore import QTimer
 
 
 def _spin(wait_ms, app, condition=None, timeout_ms=30000):
-    """驱动事件循环直到条件满足或超时"""
+    """驱动事件循环直到条件满足或超时（无condition时按时长驱动）"""
+    if condition is None:
+        end = time.time() + wait_ms / 1000
+        while time.time() < end:
+            app.processEvents()
+            time.sleep(0.02)
+        return False
     deadline = time.time() + timeout_ms / 1000
     while time.time() < deadline:
         app.processEvents()
-        if condition is not None and condition():
+        if condition():
             return True
         time.sleep(0.02)
-    return condition is not None and condition()
+    return False
 
 
 def main():
@@ -66,14 +72,28 @@ def _run_tests(app, failures):
     from main import MainApp, ConfigWindow
     from managers.translation import TranslationManager
     from managers.ocr import OCRManager
+    from PyQt5.QtWidgets import QMessageBox
+
+    # 保存流程会弹模态 QMessageBox，无头测试没人点确定会永久阻塞：
+    # 把 information/critical/warning 全部替换为记录型假弹窗
+    messagebox_log = []
+
+    def _fake_box(*args, **kwargs):
+        messagebox_log.append(args[1] if len(args) >= 2 else str(args))
+        return QMessageBox.Ok
+
+    QMessageBox.information = staticmethod(_fake_box)
+    QMessageBox.critical = staticmethod(_fake_box)
+    QMessageBox.warning = staticmethod(_fake_box)
 
     def check(name, fn):
+        print(f"▶ 开始: {name}", flush=True)
         try:
             fn()
-            print(f"✅ {name}")
+            print(f"✅ {name}", flush=True)
         except Exception as e:
             failures.append(f"{name}: {e}")
-            print(f"❌ {name}: {e}")
+            print(f"❌ {name}: {e}", flush=True)
 
     main_app = MainApp()
     main_app.app = app
@@ -211,7 +231,9 @@ def _run_tests(app, failures):
         win.target_lang_combo.setCurrentIndex(win.target_lang_combo.findData('ja'))
         win.ocr_type_combo.setCurrentIndex(win.ocr_type_combo.findData('baidu_cloud'))
         _spin(100, app)
-        win._on_save()  # hotkey_manager=None → 警告分支后 return，但配置已写盘
+        win._on_save()  # QMessageBox 已被替换为假弹窗，不会阻塞
+        assert messagebox_log and messagebox_log[-1] == "保存成功", \
+            f"应弹出保存成功提示: {messagebox_log}"
         cm = win.config_manager
         assert cm.get_api_type() == 'llm'
         assert cm.get_target_lang() == 'ja'
