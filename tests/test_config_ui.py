@@ -21,7 +21,7 @@ import time
 import shutil
 import subprocess
 
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from PyQt5.QtWidgets import QApplication, QLineEdit
 from PyQt5.QtCore import QTimer

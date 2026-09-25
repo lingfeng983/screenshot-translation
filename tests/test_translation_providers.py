@@ -8,7 +8,8 @@
 
 import sys
 import os
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+# 项目根目录加入 sys.path（tests/ 的上一级）
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 def test_provider_registry():

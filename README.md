@@ -170,10 +170,12 @@ ScreenshotTranslation/
 ├── scripts/
 │   ├── make_release_package.py  # OCR组件分卷打包（上传Release用）
 │   └── setup_ocr.py             # 从Release下载恢复OCR组件
-├── test_translation_providers.py  # 翻译架构回归测试
-├── test_ocr_providers.py          # OCR架构回归测试
-├── test_features.py               # 基础功能回归测试
-├── managers/                # 功能模块
+├── tests/                   # 回归测试（从项目根可直接运行）
+│   ├── test_translation_providers.py  # 翻译架构测试
+│   ├── test_ocr_providers.py          # OCR架构测试
+│   ├── test_features.py               # 基础功能测试
+│   └── test_config_ui.py              # 配置界面测试（开发中）
+├── managers/                # 核心功能模块
 │   ├── provider_common.py   # ★ 插件架构公共基座（注册表/自动发现/基类/降级链）
 │   ├── translation.py       # 翻译管理器（分发/缓存/降级链）
 │   ├── ocr.py               # OCR管理器（分发/重试/降级）
