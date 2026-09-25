@@ -4,7 +4,20 @@
 
 ## 🚀 快速开始
 
-### 首次安装
+### 方式一：单文件 exe（推荐普通用户）
+从 [Releases](https://gitee.com/lingfeng983/screenshot-translation/releases) 下载 `ScreenshotTranslator.exe`（约48MB，单文件、无依赖）：
+
+1. 放到任意目录，双击运行——首次启动自动生成 `config.ini`
+2. 右下角托盘出现图标（若被折叠，点任务栏 `^` 展开并右键图标→设置常显）
+3. **Tesseract OCR 组件不在 exe 内**：从同页 Release 下载 `ocr-components` 分卷包，
+   放到 exe 同目录后运行一次 `setup_ocr.exe / setup_ocr.py`，或手动解压到 exe 旁的 `resources/`
+4. 按 `Alt+Z` 截图翻译
+
+> 使用百度云OCR/LLM 等需密钥的服务时，右键托盘→设置 填入密钥。
+
+### 方式二：源码运行（开发者）
+
+#### 首次安装
 ```bash
 # 1. 克隆仓库
 git clone https://gitee.com/lingfeng983/screenshot-translation.git
@@ -167,6 +180,7 @@ ScreenshotTranslation/
 ├── CHANGELOG.md         # 更新日志
 ├── requirements.txt     # 依赖列表
 ├── run_fixed.bat        # 启动脚本
+├── screenshot-translator.spec  # PyInstaller单文件打包配置
 ├── scripts/
 │   ├── make_release_package.py  # OCR组件分卷打包（上传Release用）
 │   └── setup_ocr.py             # 从Release下载恢复OCR组件
@@ -177,6 +191,7 @@ ScreenshotTranslation/
 │   └── test_config_ui.py              # 配置界面测试（开发中）
 ├── managers/                # 核心功能模块
 │   ├── provider_common.py   # ★ 插件架构公共基座（注册表/自动发现/基类/降级链）
+│   ├── app_paths.py         # ★ 路径定位（源码/exe双形态：配置/缓存/日志/资源）
 │   ├── translation.py       # 翻译管理器（分发/缓存/降级链）
 │   ├── ocr.py               # OCR管理器（分发/重试/降级）
 │   ├── screenshot.py        # 截图遮罩（磁吸/气泡/角标记）与结果对话框
@@ -213,6 +228,15 @@ ScreenshotTranslation/
 ```
 新翻译API放 `managers/providers/`，新OCR引擎放 `managers/ocr_providers/`，
 定义 `name`/`display_name`/`config_fields` + 工作方法 + `register(registry)` 即自动上架配置界面。
+
+### 打包单文件 exe
+```bash
+pip install pyinstaller
+python -m PyInstaller screenshot-translator.spec --noconfirm
+# 产物：dist/ScreenshotTranslator.exe（约48MB，含图标，无控制台黑窗）
+```
+exe 内不含 Tesseract 组件（见 Release 分卷包说明），首次运行会在 exe 同目录
+生成 `config.ini`、日志与缓存文件。
 
 ## 🆘 技术支持
 

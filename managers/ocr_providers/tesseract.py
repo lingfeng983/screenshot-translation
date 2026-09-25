@@ -12,6 +12,7 @@ Tesseract OCR 提供者（本地离线识别）
 import logging
 import os
 
+from .. import app_paths
 from .base import OCRProvider
 
 logger = logging.getLogger('screenshot-translation')
@@ -27,22 +28,12 @@ except ImportError as e:
 
 def _find_tesseract_cmd():
     """
-    探测 tesseract 可执行文件路径
+    探测 tesseract 可执行文件路径（由 app_paths 统一提供候选）
 
     Returns:
         str 或 None: 首个存在的路径；均未命中返回None（用系统PATH）
     """
-    project_root = os.path.dirname(os.path.dirname(
-        os.path.dirname(os.path.abspath(__file__))))
-    candidates = [
-        # 项目内置的便携版tesseract
-        os.path.join(project_root, 'resources', 'tesseract', 'tesseract.exe'),
-        os.path.join(os.environ.get('ProgramFiles', ''),
-                     'Tesseract-OCR', 'tesseract.exe'),
-        os.path.join(os.environ.get('LOCALAPPDATA', ''),
-                     'Tesseract-OCR', 'tesseract.exe'),
-    ]
-    for exe in candidates:
+    for exe in app_paths.tesseract_cmd_candidates():
         if exe and os.path.isfile(exe):
             return exe
     return None
@@ -53,18 +44,9 @@ def _find_tessdata_path():
     查找可用的 tessdata 训练数据目录
 
     Returns:
-        str: 首个包含 eng 与 chi_sim 训练数据的目录；均未命中时返回项目内默认路径
+        str: 首个包含 eng 与 chi_sim 训练数据的目录；均未命中时返回首个候选路径
     """
-    project_root = os.path.dirname(os.path.dirname(
-        os.path.dirname(os.path.abspath(__file__))))
-    paths = [
-        os.path.join(project_root, 'resources', 'tessdata'),
-        os.path.join(os.getcwd(), 'tessdata'),
-        os.path.join(os.environ.get('ProgramFiles', ''),
-                     'Tesseract-OCR', 'tessdata'),
-        os.path.join(os.environ.get('LOCALAPPDATA', ''),
-                     'Tesseract-OCR', 'tessdata'),
-    ]
+    paths = app_paths.tessdata_candidates()
     for path in paths:
         if os.path.exists(path) and os.path.isdir(path):
             if (os.path.exists(os.path.join(path, 'eng.traineddata'))

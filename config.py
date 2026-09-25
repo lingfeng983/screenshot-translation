@@ -8,20 +8,23 @@
 import configparser
 import os
 
+from managers import app_paths
+
 class ConfigManager:
     """
     配置管理器类
     负责处理配置文件的读写操作
     """
 
-    def __init__(self, config_file='config.ini'):
+    def __init__(self, config_file=None):
         """
         初始化配置管理器
 
         Args:
-            config_file (str): 配置文件路径
+            config_file (str): 配置文件路径；None时按运行形态自动定位
+                （源码→项目根，exe→exe同目录）
         """
-        self.config_file = config_file
+        self.config_file = config_file or app_paths.config_file()
         self.config = configparser.ConfigParser()
         self._load_config()
 

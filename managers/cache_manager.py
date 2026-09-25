@@ -24,18 +24,21 @@ class CacheManager:
     缓存条数有上限（LRU 淘汰），写盘按次数节流，进程退出时兜底落盘。
     """
 
-    def __init__(self, cache_file: str = "translation_cache.json",
+    def __init__(self, cache_file: str = None,
                  expire_hours: int = 24, max_entries: int = 1000,
                  flush_every: int = 10):
         """
         初始化缓存管理器
 
         Args:
-            cache_file (str): 缓存文件路径
+            cache_file (str): 缓存文件路径；None时按运行形态自动定位
             expire_hours (int): 缓存过期时间（小时）
             max_entries (int): 缓存最大条数，超出按最旧条目淘汰
             flush_every (int): 每累积多少次写入才落盘一次
         """
+        if cache_file is None:
+            from . import app_paths
+            cache_file = app_paths.cache_file()
         self.cache_file = cache_file
         self.expire_hours = expire_hours
         self.max_entries = max_entries

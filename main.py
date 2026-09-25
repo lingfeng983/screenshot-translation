@@ -16,11 +16,13 @@ from PyQt5.QtWidgets import (
 )
 
 # 配置日志（全局唯一入口，其他模块只使用 logging.getLogger）
+# 日志路径按运行形态定位：源码→项目根，exe→exe同目录（可写）
+from managers import app_paths
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('screenshot_translation.log'),
+        logging.FileHandler(app_paths.log_file(), encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
