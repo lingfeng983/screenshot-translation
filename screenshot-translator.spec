@@ -6,16 +6,30 @@ PyInstaller 单文件打包配置
 产物：dist/ScreenshotTranslator.exe（单文件，含图标；Tesseract 首运下载或跟随Release）
 """
 
+import os
 from PyInstaller.utils.hooks import collect_data_files
 
 block_cipher = None
 
 # 随 exe 分发的只读资源（解包到 _MEIPASS/resources/...）
+# Tesseract 运行最小集：若存在则整体打进 exe（由 scripts/collect_ocr_bundle.py 生成）
 datas = [
     ('resources/icon.png', 'resources'),
     ('resources/icon.ico', 'resources'),
     ('config.example.ini', '.'),
 ]
+
+_ocr_bundle = os.path.join(SPECPATH, 'dist', 'ocr-bundle')
+if os.path.isdir(_ocr_bundle):
+    # 打包为 resources/tesseract/... 与 resources/tessdata/...
+    for _root, _dirs, _files in os.walk(_ocr_bundle):
+        for _f in _files:
+            _abs = os.path.join(_root, _f)
+            _arc = os.path.join('resources', os.path.relpath(_abs, _ocr_bundle))
+            datas.append((_abs, os.path.dirname(_arc)))
+    print(f'>>> 已包含 OCR 最小集: {_ocr_bundle}')
+else:
+    print('>>> 警告: 未找到 OCR bundle，exe 将不含 Tesseract（运行时需自行提供）')
 
 # 隐藏导入：pystray 的 Windows 后端与键盘库按需动态加载
 hiddenimports = [

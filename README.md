@@ -5,12 +5,11 @@
 ## 🚀 快速开始
 
 ### 方式一：单文件 exe（推荐普通用户）
-从 [Releases](https://gitee.com/lingfeng983/screenshot-translation/releases) 下载 `ScreenshotTranslator.exe`（约48MB，单文件、无依赖）：
+从 [Releases](https://gitee.com/lingfeng983/screenshot-translation/releases) 下载 `ScreenshotTranslator.exe`（约182MB，单文件）：
 
 1. 放到任意目录，双击运行——首次启动自动生成 `config.ini`
 2. 右下角托盘出现图标（若被折叠，点任务栏 `^` 展开并右键图标→设置常显）
-3. **Tesseract OCR 组件不在 exe 内**：从同页 Release 下载 `ocr-components` 分卷包，
-   放到 exe 同目录后运行一次 `setup_ocr.exe / setup_ocr.py`，或手动解压到 exe 旁的 `resources/`
+3. **Tesseract OCR 已内置**（含中英文语言包），无需额外下载，开箱即用
 4. 按 `Alt+Z` 截图翻译
 
 > 使用百度云OCR/LLM 等需密钥的服务时，右键托盘→设置 填入密钥。
@@ -231,12 +230,15 @@ ScreenshotTranslation/
 
 ### 打包单文件 exe
 ```bash
-pip install pyinstaller
+# 1. 收集 Tesseract 运行最小集（排除约60MB训练工具）
+python scripts/collect_ocr_bundle.py
+
+# 2. 打包（自动包含 OCR 最小集）
 python -m PyInstaller screenshot-translator.spec --noconfirm
-# 产物：dist/ScreenshotTranslator.exe（约48MB，含图标，无控制台黑窗）
+# 产物：dist/ScreenshotTranslator.exe（约182MB，含图标与内置OCR，无控制台黑窗）
 ```
-exe 内不含 Tesseract 组件（见 Release 分卷包说明），首次运行会在 exe 同目录
-生成 `config.ini`、日志与缓存文件。
+exe 首次运行会在同目录生成 `config.ini`、日志与缓存文件。
+OCR 组件随 exe 解包到临时目录运行，无需安装。
 
 ## 🆘 技术支持
 

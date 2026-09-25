@@ -53,10 +53,13 @@
 - **仓库只保留源码**：Tesseract 便携包+语言数据（约110MB）不入库；
   `scripts/make_release_package.py` 打为分卷 zip（≤90MB/卷）上传 Gitee Release 附件，
   克隆端 `scripts/setup_ocr.py` 自动下载、SHA256 校验、解压，支持 `--local` 离线恢复
-- **单文件 exe 分发**：`screenshot-translator.spec` + PyInstaller 打出约48MB单文件
-  （含图标、无控制台）；新增 `managers/app_paths.py` 统一双形态路径定位——
+- **单文件 exe 分发**：`screenshot-translator.spec` + PyInstaller 打出单文件
+  （含图标、无控制台、内置Tesseract OCR与中英文语言包，开箱即用，约182MB）；
+  新增 `managers/app_paths.py` 统一双形态路径定位——
   exe 下只读资源走 `_MEIPASS`，可写的配置/缓存/日志落在 exe 同目录，
   首次启动自动生成默认 config.ini
+- **OCR 瘦身打包**：`scripts/collect_ocr_bundle.py` 抽取运行必需的
+  tesseract.exe+DLL+eng/chi_sim（排除约60MB训练工具），打前先收集最小集
 
 ## [历史版本]
 
