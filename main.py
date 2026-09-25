@@ -188,11 +188,23 @@ class MainApp:
                     # 显示配置窗口
                     self.open_config_window()
                 else:
-                    # 默认行为：静默驻留托盘，托盘提示用户如何打开设置
-                    if self.tray_manager:
-                        self.tray_manager.show_notification(
-                            "截图翻译工具",
-                            "已最小化到托盘运行\n按 Alt+Z 截图翻译，右键托盘图标打开设置")
+                    # 默认行为：静默驻留托盘。通知用独立计时器延迟发出：
+                    # 1) 避开 pystray Icon.run 未就绪的窗口期
+                    # 2) QTimer 在 exec_ 之前创建不触发（Qt对象尚未关联事件循环），
+                    #    threading.Timer 不依赖 Qt，最可靠
+                    def _startup_notice():
+                        try:
+                            if self.tray_manager:
+                                self.tray_manager.show_notification(
+                                    "截图翻译工具",
+                                    "已在右下角托盘运行。左键单击图标：截图翻译；"
+                                    "双击：打开设置")
+                        except Exception as e:
+                            logger.warning(f"启动通知失败: {e}")
+
+                    notice_timer = threading.Timer(2.0, _startup_notice)
+                    notice_timer.daemon = True
+                    notice_timer.start()
             except Exception as e:
                 logger.error(f"处理启动行为失败: {e}")
 

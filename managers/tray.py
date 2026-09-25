@@ -271,9 +271,9 @@ class SystemTrayManager:
                 self.tray_icon.notify(message, title)
                 # 部分平台通知常驻，几秒后移除
                 threading.Timer(5.0, self._remove_notification).start()
-                print(f"托盘通知: {title} - {message}")
+                logger.info(f"托盘通知: {title} - {message}")
             else:
-                print(f"托盘通知(无图标): {title} - {message}")
+                logger.warning("托盘图标未就绪，通知未显示")
         except Exception as e:
             print(f"显示通知失败: {e}")
 
