@@ -50,6 +50,9 @@
 - 默认快捷键：`Ctrl+Shift+A` → `Alt+Z`（配置项 `alt+z`，按下直接截图翻译）
 - 配置窗口更名"设置"，启动默认最小化到托盘（托盘通知提示用法）
 - 旧配置文件自动迁移：自动补齐 `[OCR]`、`[Overlay]` 段
+- **仓库只保留源码**：Tesseract 便携包+语言数据（约110MB）不入库；
+  `scripts/make_release_package.py` 打为分卷 zip（≤90MB/卷）上传 Gitee Release 附件，
+  克隆端 `scripts/setup_ocr.py` 自动下载、SHA256 校验、解压，支持 `--local` 离线恢复
 
 ## [历史版本]
 

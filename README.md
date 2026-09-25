@@ -16,11 +16,18 @@ pip install -r requirements.txt
 # 3. 创建本地配置（含API密钥，不入库）
 copy config.example.ini config.ini
 
-# 4. 首次运行：程序自动下载 Tesseract OCR 组件（约300MB，已加入 .gitignore）
+# 4. 下载 OCR 组件（Tesseract 便携包+语言数据，约110MB，不入仓库，走 Release 附件）
+python scripts/setup_ocr.py
+
+# 5. 启动
 python main.py
 ```
-> Tesseract 便携包与语言包体积较大（约300MB）不入库；若自动下载失败，
-> 手动放置到 `resources/tesseract/`（程序本体）与 `resources/tessdata/`（eng+chi_sim 语言数据）。
+
+> **OCR 组件分发方式**：仓库只保留源码；Tesseract 便携包与语言数据以分卷 zip
+> 附件形式发布在 Gitee [Releases](https://gitee.com/lingfeng983/screenshot-translation/releases)，
+> `scripts/setup_ocr.py` 自动下载、SHA256 校验并解压。
+> 离线环境可用 `python scripts/setup_ocr.py --local <分卷目录>`。
+> 维护者更新组件后运行 `python scripts/make_release_package.py` 重新打包。
 
 ### 启动程序
 ```bash
@@ -160,6 +167,9 @@ ScreenshotTranslation/
 ├── CHANGELOG.md         # 更新日志
 ├── requirements.txt     # 依赖列表
 ├── run_fixed.bat        # 启动脚本
+├── scripts/
+│   ├── make_release_package.py  # OCR组件分卷打包（上传Release用）
+│   └── setup_ocr.py             # 从Release下载恢复OCR组件
 ├── test_translation_providers.py  # 翻译架构回归测试
 ├── test_ocr_providers.py          # OCR架构回归测试
 ├── test_features.py               # 基础功能回归测试
