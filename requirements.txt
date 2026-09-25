@@ -1,0 +1,28 @@
+# 项目依赖
+
+# GUI框架
+PyQt5
+
+# 图像处理和截图
+Pillow
+pyautogui
+
+# OCR功能
+pytesseract
+
+# API调用
+requests
+
+# 系统托盘
+pystray
+
+# 全局快捷键
+keyboard
+
+# 其他依赖
+pygetwindow
+pyrect
+
+# 注意：使用前需要安装Tesseract OCR
+# Windows: https://github.com/UB-Mannheim/tesseract/wiki
+# 并确保tesseract.exe在系统PATH中

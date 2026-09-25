@@ -1,0 +1,161 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+OCR管理器
+负责图像文字识别，基于 provider 注册表分发到具体OCR引擎
+
+内置提供者：Tesseract(本地离线)、百度云OCR(在线)、模拟OCR(兜底)
+扩展方式：在 managers/ocr_providers/ 下新建符合约定的模块即可自动注册
+"""
+
+import logging
+
+from .error_handler import error_handler
+from .ocr_providers import ocr_provider_registry
+from .provider_common import ProviderChainManager
+from .retry_handler import RetryHandler
+
+logger = logging.getLogger('screenshot-translation')
+
+# OCR失败重试：识别是本地/在线调用，重试2次间隔短即可
+ocr_retry_handler = RetryHandler(max_attempts=2, base_delay=0.5)
+
+# 识别结果错误标记，与翻译的 [翻译失败] 风格一致
+_OCR_FAIL_PREFIX = '[OCR识别失败'
+
+
+class OCRManager(ProviderChainManager):
+    """
+    OCR管理器类
+    基于provider注册表分发OCR请求，自带重试与降级；
+    分发/重试/失败文本转换由 ProviderChainManager 提供
+    """
+
+    # 链式调度基类配置
+    _registry = ocr_provider_registry
+    _default_provider_name = 'tesseract'
+    _failure_prefix = _OCR_FAIL_PREFIX
+
+    def __init__(self, config_manager=None):
+        """
+        初始化OCR管理器
+
+        Args:
+            config_manager: 配置管理器实例（读取 [OCR] 段）
+        """
+        self.config_manager = config_manager
+        self.ocr_type = 'tesseract'  # 默认本地Tesseract
+        self._load_config()
+
+        logger.info(f"OCR管理器初始化完成，当前引擎: {self.ocr_type}，"
+                    f"可用提供者: {ocr_provider_registry.names()}")
+
+    def _load_config(self):
+        """加载OCR引擎配置"""
+        try:
+            if self.config_manager:
+                self.ocr_type = self.config_manager.get_ocr_type()
+                logger.info(f"从配置加载OCR引擎: {self.ocr_type}")
+        except Exception as e:
+            logger.error(f"加载OCR配置失败: {e}")
+
+    def reload_config(self):
+        """重新加载配置（配置窗口保存后调用）"""
+        self._load_config()
+
+    def set_ocr_type(self, ocr_type):
+        """
+        设置OCR引擎类型
+
+        Args:
+            ocr_type (str): OCR引擎类型
+        """
+        self.ocr_type = ocr_type
+        logger.info(f"OCR引擎已设置为: {ocr_type}")
+
+    def perform_ocr(self, image):
+        """
+        对图像执行OCR识别（带重试与降级）
+
+        降级链：当前引擎(带重试) -> Tesseract -> 模拟OCR
+        保证任何情况下都返回文本，不中断截图翻译流程。
+
+        Args:
+            image (PIL.Image.Image): 待识别的图像
+
+        Returns:
+            str: 识别出的文本；全部失败时返回错误提示文本
+        """
+        provider_cls = self._resolve_provider(self.ocr_type)
+        if provider_cls is None:
+            return f"{_OCR_FAIL_PREFIX}: 无可用OCR引擎]"
+
+        result = self._recognize_via(provider_cls, image)
+
+        # 1) 当前引擎失败时，尝试本地Tesseract兜底
+        if self._is_failure(result):
+            fallback_cls = ocr_provider_registry.get('tesseract')
+            if fallback_cls is not None and fallback_cls is not provider_cls:
+                logger.warning("当前OCR引擎失败，尝试本地Tesseract")
+                fallback_result = self._recognize_via(
+                    fallback_cls, image, retry_handler=ocr_retry_handler)
+                if not self._is_failure(fallback_result):
+                    return fallback_result
+
+        # 2) 最后兜底：模拟OCR，保证流程不中断
+        if self._is_failure(result):
+            mock_cls = ocr_provider_registry.get('mock')
+            if mock_cls is not None:
+                logger.warning("所有OCR引擎均失败，降级为模拟OCR")
+                mock_result = self._recognize_via(mock_cls, image)
+                if not self._is_failure(mock_result):
+                    return mock_result
+
+        return result
+
+    def _recognize_via(self, provider_cls, image, retry_handler=None):
+        """
+        通过指定provider识别，自带重试；失败返回错误文本而非抛异常，
+        保证降级链能继续往下走（由公共基类的 _run_provider 实现）
+
+        Args:
+            provider_cls: OCR provider类
+            image (PIL.Image.Image): 待识别的图像
+            retry_handler: 重试处理器，缺省用OCR重试器
+
+        Returns:
+            str: 识别出的文本，彻底失败时返回 [OCR识别失败...] 文本
+        """
+        def factory():
+            return provider_cls(config_manager=self.config_manager)
+
+        def call(provider):
+            return provider.recognize(image)
+
+        def failure_text(err):
+            if err is not None:
+                return f"{_OCR_FAIL_PREFIX}: {err}]"
+            return f"{_OCR_FAIL_PREFIX}: {provider_cls.display_name}]"
+
+        return self._run_provider(factory, call, failure_text, retry_handler)
+
+    def get_available_languages(self):
+        """
+        获取当前引擎可用的识别语言列表
+
+        Returns:
+            list[str]: 语言代码列表；查询失败时返回默认列表
+        """
+        provider_cls = ocr_provider_registry.get(self.ocr_type)
+        if provider_cls is None:
+            return ['eng', 'chi_sim']
+        try:
+            provider = provider_cls(config_manager=self.config_manager)
+        except Exception as e:
+            logger.error(f"OCR提供者初始化失败: {e}")
+            return ['eng', 'chi_sim']
+        return provider.get_available_languages()
+
+    def handle_ocr_error(self, error):
+        """兼容旧接口：统一走错误处理器"""
+        return error_handler.handle_ocr_error(error)

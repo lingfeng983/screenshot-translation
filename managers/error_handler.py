@@ -1,0 +1,200 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+错误处理工具类
+负责统一处理错误和提供友好的错误提示
+"""
+
+import traceback
+import logging
+from PyQt5.QtWidgets import QMessageBox
+
+from .qt_dispatcher import qt_dispatcher
+
+# 日志配置统一由入口 main.py 完成，此处只获取 logger
+logger = logging.getLogger('screenshot-translation')
+
+class ErrorHandler:
+    """
+    错误处理工具类
+    负责统一处理错误和提供友好的错误提示
+    """
+
+    @staticmethod
+    def handle_error(error, module_name, show_message=True):
+        """
+        处理错误
+
+        Args:
+            error (Exception): 错误对象
+            module_name (str): 模块名称
+            show_message (bool): 是否显示错误提示
+
+        Returns:
+            str: 错误信息
+        """
+        error_message = f"{module_name}模块发生错误: {str(error)}"
+
+        # 记录错误日志
+        logger.error(error_message)
+        logger.error(traceback.format_exc())
+
+        # 显示错误提示（可能被工作线程调用，QMessageBox 必须在主线程创建）
+        if show_message:
+            qt_dispatcher.dispatch_to_main_thread(
+                ErrorHandler._show_critical_box, module_name, error
+            )
+
+        return error_message
+
+    @staticmethod
+    def _show_critical_box(module_name, error):
+        """
+        在主线程弹出错误提示框
+
+        Args:
+            module_name (str): 模块名称
+            error (Exception): 错误对象
+        """
+        try:
+            QMessageBox.critical(
+                None,
+                "错误",
+                f"{module_name}模块发生错误:\n{str(error)}",
+                QMessageBox.Ok
+            )
+        except Exception as e:
+            logger.error(f"显示错误提示失败: {e}")
+
+    @staticmethod
+    def handle_ocr_error(error, show_message=False):
+        """
+        处理OCR错误
+
+        Args:
+            error (Exception): 错误对象
+            show_message (bool): 是否显示错误提示
+
+        Returns:
+            str: 默认的OCR结果
+        """
+        error_message = ErrorHandler.handle_error(error, "OCR", show_message)
+
+        # OCR失败时返回默认文本
+        return "[OCR识别失败，请确保已安装Tesseract OCR]"
+
+    @staticmethod
+    def handle_translation_error(error, show_message=False):
+        """
+        处理翻译错误
+
+        Args:
+            error (Exception): 错误对象
+            show_message (bool): 是否显示错误提示
+
+        Returns:
+            str: 错误信息
+        """
+        error_message = ErrorHandler.handle_error(error, "翻译", show_message)
+
+        # 翻译失败时返回错误信息
+        return f"[翻译失败: {str(error)}]"
+
+    @staticmethod
+    def handle_screenshot_error(error, show_message=True):
+        """
+        处理截图错误
+
+        Args:
+            error (Exception): 错误对象
+            show_message (bool): 是否显示错误提示
+        """
+        ErrorHandler.handle_error(error, "截图", show_message)
+
+    @staticmethod
+    def handle_hotkey_error(error, show_message=True):
+        """
+        处理快捷键错误
+
+        Args:
+            error (Exception): 错误对象
+            show_message (bool): 是否显示错误提示
+        """
+        ErrorHandler.handle_error(error, "快捷键", show_message)
+
+    @staticmethod
+    def handle_tray_error(error, show_message=False):
+        """
+        处理系统托盘错误
+
+        Args:
+            error (Exception): 错误对象
+            show_message (bool): 是否显示错误提示
+        """
+        ErrorHandler.handle_error(error, "系统托盘", show_message)
+
+    @staticmethod
+    def show_info_message(title, message):
+        """
+        显示信息提示框
+
+        Args:
+            title (str): 标题
+            message (str): 提示内容
+        """
+        try:
+            QMessageBox.information(
+                None,
+                title,
+                message,
+                QMessageBox.Ok
+            )
+        except Exception as e:
+            logger.error(f"显示信息提示失败: {e}")
+
+    @staticmethod
+    def show_warning_message(title, message):
+        """
+        显示警告提示框
+
+        Args:
+            title (str): 标题
+            message (str): 提示内容
+        """
+        try:
+            QMessageBox.warning(
+                None,
+                title,
+                message,
+                QMessageBox.Ok
+            )
+        except Exception as e:
+            logger.error(f"显示警告提示失败: {e}")
+
+    @staticmethod
+    def show_question_message(title, message):
+        """
+        显示是/否询问框
+
+        Args:
+            title (str): 标题
+            message (str): 询问内容
+
+        Returns:
+            bool: 用户是否选择"是"；弹窗失败时返回False
+        """
+        try:
+            result = QMessageBox.question(
+                None,
+                title,
+                message,
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+            return result == QMessageBox.Yes
+        except Exception as e:
+            logger.error(f"显示询问提示失败: {e}")
+            return False
+
+# 创建错误处理器实例
+error_handler = ErrorHandler()
