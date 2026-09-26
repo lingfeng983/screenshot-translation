@@ -59,39 +59,6 @@ def test_cache_manager():
 
     print("✅ 缓存管理器测试通过\n")
 
-def test_progress_manager():
-    """测试进度管理器（需要QApplication）"""
-    print("=== 测试进度管理器 ===")
-    try:
-        from managers.progress_manager import progress_manager
-        from PyQt5.QtWidgets import QApplication
-        import sys
-
-        # 创建QApplication实例
-        app = QApplication.instance()
-        if app is None:
-            app = QApplication(sys.argv)
-
-        # 创建进度对话框
-        dialog = progress_manager.show_progress("测试", "测试进度", 0, 100)
-        if dialog:
-            print("✅ 进度对话框创建成功")
-
-            # 更新进度
-            progress_manager.update_progress(50, "进行中...")
-            print("✅ 进度更新成功")
-
-            # 关闭进度对话框
-            progress_manager.hide_progress()
-            print("✅ 进度对话框关闭成功")
-        else:
-            print("❌ 进度对话框创建失败")
-
-        print("✅ 进度管理器测试完成\n")
-
-    except Exception as e:
-        print(f"⚠️ 进度管理器测试跳过 (需要GUI环境): {e}\n")
-
 def test_screenshot_widget():
     """测试截图遮罩窗口：初始化属性完整、可绘制、能获得焦点（ESC 退出依赖焦点）"""
     print("=== 测试截图遮罩窗口 ===")
@@ -199,7 +166,6 @@ def main():
     try:
         test_retry_handler()
         test_cache_manager()
-        test_progress_manager()
         test_screenshot_widget()
         test_result_render_layout()
         test_tesseract_no_console_window()

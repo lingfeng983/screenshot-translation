@@ -210,7 +210,7 @@ ScreenshotTranslation/
 │   ├── window_enum.py       # Win32可见窗口枚举（磁吸数据源）
 │   ├── cache_manager.py     # 翻译缓存（持久化/LRU）
 │   ├── retry_handler.py     # 指数退避重试
-│   ├── thread_pool.py / qt_dispatcher.py / progress_manager.py
+│   ├── thread_pool.py / qt_dispatcher.py
 │   ├── hotkey.py / tray.py / error_handler.py
 │   ├── providers/           # 翻译API插件目录（扩展放这里）
 │   │   ├── base.py          #   翻译基类+目标语言表（继承公共基座）
