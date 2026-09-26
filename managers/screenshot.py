@@ -372,8 +372,7 @@ class ScreenshotWidget(QWidget):
         # 结果态：识别/翻译完成后就地覆盖展示
         self._result = None          # 最近一次成功的 payload
         self._result_rect = None     # 选区逻辑矩形（结果态绘制用）
-        self._crop_raw = None        # 选区冻结背景（物理像素，1:1）
-        self._crop_pixmap = None     # 同上，带 devicePixelRatio 供遮罩绘制
+        self._crop_pixmap = None     # 选区冻结背景，带 devicePixelRatio 供遮罩绘制
         self._scale = 1.0            # 逻辑坐标 → 图像物理像素的倍率
         self._blocks = []            # 逻辑坐标行块
         self._paragraphs = []        # [(屏幕矩形, [块下标]), ...]
@@ -674,7 +673,6 @@ class ScreenshotWidget(QWidget):
         self._loading = False
         self._result_rect = region
         self._scale = scale
-        self._crop_raw = result_render.pil_to_qpixmap(image)
         self._crop_pixmap = result_render.pil_to_qpixmap(image, dpr=scale)
         self._blocks = result_render.to_logical_blocks(payload.get('blocks') or [], scale)
         self._paragraphs = self._build_paragraphs()
@@ -998,15 +996,18 @@ class ScreenshotWidget(QWidget):
             QPixmap 或 None
         """
         payload = self._result
-        if payload is None or self._crop_raw is None:
+        if payload is None:
             return None
         image = payload['image']
+        if image is None:
+            return None
         pixmap = QPixmap(image.width, image.height)
         pixmap.fill(Qt.transparent)
 
         painter = QPainter(pixmap)
         painter.setRenderHint(QPainter.Antialiasing, True)
-        painter.drawPixmap(0, 0, self._crop_raw)
+        # 底图按需从 PIL 转换：常驻一份 1:1 QPixmap 等于把选区再存一遍
+        painter.drawPixmap(0, 0, result_render.pil_to_qpixmap(image))
         texts = payload.get('block_texts') or []
         if texts and self._mode != result_render.MODE_ORIGINAL:
             result_render.paint_blocks(
@@ -1164,7 +1165,9 @@ class ScreenshotWidget(QWidget):
         scale = self._grab_scale
         box = (int(rect.left() * scale), int(rect.top() * scale),
                int(rect.right() * scale), int(rect.bottom() * scale))
-        screenshot = self.full_screen.crop(box)
+        # crop 与原图共享像素缓冲，必须 copy 才能放下整屏图（1440p 约 11 MiB）
+        screenshot = self.full_screen.crop(box).copy()
+        self.full_screen = None
         logger.info(f"截图完成，大小: {screenshot.width}x{screenshot.height}")
 
         # 遮罩不关闭：先用本次裁剪图冻结选区做加载提示，结果回来后就地覆盖
@@ -1175,7 +1178,6 @@ class ScreenshotWidget(QWidget):
         self._paragraphs = []
         self._result_rect = QRect(rect)
         self._scale = screenshot.width / max(1, rect.width())
-        self._crop_raw = screenshot
         self._crop_pixmap = result_render.pil_to_qpixmap(screenshot, dpr=self._scale)
         self._loading = True
         self.region_selected.emit(screenshot, QRect(rect))

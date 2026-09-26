@@ -37,25 +37,29 @@ def test_retry_handler():
     print("✅ 重试处理器测试通过\n")
 
 def test_cache_manager():
-    """测试缓存管理器"""
+    """测试缓存管理器（用临时文件，避免污染项目里的真实缓存）"""
     print("=== 测试缓存管理器 ===")
-    from managers.cache_manager import cache_manager
+    import tempfile
+    from managers.cache_manager import CacheManager
 
-    # 测试缓存存储和获取
-    test_text = "Hello World"
-    test_translation = "你好世界"
-    api_type = "libretranslate"
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        cache_manager = CacheManager(cache_file=os.path.join(tmp_dir, 'cache.json'))
 
-    # 缓存翻译结果
-    cache_manager.cache_translation(test_text, api_type, test_translation)
+        # 测试缓存存储和获取
+        test_text = "Hello World"
+        test_translation = "你好世界"
+        api_type = "libretranslate"
 
-    # 获取缓存结果
-    cached_result = cache_manager.get_cached_translation(test_text, api_type)
-    print(f"缓存的翻译结果: {cached_result}")
+        # 缓存翻译结果
+        cache_manager.cache_translation(test_text, api_type, test_translation)
 
-    # 测试统计信息
-    stats = cache_manager.get_cache_stats()
-    print(f"缓存统计: {stats}")
+        # 获取缓存结果
+        cached_result = cache_manager.get_cached_translation(test_text, api_type)
+        print(f"缓存的翻译结果: {cached_result}")
+
+        # 测试统计信息
+        stats = cache_manager.get_cache_stats()
+        print(f"缓存统计: {stats}")
 
     print("✅ 缓存管理器测试通过\n")
 
@@ -145,6 +149,64 @@ def test_result_render_layout():
     print("✅ 译文就地覆盖排版测试通过\n")
 
 
+def test_result_render_cache():
+    """结果态排版缓存：同图重绘命中缓存，换选区图必须作废"""
+    print("=== 测试结果态排版缓存 ===")
+    from PIL import Image
+    from PyQt5.QtCore import QPoint
+    from PyQt5.QtGui import QPainter, QPixmap
+    from PyQt5.QtWidgets import QApplication
+
+    import managers.result_render as rr
+    from managers.text_block import TextBlock
+
+    app = QApplication.instance() or QApplication(sys.argv)
+    blocks = [TextBlock('one', 4, 4, 120, 16), TextBlock('two', 4, 26, 150, 16)]
+    texts = ['译文一 translated', '译文二 more translated text']
+    image_a = Image.new('RGB', (220, 80), 'white')
+    image_b = Image.new('RGB', (220, 80), 'black')
+    canvas = QPixmap(220, 80)
+
+    def paint(image):
+        painter = QPainter(canvas)
+        rr.paint_blocks(painter, image, blocks, texts, QPoint(0, 0),
+                        rr.MODE_BILINGUAL, 1.0)
+        painter.end()
+
+    rr._LAYOUT_CACHE.clear()
+    paint(image_a)
+    first = dict(rr._LAYOUT_CACHE)
+    assert len(first) == len(blocks), f"首帧应缓存{len(blocks)}块，实际{len(first)}"
+
+    paint(image_a)
+    assert all(rr._LAYOUT_CACHE[k] is v for k, v in first.items()), \
+        "同一张图重绘应命中缓存，而不是重新取色排版"
+
+    paint(image_b)
+    assert all(rr._LAYOUT_CACHE[k] is not v for k, v in first.items()), \
+        "换了选区图必须作废缓存，否则会用上一张图的配色画当前选区"
+
+    assert rr.warm_up_fonts() is True, "字形预热失败会让结果态首帧回到数百毫秒"
+    print("✅ 结果态排版缓存测试通过\n")
+
+
+def test_ocr_provider_reuse():
+    """OCR provider 必须复用：每次识别新建实例会多起一个 tesseract --version 进程"""
+    print("=== 测试 OCR provider 实例复用 ===")
+    from managers.ocr import OCRManager
+
+    class FakeProvider:
+        def __init__(self, config_manager=None):
+            self.config_manager = config_manager
+
+    manager = OCRManager()
+    provider = manager._get_provider(FakeProvider)
+    assert manager._get_provider(FakeProvider) is provider, "provider 每次都在新建"
+    manager.reload_config()
+    assert manager._get_provider(FakeProvider) is not provider, "配置重载后未丢弃旧实例"
+    print("✅ OCR provider 实例复用测试通过\n")
+
+
 def test_qt_dispatcher():
     """测试Qt线程调度器"""
     print("=== 测试Qt线程调度器 ===")
@@ -168,6 +230,8 @@ def main():
         test_cache_manager()
         test_screenshot_widget()
         test_result_render_layout()
+        test_result_render_cache()
+        test_ocr_provider_reuse()
         test_tesseract_no_console_window()
         test_qt_dispatcher()
 

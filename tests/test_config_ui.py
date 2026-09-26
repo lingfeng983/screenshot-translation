@@ -74,6 +74,15 @@ def _run_tests(app, failures):
     from managers.ocr import OCRManager
     from PyQt5.QtWidgets import QMessageBox
 
+    # 本文件会真的走一次翻译：全局缓存单例必须指向临时文件，
+    # 否则测试把结果写进项目根的 translation_cache.json
+    import tempfile
+    from managers import cache_manager as cache_manager_module
+    _cache_dir = tempfile.TemporaryDirectory()
+    _cache_singleton = cache_manager_module.cache_manager
+    _cache_singleton.cache_file = os.path.join(_cache_dir.name, 'cache.json')
+    _cache_singleton._keep_tmpdir = _cache_dir
+
     # 保存流程会弹模态 QMessageBox，无头测试没人点确定会永久阻塞：
     # 把 information/critical/warning 全部替换为记录型假弹窗
     messagebox_log = []

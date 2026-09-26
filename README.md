@@ -4,10 +4,11 @@
 
 ## 🚀 快速开始
 
-### 方式一：单文件 exe（推荐普通用户）
-从 [Releases](https://gitee.com/lingfeng983/screenshot-translation/releases) 下载 `ScreenshotTranslator.exe`（约182MB，单文件）：
+### 方式一：下载打包产物（推荐普通用户）
+从 [Releases](https://gitee.com/lingfeng983/screenshot-translation/releases) 下载 `ScreenshotTranslator.zip`
+（约298MB，解压后是一个目录，入口 `ScreenshotTranslator/ScreenshotTranslator.exe`）：
 
-1. 放到任意目录，双击运行——首次启动自动生成 `config.ini`
+1. 整目录解压到任意位置，双击 exe 运行——首次启动自动生成 `config.ini`
 2. 右下角托盘出现图标（若被折叠，点任务栏 `^` 展开并右键图标→设置常显）
 3. **Tesseract OCR 已内置**（含中英文语言包），无需额外下载，开箱即用
 4. 按 `Alt+Z` 截图翻译
@@ -186,7 +187,7 @@ ScreenshotTranslation/
 ├── CHANGELOG.md         # 更新日志
 ├── requirements.txt     # 依赖列表
 ├── run_fixed.bat        # 启动脚本
-├── screenshot-translator.spec  # PyInstaller单文件打包配置
+├── screenshot-translator.spec  # PyInstaller onedir 打包配置（含依赖裁剪）
 ├── scripts/
 │   ├── make_release_package.py  # OCR组件分卷打包（上传Release用）
 │   └── setup_ocr.py             # 从Release下载恢复OCR组件
@@ -239,17 +240,22 @@ ScreenshotTranslation/
 新翻译API放 `managers/providers/`，新OCR引擎放 `managers/ocr_providers/`，
 定义 `name`/`display_name`/`config_fields` + 工作方法 + `register(registry)` 即自动上架配置界面。
 
-### 打包单文件 exe
+### 打包（onedir 目录形态）
 ```bash
 # 1. 收集 Tesseract 运行最小集（排除约60MB训练工具）
 python scripts/collect_ocr_bundle.py
 
 # 2. 打包（自动包含 OCR 最小集）
 python -m PyInstaller screenshot-translator.spec --noconfirm
-# 产物：dist/ScreenshotTranslator.exe（约182MB，含图标与内置OCR，无控制台黑窗）
+# 产物：dist/ScreenshotTranslator/ScreenshotTranslator.exe（整个目录约298MB，需整体分发）
 ```
-exe 首次运行会在同目录生成 `config.ini`、日志与缓存文件。
-OCR 组件随 exe 解包到临时目录运行，无需安装。
+打包时自动裁剪无用依赖：Qt 的 QML/场景图/Vulkan 插件与翻译文件、PIL 的
+`_avif/_webp/_imagingtk` 等扩展、tesseract 副本在根目录重复落地的 47 个 DLL
+（仅 `libffi-8.dll`、`zlib1.dll` 被 CPython/Qt/PIL 真实加载，必须留在根目录）。
+
+exe 启动即加载本目录下的 `_internal`，不再解包到临时目录；`config.ini`、日志与
+缓存文件都写在 exe 同级目录，日志按 2MB × 3 份轮转。OCR 组件随 `_internal` 分发，
+无需安装。
 
 ## 🆘 技术支持
 

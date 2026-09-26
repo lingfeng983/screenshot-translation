@@ -35,6 +35,8 @@ config.ini.bak
 
 # ===== 工具本地目录 =====
 .freebuff/
+# 开发期探针脚本与目视验证截图
+scratch/
 
 # ===== 大体积二进制（走 Release 附件分发）=====
 # Tesseract 便携版主程序（约238MB）

@@ -9,6 +9,9 @@ import logging
 import sys
 import threading
 
+from logging.handlers import RotatingFileHandler
+
+from PyQt5.QtCore import QTimer
 from PyQt5.QtWidgets import (
     QApplication, QDialog, QVBoxLayout, QLineEdit, QPushButton,
     QComboBox, QCheckBox, QGroupBox, QFormLayout, QMessageBox,
@@ -17,12 +20,14 @@ from PyQt5.QtWidgets import (
 
 # 配置日志（全局唯一入口，其他模块只使用 logging.getLogger）
 # 日志路径按运行形态定位：源码→项目根，exe→exe同目录（可写）
-from managers import app_paths
+from managers import app_paths, result_render
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler(app_paths.log_file(), encoding='utf-8'),
+        # 常驻托盘的应用日志只增不减，必须轮转，否则长期占盘
+        RotatingFileHandler(app_paths.log_file(), maxBytes=2 * 1024 * 1024,
+                            backupCount=3, encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
@@ -145,6 +150,10 @@ class MainApp:
             self.is_running = True
 
             logger.info("应用启动成功")
+
+            # 第一次往画布上画中文时 Qt 会现加载字体并整形，实测约 290ms；
+            # 趁启动后的空闲把它预热掉，截图结果态首帧就不卡这一下
+            QTimer.singleShot(1500, result_render.warm_up_fonts)
 
             # 启动时处理启动行为
             self._handle_startup_behavior()

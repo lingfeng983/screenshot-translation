@@ -45,10 +45,30 @@ class OCRManager(ProviderChainManager):
         """
         self.config_manager = config_manager
         self.ocr_type = 'tesseract'  # 默认本地Tesseract
+        self._providers = {}
         self._load_config()
 
         logger.info(f"OCR管理器初始化完成，当前引擎: {self.ocr_type}，"
                     f"可用提供者: {ocr_provider_registry.names()}")
+
+    def _get_provider(self, provider_cls):
+        """
+        取得 provider 实例（按类缓存）
+
+        Tesseract 构造时要探测引擎路径、跑一次 `tesseract --version` 子进程并
+        扫盘定位 tessdata，若每次识别都新建实例，一次翻译就白白多起一个进程。
+
+        Args:
+            provider_cls: OCR provider 类
+
+        Returns:
+            provider 实例（首次调用时构造）
+        """
+        provider = self._providers.get(provider_cls)
+        if provider is None:
+            provider = provider_cls(config_manager=self.config_manager)
+            self._providers[provider_cls] = provider
+        return provider
 
     def _load_config(self):
         """加载OCR引擎配置"""
@@ -61,6 +81,7 @@ class OCRManager(ProviderChainManager):
 
     def reload_config(self):
         """重新加载配置（配置窗口保存后调用）"""
+        self._providers.clear()
         self._load_config()
 
     def set_ocr_type(self, ocr_type):
@@ -168,7 +189,7 @@ class OCRManager(ProviderChainManager):
             list[TextBlock]: 行块列表或空列表
         """
         def factory():
-            return provider_cls(config_manager=self.config_manager)
+            return self._get_provider(provider_cls)
 
         def call(provider):
             return provider.recognize_blocks(image)
@@ -191,7 +212,7 @@ class OCRManager(ProviderChainManager):
             str: 识别出的文本，彻底失败时返回 [OCR识别失败...] 文本
         """
         def factory():
-            return provider_cls(config_manager=self.config_manager)
+            return self._get_provider(provider_cls)
 
         def call(provider):
             return provider.recognize(image)
@@ -214,7 +235,7 @@ class OCRManager(ProviderChainManager):
         if provider_cls is None:
             return ['eng', 'chi_sim']
         try:
-            provider = provider_cls(config_manager=self.config_manager)
+            provider = self._get_provider(provider_cls)
         except Exception as e:
             logger.error(f"OCR提供者初始化失败: {e}")
             return ['eng', 'chi_sim']

@@ -53,13 +53,32 @@
 - **仓库只保留源码**：Tesseract 便携包+语言数据（约110MB）不入库；
   `scripts/make_release_package.py` 打为分卷 zip（≤90MB/卷）上传 Gitee Release 附件，
   克隆端 `scripts/setup_ocr.py` 自动下载、SHA256 校验、解压，支持 `--local` 离线恢复
-- **单文件 exe 分发**：`screenshot-translator.spec` + PyInstaller 打出单文件
-  （含图标、无控制台、内置Tesseract OCR与中英文语言包，开箱即用，约182MB）；
-  新增 `managers/app_paths.py` 统一双形态路径定位——
-  exe 下只读资源走 `_MEIPASS`，可写的配置/缓存/日志落在 exe 同目录，
-  首次启动自动生成默认 config.ini
+- **分发包改为 onedir 目录形态**：`screenshot-translator.spec` + PyInstaller 打出
+  `dist/ScreenshotTranslator/`（含图标、无控制台、内置Tesseract OCR与中英文语言包，
+  开箱即用，整目录约298MB）；新增 `managers/app_paths.py` 统一双形态路径定位——
+  打包态只读资源走 `_MEIPASS`（onedir 下即 `_internal`），可写的配置/缓存/日志
+  落在 exe 同目录，首次启动自动生成默认 config.ini
 - **OCR 瘦身打包**：`scripts/collect_ocr_bundle.py` 抽取运行必需的
-  tesseract.exe+DLL+eng/chi_sim（排除约60MB训练工具），打前先收集最小集
+  tesseract.exe+DLL+eng/chi_sim（排除约60MB训练工具），打包时自动收集最小集
+
+### 性能与资源
+- **启动 2.97s → 0.44s**：onedir 不再把 486MB 内容解压到 `%TEMP%\_MEI*` 后才运行，
+  强制结束进程也不再遗留解包目录（此前每次异常退出留一份）
+- **依赖去重裁剪**：tesseract 作为二进制数据收集时被依赖分析重复落到根目录，
+  按真实 PE 导入表核实后仅保留 `libffi-8.dll`、`zlib1.dll`，删掉 47 个重复 DLL；
+  同时剔除 Qt 的 QML/场景图/Vulkan/翻译包与 PIL 的 `_avif/_webp/_imagingtk` 等
+  用不到的模块（binaries 212→158、datas 110→35）
+- **OCR 引擎实例复用**：Tesseract provider 构造要探测引擎路径、跑一次
+  `tesseract --version` 并扫盘定位 tessdata，改为按 provider 类缓存实例，
+  配置重载时作废，一次翻译少起一个进程
+- **结果态首帧 388ms → 100ms，重绘 2ms**：取色与排版（字体度量身踩）按
+  「图像+块矩形+模式」缓存，换选区即作废；启动空闲期预热中文字体，
+  避免第一次往画布画中文时现加载字体
+- **截图大对象即时释放**：确认选区后 `crop().copy()` 并放下整屏原图（1440p 约 11MB），
+  结果底图按需从 PIL 转换，不再常驻一份 1:1 QPixmap
+- **日志轮转**：`screenshot_translation.log` 按 2MB × 3 份滚动，常驻托盘不再无限增长
+- **测试与真实缓存隔离**：`test_features`/`test_config_ui` 走临时目录缓存文件，
+  不再把结果写进项目根的 `translation_cache.json`
 
 ## [历史版本]
 

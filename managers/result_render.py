@@ -13,9 +13,10 @@
 """
 
 from collections import Counter
+import weakref
 
 from PyQt5.QtCore import Qt, QRect, QPoint
-from PyQt5.QtGui import QColor, QFont, QFontMetrics, QPainter, QPen
+from PyQt5.QtGui import QColor, QFont, QFontMetrics, QImage, QPainter, QPen
 
 from . import styles
 from .text_block import TextBlock
@@ -35,6 +36,11 @@ BILINGUAL_SOURCE_RATIO = 0.72
 # 覆盖文字的最小/最大字号（像素）
 FONT_MIN_PX = 9
 FONT_MAX_PX = 40
+
+# 结果态排版缓存：只服务当前这一张选区图（见 _layout_cache_for）
+_LAYOUT_CACHE = {}
+_LAYOUT_OWNER = None
+_LAYOUT_SCALE = None
 
 # 结果气泡卡片
 CARD_BG = QColor(35, 38, 41, 250)
@@ -96,6 +102,34 @@ def pil_to_qpixmap(image, dpr=1.0):
         return pixmap
     except Exception:
         return None
+
+
+# 字形预热覆盖的字号档：覆盖常见行高，避免首帧现加载字体
+_WARM_UP_SIZES = (11, 14, 18, 22, 26, 32, 40)
+
+
+def warm_up_fonts():
+    """
+    预热 Qt 的字形缓存与字体整形
+
+    第一次把中文画到画布上时 Qt 要现加载字体文件并做文字整形，实测结果态
+    首帧为此付出约 290ms；启动空闲时先离屏画一遍，用户截图后就不卡这一下。
+    必须在 GUI 线程调用。
+    """
+    try:
+        image = QImage(300, 60, QImage.Format_ARGB32)
+        image.fill(Qt.transparent)
+        painter = QPainter(image)
+        painter.setPen(QColor('#ffffff'))
+        for pixel_size in _WARM_UP_SIZES:
+            font = QFont(painter.font())
+            font.setPixelSize(pixel_size)
+            painter.setFont(font)
+            painter.drawText(2, min(58, pixel_size + 4), '译文字示例 sample 0123')
+        painter.end()
+    except Exception:
+        return False
+    return True
 
 
 def card_content_size(painter, body_text, title=None, footer=None,
@@ -428,6 +462,59 @@ def _block_bottom_limit(block, following, bounds):
     return max(block.bottom, limit)
 
 
+def _layout_cache_for(image, scale):
+    """
+    取本选区图的排版缓存；换了图就整体作废
+
+    缓存以"这张图对象本身"为归属：图一换（重新截图），旧缓存立即清空，
+    避免用上一张选区的取色结果画当前选区。
+
+    Args:
+        image (PIL.Image.Image): 选区图像
+        scale (float): 逻辑坐标到图像像素的倍率
+
+    Returns:
+        dict: 以 (块矩形, 译文, 模式, 可借用高度) 为键的排版结果
+    """
+    global _LAYOUT_CACHE, _LAYOUT_OWNER, _LAYOUT_SCALE
+
+    owner = _LAYOUT_OWNER() if _LAYOUT_OWNER is not None else None
+    if owner is not image or _LAYOUT_SCALE != scale:
+        _LAYOUT_CACHE = {}
+        _LAYOUT_SCALE = scale
+        try:
+            _LAYOUT_OWNER = weakref.ref(image)
+        except TypeError:
+            _LAYOUT_OWNER = None
+    return _LAYOUT_CACHE
+
+
+def _layout_block(painter, image, rect, text, mode, scale, avail):
+    """
+    单块的取色与排版（结果态每帧都要用到，代价高，按块缓存）
+
+    取色要逐像素采样选区图，排版要从基准字号逐档试到能放下，
+    一次重绘十几块就是几百毫秒；同一张选区图上的块在不换模式、
+    不改译文时结果不变，所以缓存起来。
+
+    Returns:
+        tuple: (背景色, 前景色, 字体, 行列表, 原文字号, 原文行高, 行高)
+    """
+    bg, fg = dominant_colors(image, rect, scale)
+    base_px = int(rect.height() * 0.78)
+    font, lines, _ = fit_text(painter, text, QRect(0, 0, rect.width(), avail), base_px)
+    source_px = source_height = 0
+    if mode == MODE_BILINGUAL:
+        source_px, source_height = bilingual_source_layout(
+            painter.font(), base_px, avail)
+        if source_height:
+            font, lines, _ = fit_text(
+                painter, text,
+                QRect(0, 0, rect.width(), avail - source_height), base_px)
+    line_height = max(1, QFontMetrics(font).lineSpacing())
+    return bg, fg, font, lines, source_px, source_height, line_height
+
+
 def paint_blocks(painter, image, blocks, texts, origin, mode, scale=1.0):
     """
     就地覆盖绘制
@@ -459,27 +546,22 @@ def paint_blocks(painter, image, blocks, texts, origin, mode, scale=1.0):
                    int(image.width / max(1.0, scale)),
                    int(image.height / max(1.0, scale)))
 
+    cache = _layout_cache_for(image, scale)
+
     painted = []
     for index, (block, text) in enumerate(pairs):
         rect = QRect(block.left, block.top, block.width, block.height)
-        bg, fg = dominant_colors(image, rect, scale)
         limit = _block_bottom_limit(block,
                                     [b for b, _ in pairs[index + 1:]], bounds)
         # 可借用高度：从块顶到"下一行/选区下沿"之前
         avail = max(rect.height(), limit - rect.top())
-        base_px = int(rect.height() * 0.78)
-
-        font, lines, _ = fit_text(painter, text,
-                                  QRect(0, 0, rect.width(), avail), base_px)
-        source_px = source_height = 0
-        if mode == MODE_BILINGUAL:
-            source_px, source_height = bilingual_source_layout(
-                painter.font(), base_px, avail)
-            if source_height:
-                font, lines, _ = fit_text(
-                    painter, text,
-                    QRect(0, 0, rect.width(), avail - source_height), base_px)
-        line_height = max(1, QFontMetrics(font).lineSpacing())
+        key = (rect.left(), rect.top(), rect.width(), rect.height(),
+               text, mode, avail)
+        layout = cache.get(key)
+        if layout is None:
+            layout = _layout_block(painter, image, rect, text, mode, scale, avail)
+            cache[key] = layout
+        bg, fg, font, lines, source_px, source_height, line_height = layout
 
         # 覆盖块高度按实际排版内容收敛，多出的留白会压住下面的原文行
         content = source_height + len(lines) * line_height
