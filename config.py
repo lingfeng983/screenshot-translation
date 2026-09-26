@@ -22,7 +22,7 @@ class ConfigManager:
 
         Args:
             config_file (str): 配置文件路径；None时按运行形态自动定位
-                （源码→项目根，exe→exe同目录）
+                （源码→项目根，exe→~/.screenshot-translation）
         """
         self.config_file = config_file or app_paths.config_file()
         self.config = configparser.ConfigParser()

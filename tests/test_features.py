@@ -207,6 +207,75 @@ def test_ocr_provider_reuse():
     print("✅ OCR provider 实例复用测试通过\n")
 
 
+def test_app_paths_user_data():
+    """打包态可写文件落 ~/.screenshot-translation，旧文件只补缺迁移"""
+    print("=== 测试打包态数据目录 ===")
+    import tempfile
+    from managers import app_paths
+
+    env_names = ('HOME', 'USERPROFILE', 'HOMEDRIVE', 'HOMEPATH')
+    saved_env = {name: os.environ.get(name) for name in env_names}
+    saved_frozen = getattr(sys, 'frozen', None)
+    saved_meipass = getattr(sys, '_MEIPASS', None)
+    saved_executable = sys.executable
+    try:
+        with tempfile.TemporaryDirectory() as home, \
+                tempfile.TemporaryDirectory() as appdir:
+            os.environ['HOME'] = home
+            os.environ['USERPROFILE'] = home
+            os.environ.pop('HOMEDRIVE', None)
+            os.environ.pop('HOMEPATH', None)
+            sys.frozen = True
+            sys._MEIPASS = os.path.join(appdir, '_internal')
+            os.makedirs(sys._MEIPASS, exist_ok=True)
+            sys.executable = os.path.join(appdir, 'ScreenshotTranslator.exe')
+
+            user_dir = os.path.join(home, '.screenshot-translation')
+            assert app_paths.app_root() == appdir
+            assert app_paths.data_dir() == user_dir, "打包态可写文件应落用户目录"
+            for path in (app_paths.config_file(), app_paths.cache_file(),
+                         app_paths.log_file()):
+                assert path.startswith(user_dir), f"{path} 不在用户目录下"
+
+            # 只读资源仍从 _internal 取，不受数据目录搬迁影响
+            assert app_paths.bundled_root() == sys._MEIPASS
+
+            # 旧版留在 exe 旁的配置要搬进用户目录，且第二次调用不覆盖已有文件
+            with open(os.path.join(appdir, 'config.ini'), 'w', encoding='utf-8') as f:
+                f.write('[Hotkey]\nglobal_hotkey = alt+z\n')
+            assert app_paths.migrate_legacy_data() == ['config.ini']
+            with open(app_paths.config_file(), encoding='utf-8') as f:
+                assert 'alt+z' in f.read(), "迁移后内容不符"
+            with open(app_paths.config_file(), 'w', encoding='utf-8') as f:
+                f.write('[Hotkey]\nglobal_hotkey = ctrl+shift+a\n')
+            assert app_paths.migrate_legacy_data() == [], "迁移不该覆盖用户已有配置"
+            with open(app_paths.config_file(), encoding='utf-8') as f:
+                assert 'ctrl+shift+a' in f.read()
+
+            # 源码形态留在项目根，开发者本地 config 与工作区测试不受影响
+            sys.frozen = False
+            assert app_paths.data_dir() == app_paths.app_root()
+            assert app_paths.migrate_legacy_data() == []
+    finally:
+        for name, value in saved_env.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        if saved_frozen is None:
+            if hasattr(sys, 'frozen'):
+                del sys.frozen
+        else:
+            sys.frozen = saved_frozen
+        if saved_meipass is None:
+            if hasattr(sys, '_MEIPASS'):
+                del sys._MEIPASS
+        else:
+            sys._MEIPASS = saved_meipass
+        sys.executable = saved_executable
+    print("✅ 打包态数据目录测试通过\n")
+
+
 def test_qt_dispatcher():
     """测试Qt线程调度器"""
     print("=== 测试Qt线程调度器 ===")
@@ -232,6 +301,7 @@ def main():
         test_result_render_layout()
         test_result_render_cache()
         test_ocr_provider_reuse()
+        test_app_paths_user_data()
         test_tesseract_no_console_window()
         test_qt_dispatcher()
 

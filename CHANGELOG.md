@@ -48,16 +48,21 @@
 ### 变更
 - 默认翻译 API：`libretranslate` → `edge_free`（国内可直连）
 - 默认快捷键：`Ctrl+Shift+A` → `Alt+Z`（配置项 `alt+z`，按下直接截图翻译）
-- 配置窗口更名"设置"，启动默认最小化到托盘（托盘通知提示用法）
+- 配置窗口更名"设置"，启动默认最小化到托盘；**托盘提示通知只在首次运行弹一次**
+  （文案精简为 `Alt+Z 开始截图翻译`），之后驻留托盘不再打扰，交互方式看图标悬停提示
 - 旧配置文件自动迁移：自动补齐 `[OCR]`、`[Overlay]` 段
 - **仓库只保留源码**：Tesseract 便携包+语言数据（约110MB）不入库；
   `scripts/make_release_package.py` 打为分卷 zip（≤90MB/卷）上传 Gitee Release 附件，
   克隆端 `scripts/setup_ocr.py` 自动下载、SHA256 校验、解压，支持 `--local` 离线恢复
 - **分发包改为 onedir 目录形态**：`screenshot-translator.spec` + PyInstaller 打出
   `dist/ScreenshotTranslator/`（含图标、无控制台、内置Tesseract OCR与中英文语言包，
-  开箱即用，整目录约298MB）；新增 `managers/app_paths.py` 统一双形态路径定位——
-  打包态只读资源走 `_MEIPASS`（onedir 下即 `_internal`），可写的配置/缓存/日志
-  落在 exe 同目录，首次启动自动生成默认 config.ini
+  开箱即用，整目录约297MB）；新增 `managers/app_paths.py` 统一双形态路径定位——
+  打包态只读资源走 `_MEIPASS`（onedir 下即 `_internal`），可写文件见下条
+- **可写数据迁到用户目录 `~/.screenshot-translation`**：打包态的 `config.ini`、
+  `translation_cache.json` 与日志不再写在 exe 旁边，产物目录保持只读——
+  装进 Program Files 或整目录覆盖升级都不会丢配置；`migrate_legacy_data()`
+  把旧版留在 exe 同目录的配置与缓存首次启动搬进用户目录（只补缺、不覆盖、不删原件），
+  源码运行仍写在项目根，不打扰开发者本地文件
 - **OCR 瘦身打包**：`scripts/collect_ocr_bundle.py` 抽取运行必需的
   tesseract.exe+DLL+eng/chi_sim（排除约60MB训练工具），打包时自动收集最小集
 
@@ -67,7 +72,7 @@
 - **依赖去重裁剪**：tesseract 作为二进制数据收集时被依赖分析重复落到根目录，
   按真实 PE 导入表核实后仅保留 `libffi-8.dll`、`zlib1.dll`，删掉 47 个重复 DLL；
   同时剔除 Qt 的 QML/场景图/Vulkan/翻译包与 PIL 的 `_avif/_webp/_imagingtk` 等
-  用不到的模块（binaries 212→158、datas 110→35）
+  用不到的模块（binaries 212→157、datas 110→35）
 - **OCR 引擎实例复用**：Tesseract provider 构造要探测引擎路径、跑一次
   `tesseract --version` 并扫盘定位 tessdata，改为按 provider 类缓存实例，
   配置重载时作废，一次翻译少起一个进程
@@ -79,6 +84,8 @@
 - **日志轮转**：`screenshot_translation.log` 按 2MB × 3 份滚动，常驻托盘不再无限增长
 - **测试与真实缓存隔离**：`test_features`/`test_config_ui` 走临时目录缓存文件，
   不再把结果写进项目根的 `translation_cache.json`
+- 新增打包态数据目录用例（模拟 `sys.frozen`/`_MEIPASS` 与临时 HOME，验证可写路径、
+  只补缺迁移、源码形态不变），`pytest tests -q` 21 passed
 
 ## [历史版本]
 

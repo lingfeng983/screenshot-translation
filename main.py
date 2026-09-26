@@ -6,6 +6,7 @@
 """
 
 import logging
+import os
 import sys
 import threading
 
@@ -19,7 +20,7 @@ from PyQt5.QtWidgets import (
 )
 
 # 配置日志（全局唯一入口，其他模块只使用 logging.getLogger）
-# 日志路径按运行形态定位：源码→项目根，exe→exe同目录（可写）
+# 日志路径按运行形态定位：源码→项目根，exe→~/.screenshot-translation（可写）
 from managers import app_paths, result_render
 logging.basicConfig(
     level=logging.INFO,
@@ -54,6 +55,10 @@ class MainApp:
     def __init__(self):
         """初始化主应用并注册全局异常处理"""
         logger.info("初始化主应用")
+
+        # 旧版把可写文件放在 exe 旁边，先搬进用户目录再判断是否首次运行
+        app_paths.migrate_legacy_data()
+        self.first_run = not os.path.exists(app_paths.config_file())
 
         # 设置全局异常处理
         self._setup_exception_handler()
@@ -198,8 +203,9 @@ class MainApp:
                 if not minimize_to_tray:
                     # 显示配置窗口
                     self.open_config_window()
-                else:
-                    # 默认行为：静默驻留托盘。通知用独立计时器延迟发出：
+                elif self.first_run:
+                    # 只在首次运行提示一次：图标常驻后每次都弹通知是噪音，
+                    # 交互方式托盘 tooltip 已经写了。通知要延迟发出：
                     # 1) 避开 pystray Icon.run 未就绪的窗口期
                     # 2) QTimer 在 exec_ 之前创建不触发（Qt对象尚未关联事件循环），
                     #    threading.Timer 不依赖 Qt，最可靠
@@ -207,15 +213,15 @@ class MainApp:
                         try:
                             if self.tray_manager:
                                 self.tray_manager.show_notification(
-                                    "截图翻译工具",
-                                    "已在右下角托盘运行。左键单击图标：截图翻译；"
-                                    "双击：打开设置")
+                                    "截图翻译已就绪", "Alt+Z 开始截图翻译")
                         except Exception as e:
                             logger.warning(f"启动通知失败: {e}")
 
                     notice_timer = threading.Timer(2.0, _startup_notice)
                     notice_timer.daemon = True
                     notice_timer.start()
+                else:
+                    logger.info("非首次启动，跳过托盘提示通知")
             except Exception as e:
                 logger.error(f"处理启动行为失败: {e}")
 

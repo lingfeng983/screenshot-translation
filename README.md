@@ -8,7 +8,7 @@
 从 [Releases](https://gitee.com/lingfeng983/screenshot-translation/releases) 下载 `ScreenshotTranslator.zip`
 （约298MB，解压后是一个目录，入口 `ScreenshotTranslator/ScreenshotTranslator.exe`）：
 
-1. 整目录解压到任意位置，双击 exe 运行——首次启动自动生成 `config.ini`
+1. 整目录解压到任意位置，双击 exe 运行——首次启动在 `%USERPROFILE%\.screenshot-translation\` 生成 `config.ini`
 2. 右下角托盘出现图标（若被折叠，点任务栏 `^` 展开并右键图标→设置常显）
 3. **Tesseract OCR 已内置**（含中英文语言包），无需额外下载，开箱即用
 4. 按 `Alt+Z` 截图翻译
@@ -198,7 +198,7 @@ ScreenshotTranslation/
 │   └── test_config_ui.py              # 配置界面测试（开发中）
 ├── managers/                # 核心功能模块
 │   ├── provider_common.py   # ★ 插件架构公共基座（注册表/自动发现/基类/降级链）
-│   ├── app_paths.py         # ★ 路径定位（源码/exe双形态：配置/缓存/日志/资源）
+│   ├── app_paths.py         # ★ 路径定位（源码→项目根 / 打包→~/.screenshot-translation，含旧数据迁移）
 │   ├── translation.py       # 翻译管理器（分发/缓存/降级链）
 │   ├── ocr.py               # OCR管理器（分发/重试/降级）
 │   ├── screenshot.py        # 截图遮罩（磁吸/气泡/角标记）+ 就地译文结果态
@@ -253,9 +253,12 @@ python -m PyInstaller screenshot-translator.spec --noconfirm
 `_avif/_webp/_imagingtk` 等扩展、tesseract 副本在根目录重复落地的 47 个 DLL
 （仅 `libffi-8.dll`、`zlib1.dll` 被 CPython/Qt/PIL 真实加载，必须留在根目录）。
 
-exe 启动即加载本目录下的 `_internal`，不再解包到临时目录；`config.ini`、日志与
-缓存文件都写在 exe 同级目录，日志按 2MB × 3 份轮转。OCR 组件随 `_internal` 分发，
-无需安装。
+exe 启动即加载本目录下的 `_internal`，不再解包到临时目录。可写文件统一落在
+`%USERPROFILE%\.screenshot-translation\`（`config.ini`、`translation_cache.json`、
+按 2MB × 3 轮转的 `screenshot_translation.log`），产物目录保持只读——放进
+Program Files 或整目录覆盖升级都不会丢配置；旧版本留在 exe 同目录的配置与缓存
+首次启动会自动搬进该目录（只补缺，不覆盖已有文件）。源码运行仍在项目根。
+OCR 组件随 `_internal` 分发，无需安装。
 
 ## 🆘 技术支持
 
