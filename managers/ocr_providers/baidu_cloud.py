@@ -17,6 +17,7 @@ import time
 import requests
 
 from .base import OCRProvider
+from ..text_block import TextBlock
 
 logger = logging.getLogger('screenshot-translation')
 
@@ -33,6 +34,8 @@ class BaiduOCRProvider(OCRProvider):
 
     TOKEN_URL = 'https://aip.baidubce.com/oauth/2.0/token'
     OCR_URL = 'https://aip.baidubce.com/rest/2.0/ocr/v1/general_basic'
+    # general 接口比 general_basic 多返回每行 location 坐标，就地覆盖原文时用它
+    GENERAL_URL = 'https://aip.baidubce.com/rest/2.0/ocr/v1/general'
 
     def __init__(self, config_manager=None):
         """
@@ -101,6 +104,57 @@ class BaiduOCRProvider(OCRProvider):
         Raises:
             Exception: 密钥未设置或识别失败
         """
+        result = self._post_image(self.OCR_URL, image)
+        words = result.get('words_result') or []
+        text = '\n'.join(w.get('words', '') for w in words)
+        logger.info(f"百度云OCR识别完成，{len(words)} 行文本")
+        if not text.strip():
+            raise Exception("百度云OCR未识别到任何文本")
+        return self.clean_text(text)
+
+    def recognize_blocks(self, image):
+        """
+        行级块识别：走带坐标的 general 接口
+
+        Args:
+            image (PIL.Image.Image): 待识别的图像
+
+        Returns:
+            list[TextBlock]: 按接口返回顺序（阅读顺序）的行块
+
+        Raises:
+            Exception: 密钥未设置或未识别到文本
+        """
+        result = self._post_image(self.GENERAL_URL, image)
+        items = result.get('words_result') or []
+        blocks = []
+        for item in items:
+            text = (item.get('words') or '').strip()
+            loc = item.get('location') or {}
+            if not text or not loc:
+                continue
+            blocks.append(TextBlock(
+                text, loc.get('left', 0), loc.get('top', 0),
+                loc.get('width', 0), loc.get('height', 0)))
+        logger.info(f"百度云OCR块级识别完成，{len(blocks)} 行")
+        if not blocks:
+            raise Exception("百度云OCR未识别到任何文本")
+        return blocks
+
+    def _post_image(self, url, image):
+        """
+        把图像送进指定百度OCR接口并返回解析后的响应
+
+        Args:
+            url (str): 接口地址（general / general_basic）
+            image (PIL.Image.Image): 待识别的图像
+
+        Returns:
+            dict: 接口响应
+
+        Raises:
+            Exception: 密钥未设置、网络错误或业务错误
+        """
         token = self._get_access_token()
 
         # 图像编码为base64（PNG无损，避免JPEG压缩损失小字清晰度）
@@ -111,7 +165,7 @@ class BaiduOCRProvider(OCRProvider):
 
         try:
             response = self.session.post(
-                self.OCR_URL,
+                url,
                 params={'access_token': token},
                 headers={'Content-Type': 'application/x-www-form-urlencoded'},
                 data=f'image={image_b64}',
@@ -124,13 +178,7 @@ class BaiduOCRProvider(OCRProvider):
             if 'error_code' in result:
                 raise Exception(
                     f"百度云OCR错误: {result.get('error_code')} {result.get('error_msg', '')}")
-
-            words = result.get('words_result') or []
-            text = '\n'.join(w.get('words', '') for w in words)
-            logger.info(f"百度云OCR识别完成，{len(words)} 行文本")
-            if not text.strip():
-                raise Exception("百度云OCR未识别到任何文本")
-            return self.clean_text(text)
+            return result
 
         except (requests.RequestException, json.JSONDecodeError) as e:
             raise Exception(f"百度云OCR请求失败: {e}") from e

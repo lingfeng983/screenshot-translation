@@ -7,7 +7,7 @@ PyInstaller 单文件打包配置
 """
 
 import os
-from PyInstaller.utils.hooks import collect_data_files
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 block_cipher = None
 
@@ -32,10 +32,12 @@ else:
     print('>>> 警告: 未找到 OCR bundle，exe 将不含 Tesseract（运行时需自行提供）')
 
 # 隐藏导入：pystray 的 Windows 后端与键盘库按需动态加载
+# 插件包（翻译API / OCR引擎）只在运行时按目录扫描发现，静态分析看不到引用，
+# 不显式收集的话 exe 里一个 provider 都没有，翻译与OCR全部失效
 hiddenimports = [
     'pystray._win32',
     'PIL._tkinter_finder',
-]
+] + collect_submodules('managers.providers') + collect_submodules('managers.ocr_providers')
 
 a = Analysis(
     ['main.py'],

@@ -113,6 +113,70 @@ class OCRManager(ProviderChainManager):
 
         return result
 
+    def perform_ocr_with_blocks(self, image):
+        """
+        一次识别同时拿到整段文本与带坐标的行块
+
+        就地覆盖原文需要坐标，所以先走块级链路；引擎不支持坐标或识别失败时
+        退回 perform_ocr 的文本降级链路，此时行块列表为空，
+        调用方据此降级为整体气泡展示。
+
+        Args:
+            image (PIL.Image.Image): 待识别的图像
+
+        Returns:
+            tuple[str, list[TextBlock]]: (整段文本, 行块列表)
+        """
+        blocks = self._perform_ocr_blocks(image)
+        if blocks:
+            text = '\n'.join(block.text for block in blocks)
+            if text.strip():
+                return text, blocks
+        return self.perform_ocr(image), []
+
+    def _perform_ocr_blocks(self, image):
+        """
+        块级识别降级链：当前引擎 -> 本地Tesseract
+
+        Args:
+            image (PIL.Image.Image): 待识别的图像
+
+        Returns:
+            list[TextBlock]: 行块列表；无可用坐标时为空列表
+        """
+        provider_cls = self._resolve_provider(self.ocr_type)
+        if provider_cls is None:
+            return []
+
+        blocks = self._recognize_blocks_via(provider_cls, image)
+        if not blocks:
+            fallback_cls = ocr_provider_registry.get('tesseract')
+            if fallback_cls is not None and fallback_cls is not provider_cls:
+                logger.warning("当前OCR引擎拿不到块级坐标，尝试本地Tesseract")
+                blocks = self._recognize_blocks_via(fallback_cls, image)
+        return blocks
+
+    def _recognize_blocks_via(self, provider_cls, image):
+        """
+        通过指定provider做块级识别；任何失败返回空列表而不是抛异常
+
+        Args:
+            provider_cls: OCR provider类
+            image (PIL.Image.Image): 待识别的图像
+
+        Returns:
+            list[TextBlock]: 行块列表或空列表
+        """
+        def factory():
+            return provider_cls(config_manager=self.config_manager)
+
+        def call(provider):
+            return provider.recognize_blocks(image)
+
+        result = self._run_provider(
+            factory, call, lambda err: None, retry_handler=ocr_retry_handler)
+        return result if isinstance(result, list) else []
+
     def _recognize_via(self, provider_cls, image, retry_handler=None):
         """
         通过指定provider识别，自带重试；失败返回错误文本而非抛异常，

@@ -92,6 +92,92 @@ def test_progress_manager():
     except Exception as e:
         print(f"⚠️ 进度管理器测试跳过 (需要GUI环境): {e}\n")
 
+def test_screenshot_widget():
+    """测试截图遮罩窗口：初始化属性完整、可绘制、能获得焦点（ESC 退出依赖焦点）"""
+    print("=== 测试截图遮罩窗口 ===")
+    try:
+        from PyQt5.QtWidgets import QApplication
+        from PyQt5.QtCore import Qt, QPoint
+        from managers.screenshot import ScreenshotWidget
+    except Exception as e:
+        print(f"⚠️ 截图遮罩测试跳过 (导入失败): {e}\n")
+        return
+
+    app = QApplication.instance() or QApplication(sys.argv)
+    widget = ScreenshotWidget()
+
+    for attr in ('begin', 'end', 'is_selecting', 'full_screen',
+                 'screen_width', 'screen_height', '_snap_window_rects'):
+        assert hasattr(widget, attr), f"缺少初始化属性 {attr}"
+    assert widget.full_screen is not None, "全屏背景未截取"
+    assert widget.focusPolicy() == Qt.StrongFocus, "遮罩无焦点策略，ESC 无法退出"
+
+    widget.grab()  # 未选择状态绘制提示条
+    widget.begin, widget.end = QPoint(20, 20), QPoint(120, 90)
+    widget.is_selecting = True
+    widget.grab()  # 选区状态绘制边框/气泡/参考线
+    print("✅ 截图遮罩窗口测试通过\n")
+
+def test_tesseract_no_console_window():
+    """Tesseract 子进程必须带 no-window 标志：无控制台的 exe 里否则会闪终端窗口"""
+    print("=== 测试 Tesseract 子进程不弹控制台窗口 ===")
+    import subprocess
+    import sys
+
+    from managers.ocr_providers.tesseract import (
+        _HiddenSpawnSubprocess, _no_window_flags)
+
+    calls = []
+
+    class FakeSubprocess:
+        PIPE = 'pipe-const'
+
+        def run(self, args, **kwargs):
+            calls.append(kwargs)
+            return 'ok'
+
+    proxy = _HiddenSpawnSubprocess(FakeSubprocess(), 0x08000000)
+    proxy.run(['tesseract'], stdout=proxy.PIPE)
+    assert calls and calls[0].get('creationflags') == 0x08000000, "未注入 no-window 标志"
+    assert proxy.PIPE == 'pipe-const', "常量未透传"
+
+    if sys.platform == 'win32':
+        import pytesseract
+        assert _no_window_flags() == getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+        assert isinstance(pytesseract.pytesseract.subprocess, _HiddenSpawnSubprocess), \
+            "pytesseract 未被代理，打包后翻译时会闪出终端窗口"
+    print("✅ Tesseract 子进程窗口抑制测试通过\n")
+
+
+def test_result_render_layout():
+    """就地覆盖排版：借用的向下空间受下一行与选区下沿约束"""
+    print("=== 测试译文就地覆盖排版 ===")
+    from PyQt5.QtCore import QRect
+    from PyQt5.QtGui import QFont
+    from PyQt5.QtWidgets import QApplication
+
+    import managers.result_render as rr
+    from managers.text_block import TextBlock
+
+    # 必须持有引用：QApplication 被回收后 Qt 字体度量会直接崩
+    app = QApplication.instance() or QApplication(sys.argv)
+    upper = TextBlock('one', 0, 0, 200, 20)
+    lower = TextBlock('two', 0, 30, 200, 20)
+    aside = TextBlock('x', 300, 40, 100, 20)
+    bounds = QRect(0, 0, 400, 100)
+
+    # 横向重叠的下一行决定下沿；不相干的行不挡
+    assert rr._block_bottom_limit(upper, [lower, aside], bounds) == lower.top - rr.COVER_PAD
+    assert rr._block_bottom_limit(upper, [aside], bounds) == bounds.bottom()
+
+    font = QFont()
+    assert rr.bilingual_source_layout(font, 18, 12) == (0, 0), \
+        "空间不足时应放弃原文行，保住译文"
+    pixel_size, source_height = rr.bilingual_source_layout(font, 18, 40)
+    assert source_height > 0 and pixel_size >= rr.FONT_MIN_PX
+    print("✅ 译文就地覆盖排版测试通过\n")
+
+
 def test_qt_dispatcher():
     """测试Qt线程调度器"""
     print("=== 测试Qt线程调度器 ===")
@@ -114,6 +200,9 @@ def main():
         test_retry_handler()
         test_cache_manager()
         test_progress_manager()
+        test_screenshot_widget()
+        test_result_render_layout()
+        test_tesseract_no_console_window()
         test_qt_dispatcher()
 
         print("🎉 所有测试通过！新功能工作正常。")

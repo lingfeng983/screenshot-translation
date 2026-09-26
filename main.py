@@ -119,8 +119,8 @@ class MainApp:
             # 初始化配置管理器
             self.config_manager = ConfigManager()
 
-            # 初始化OCR管理器
-            self.ocr_manager = OCRManager()
+            # 初始化OCR管理器（必须传入配置，否则 [OCR] 段的引擎与语言配置不生效）
+            self.ocr_manager = OCRManager(self.config_manager)
 
             # 初始化翻译管理器
             self.translation_manager = TranslationManager(self.config_manager)

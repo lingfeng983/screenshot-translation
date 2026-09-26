@@ -11,7 +11,7 @@
 5. 测试翻译按钮：edge_free 真实网络点击应成功
 6. 全部API真实连通性矩阵（限定超时，失败必须优雅）
 7. 保存流程：写入配置、同步翻译/OCR管理器（测试后还原config.ini）
-8. 结果对话框：按钮齐全、复制译文写剪贴板、切换语言自动重译
+8. 遮罩结果态：就地译文覆盖、工具条三态、段落卡片、降级与失败态
 9. 真实启动冒烟：spawn main.py，验证日志出现"应用启动成功"后结束进程
 """
 
@@ -248,62 +248,102 @@ def _run_tests(app, failures):
         win.api_type_combo.setCurrentIndex(win.api_type_combo.findData('edge_free'))
     check("保存流程：配置写盘+翻译/OCR管理器同步", t_save)
 
-    # ---- 8. 结果对话框 ----
-    def t_result_dialog():
-        import managers.screenshot as ss
-        from managers.providers.base import TARGET_LANGUAGES
+    # ---- 8. 遮罩结果态：就地覆盖 + 工具条 + 气泡卡片 ----
+    def t_overlay_result():
+        from PIL import Image, ImageDraw
+        from PyQt5.QtCore import QPoint, QRect
+        from PyQt5.QtWidgets import QApplication, QPushButton
 
-        opened = {}
-        orig_exec = None
+        import managers.result_render as rr
+        from managers.screenshot import ScreenshotWidget
+        from managers.text_block import TextBlock, group_paragraphs
 
-        sm = main_app.screenshot_manager or __import__(
-            'managers.screenshot', fromlist=['ScreenshotManager']).ScreenshotManager()
-        sm.ocr_manager = main_app.ocr_manager
-        sm.translation_manager = main_app.translation_manager
+        lines = ['Hello world, this is line one',
+                 'and this is the second line',
+                 'third line of the paragraph']
+        translated = ['第一行译文', '第二行译文内容较长用于验证缩放', '第三行译文']
+        scale = 2.0
+        image = Image.new('RGB', (int(300 * scale), int(80 * scale)), (250, 250, 250))
+        draw = ImageDraw.Draw(image)
+        for i in range(3):
+            draw.text((int(4 * scale), int(i * 26 * scale)), lines[i],
+                      fill=(20, 20, 20))
+        blocks = [TextBlock(t, int(4 * scale), int(i * 26 * scale),
+                            int(220 * scale), int(20 * scale))
+                  for i, t in enumerate(lines)]
+        payload = {
+            'original_text': '\n'.join(lines),
+            'translated_text': '\n'.join(translated),
+            'blocks': blocks, 'block_texts': translated,
+            'image': image, 'region': QRect(20, 30, 300, 80),
+            'languages': [('zh', '中文'), ('ja', '日文')],
+            'target_lang': 'zh', 'request_id': 0, 'error': None,
+        }
 
-        # 拦截 exec_ 防止阻塞：定时关闭
-        from PyQt5.QtWidgets import QDialog
-        orig_exec = QDialog.exec_
-
-        def fake_exec(self):
-            opened['shown'] = True
-            # 记录对话框内的关键控件
-            btns = [b.text() for b in self.findChildren(type(win.save_button))]
-            opened['buttons'] = btns
-            QTimer.singleShot(300, self.accept)
-            return orig_exec(self)
-
-        QDialog.exec_ = fake_exec
+        widget = ScreenshotWidget()
+        widget.resize(900, 520)
         try:
-            sm._show_translation_dialog("Hello world", "你好世界")
-            _spin(600, app, condition=lambda: opened.get('shown'))
-            assert opened.get('shown'), "对话框未显示"
-            btns = opened.get('buttons', [])
-            for expect in ('复制译文', '复制原文', '重新翻译'):
-                assert expect in btns, f"缺少按钮: {expect}，实际{btns}"
+            widget._request_id = 0
+            widget.show_result(payload)
+            assert widget.has_result(), "结果未落地"
+            assert widget.current_payload() is payload
+            assert widget._scale == scale, f"像素倍率应为{scale}，实际{widget._scale}"
+            assert len(widget._blocks) == 3
+            assert widget._blocks[0].left == 4, "行块未换算为逻辑坐标"
+            assert len(group_paragraphs(widget._blocks)) == 1, "同段三行被拆开"
+            assert len(widget._paragraphs) == 1, "段落聚合结果不符"
+
+            # 工具条：三态按钮 + 语言下拉 + 操作按钮齐全
+            toolbar = widget._toolbar
+            assert toolbar is not None, "工具条未创建"
+            btn_texts = [b.text() for b in toolbar.findChildren(QPushButton)]
+            for expect in ('原文', '双语', '译文', '复制', '钉住', '保存', '重译', '×'):
+                assert expect in btn_texts, f"工具条缺少 {expect}: {btn_texts}"
+            assert toolbar.current_mode() == rr.MODE_TRANSLATED
+            assert toolbar.current_language() == 'zh'
+
+            # 三态切换 + 悬停/点击段落 + 复制，逐状态绘制一次确认不抛异常
+            for mode in rr.MODES:
+                widget._set_mode(mode)
+                assert widget.grab() is not None, f"{mode} 模式绘制失败"
+            widget._set_mode(rr.MODE_TRANSLATED)
+
+            para_rect, indices = widget._paragraphs[0]
+            assert widget._paragraph_at(para_rect.center()) == 0, "段落命中测试失败"
+            assert widget._paragraph_at(QPoint(860, 500)) is None
+            widget._hover_paragraph = 0
+            assert widget._card_info(), "悬停段落应出气泡卡片"
+            widget._hover_paragraph = None
+            assert widget._card_info() is None, "无行级译文缺失时不该再压卡片"
+
+            widget._copy_result()
+            clipboard = QApplication.clipboard().text()
+            assert '第一行译文' in clipboard, f"剪贴板内容不符: {clipboard}"
+
+            # 行级译文缺失时降级为整段卡片
+            degraded = dict(payload)
+            degraded['block_texts'] = []
+            widget.show_result(degraded)
+            assert widget._card_info(), "无行级译文时应展示整段卡片"
+            assert widget.grab() is not None
+
+            # 失败态与过期结果
+            widget.show_failure('OCR 服务不可用')
+            assert widget._error and not widget.has_result()
+            assert widget.grab() is not None
+            from managers.screenshot import ScreenshotManager
+            sm = main_app.screenshot_manager or ScreenshotManager()
+            stale = dict(payload)
+            stale['request_id'] = 99
+            previous_widget = sm._screenshot_widget
+            sm._screenshot_widget = widget
+            sm._apply_result(widget, stale)
+            assert widget._error == 'OCR 服务不可用', "过期选区的结果被误应用"
+            sm._screenshot_widget = previous_widget
         finally:
-            QDialog.exec_ = orig_exec
-
-        # 复制译文到剪贴板（独立小对话框构造太重，直接验证核心逻辑）
-        from PyQt5.QtWidgets import QDialog, QVBoxLayout, QTextEdit, QPushButton, QApplication
-        dlg = QDialog()
-        lay = QVBoxLayout(dlg)
-        te = QTextEdit()
-        te.setPlainText("你好世界")
-        btn = QPushButton("复制译文")
-        lay.addWidget(te); lay.addWidget(btn)
-        btn.clicked.connect(lambda: QApplication.clipboard().setText(te.toPlainText()))
-        dlg.show(); _spin(100, app)
-        btn.click(); _spin(100, app)
-        assert QApplication.clipboard().text() == "你好世界", "剪贴板内容不符"
-
-        # 切换语言自动重译（_dialog_ready 防护 + target_lang 参数链路）
-        assert main_app.translation_manager.target_lang == 'ja'  # 保存流程设置的
-        r = main_app.translation_manager.perform_translation(
-            "language switch test", force_refresh=True, target_lang='ko')
-        assert r and not r.startswith('[翻译失败'), f"韩语重译失败: {r}"
-        print(f"   ↳ 切语言重译(ko): {r[:30]}")
-    check("结果对话框：按钮齐全/剪贴板/切语言重译", t_result_dialog)
+            widget.close()
+            widget.deleteLater()
+    check("遮罩结果态：就地覆盖/工具条/段落卡片/降级/失败", t_overlay_result)
 
     win.close()
 

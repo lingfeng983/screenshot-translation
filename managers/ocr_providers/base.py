@@ -16,10 +16,27 @@ class OCRProvider(BaseProvider):
 
     子类实现 recognize(image)，接收 PIL.Image.Image，返回 str；
     识别失败抛异常，由上层重试/降级机制处理。
+    需要支持"就地覆盖原文"的子类再实现 recognize_blocks(image)，
+    返回带像素坐标的 TextBlock 列表。
     配置从 [OCR] 段读取。
     """
 
     _config_section = 'OCR'
+
+    def recognize_blocks(self, image):
+        """
+        行级块识别（就地覆盖原文所需的坐标来源）
+
+        只有能返回文本框的引擎实现本方法；未实现时抛
+        NotImplementedError，由 OCRManager 降级为纯文本链路。
+
+        Args:
+            image (PIL.Image.Image): 待识别图像
+
+        Raises:
+            NotImplementedError: 当前引擎不提供行级坐标
+        """
+        raise NotImplementedError(f"{self.display_name} 不支持行级坐标识别")
 
     def _get_option(self, option, fallback=''):
         """

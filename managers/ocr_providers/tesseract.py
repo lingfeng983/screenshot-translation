@@ -11,8 +11,11 @@ Tesseract OCR 提供者（本地离线识别）
 
 import logging
 import os
+import subprocess
+import sys
 
 from .. import app_paths
+from ..text_block import TextBlock
 from .base import OCRProvider
 
 logger = logging.getLogger('screenshot-translation')
@@ -24,6 +27,57 @@ except ImportError as e:
     logger.warning(f"无法导入pytesseract: {e}，将使用模拟OCR")
     pytesseract = None
     pytesseract_available = False
+
+
+def _no_window_flags():
+    """Windows下禁止子进程分配控制台窗口的标志"""
+    if sys.platform != 'win32':
+        return 0
+    return getattr(subprocess, 'CREATE_NO_WINDOW', 0x08000000)
+
+
+class _HiddenSpawnSubprocess:
+    """
+    pytesseract 内 subprocess 的代理：给所有进程创建补上 no-window 标志
+
+    pytesseract 只在 STARTUPINFO 里设了 SW_HIDE。父进程没有控制台时
+    （打包成 exe 后就是这种情况），Windows 会为 tesseract.exe 另开一个
+    终端宿主窗口，表现为翻译时一闪而逝的弹框；只有 CREATE_NO_WINDOW
+    能阻止控制台分配。它有多处裸调用（识别、版本探测、语言列表），
+    所以整体代理它的 subprocess 引用。
+    """
+
+    def __init__(self, module, flags):
+        self._module = module
+        self._flags = flags
+        for name in ('Popen', 'run', 'call', 'check_call', 'check_output'):
+            setattr(self, name, self._bind(name))
+
+    def _bind(self, name):
+        flags = self._flags
+
+        def spawn(*args, **kwargs):
+            kwargs.setdefault('creationflags', flags)
+            return getattr(self._module, name)(*args, **kwargs)
+
+        return spawn
+
+    def __getattr__(self, name):
+        return getattr(self._module, name)
+
+
+def _hide_pytesseract_console():
+    """把代理装到 pytesseract 的模块命名空间（幂等，重复导入不会叠加）"""
+    if not pytesseract_available or sys.platform != 'win32':
+        return
+    module = pytesseract.pytesseract
+    flags = _no_window_flags()
+    if not flags or isinstance(module.subprocess, _HiddenSpawnSubprocess):
+        return
+    module.subprocess = _HiddenSpawnSubprocess(module.subprocess, flags)
+
+
+_hide_pytesseract_console()
 
 
 def _find_tesseract_cmd():
@@ -139,6 +193,60 @@ class TesseractProvider(OCRProvider):
         if not cleaned:
             raise Exception("Tesseract未识别到任何文本")
         return cleaned
+
+    def recognize_blocks(self, image):
+        """
+        行级块识别：词框按 段落/行 合并成行块
+
+        Args:
+            image (PIL.Image.Image): 待识别图像
+
+        Returns:
+            list[TextBlock]: 按阅读顺序排列的行块
+
+        Raises:
+            Exception: pytesseract不可用或未识别到文本
+        """
+        if not pytesseract_available:
+            raise Exception("pytesseract未安装，无法使用Tesseract识别")
+
+        processed = self._preprocess_image(image)
+        # 预处理会放大图像，框坐标要按比例缩回原图坐标系
+        scale = image.width / processed.width if processed.width else 1.0
+        custom_config = f"--psm 6 -l {self._get_langs()}"
+        data = pytesseract.image_to_data(
+            processed, config=custom_config, output_type=pytesseract.Output.DICT)
+
+        lines = {}
+        for i in range(len(data.get('text', []))):
+            text = (data['text'][i] or '').strip()
+            try:
+                conf = int(data['conf'][i])
+            except (TypeError, ValueError):
+                conf = 0
+            if not text or conf <= 0:
+                continue
+            key = (data['block_num'][i], data['par_num'][i], data['line_num'][i])
+            lines.setdefault(key, []).append({
+                'text': text,
+                'word_num': data['word_num'][i],
+                'left': data['left'][i],
+                'top': data['top'][i],
+                'width': data['width'][i],
+                'height': data['height'][i],
+            })
+
+        blocks = []
+        for key in sorted(lines):
+            words = sorted(lines[key], key=lambda w: w['word_num'])
+            block = TextBlock.merge_words(words, scale=scale)
+            if block is not None:
+                blocks.append(block)
+
+        logger.info(f"Tesseract块级识别完成，{len(blocks)} 行")
+        if not blocks:
+            raise Exception("Tesseract未识别到任何文本")
+        return blocks
 
     def get_available_languages(self):
         """
