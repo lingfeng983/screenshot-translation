@@ -12,6 +12,15 @@ from typing import Callable, Any
 
 logger = logging.getLogger('screenshot-translation')
 
+
+class NonRetryableError(Exception):
+    """
+    重试无意义的错误（配置缺失、能力不支持等）
+
+    鉴权未填、密钥为空、引擎不支持某种能力：重试多少次结果都一样，
+    只会白等退避时间（默认两次退避合计约 3 秒），因此直接放弃。
+    """
+
 class RetryHandler:
     """
     重试处理器类
@@ -63,6 +72,12 @@ class RetryHandler:
                 if attempt > 0:
                     logger.info(f"第{attempt + 1}次尝试成功")
                 return result
+
+            except NonRetryableError as e:
+                # 配置类/能力类错误：立刻放弃，不浪费退避时间
+                last_exception = e
+                logger.warning(f"遇到不可重试错误，不进行重试: {e}")
+                break
 
             except Exception as e:
                 last_exception = e

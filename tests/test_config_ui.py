@@ -11,8 +11,10 @@
 5. 测试翻译按钮：edge_free 真实网络点击应成功
 6. 全部API真实连通性矩阵（限定超时，失败必须优雅）
 7. 保存流程：写入配置、同步翻译/OCR管理器（测试后还原config.ini）
-8. 遮罩结果态：就地译文覆盖、工具条三态、段落卡片、降级与失败态
-9. 真实启动冒烟：spawn main.py，验证日志出现"应用启动成功"后结束进程
+8. 主题切换：浅色/深色渲染实测、保存落盘；扩展provider自定义字段保存与回读
+9. 遮罩结果态：就地译文覆盖、工具条三态、段落卡片、降级与失败态
+10. 真实启动冒烟：spawn main.py，验证日志出现"应用启动成功"后结束进程
+11. 设置页排版：下拉框滚轮免疫（带对照组）、分组/行距紧凑、标签右对齐
 """
 
 import os
@@ -257,6 +259,81 @@ def _run_tests(app, failures):
         win.api_type_combo.setCurrentIndex(win.api_type_combo.findData('edge_free'))
     check("保存流程：配置写盘+翻译/OCR管理器同步", t_save)
 
+    # ---- 7b. 主题切换（浅色渲染实测）与扩展 provider 字段持久化 ----
+    def t_theme_and_extension():
+        from managers import styles
+        from managers.providers import provider_registry
+        from managers.providers.base import TranslationProvider
+
+        assert win.theme_combo.count() == len(styles.available_themes()), "主题下拉项数量不符"
+
+        def panel_lightness():
+            """取分组面板区域的亮度（窗口已关闭时 grab 仍会重新渲染）"""
+            image = win.grab().toImage()
+            if image.isNull():
+                return None
+            return image.pixelColor(image.width() // 2, 200).lightness()
+
+        # 浅色：进程级样式立即生效，且渲染出来确实是浅色
+        win.theme_combo.setCurrentIndex(win.theme_combo.findData('light'))
+        _spin(150, app)
+        assert styles.current_theme() == 'light', "主题未切换到浅色"
+        assert '#f2f4f8' in app.styleSheet(), "浅色主题未应用到全局样式"
+        light_value = panel_lightness()
+        if light_value is not None:
+            assert light_value > 180, f"浅色主题面板仍偏暗: {light_value}"
+
+        # 深色：换回来必须是暗底，证明两套主题真的换了色
+        win.theme_combo.setCurrentIndex(win.theme_combo.findData('dark'))
+        _spin(150, app)
+        assert styles.current_theme() == 'dark'
+        dark_value = panel_lightness()
+        if dark_value is not None:
+            assert dark_value < 120, f"深色主题面板不够暗: {dark_value}"
+
+        # 浅色 + 保存：主题应落盘
+        win.theme_combo.setCurrentIndex(win.theme_combo.findData('light'))
+        _spin(120, app)
+        win._on_save()
+        assert win.config_manager.get_theme() == 'light', "主题未保存到配置"
+        print(f"   ↳ 主题渲染亮度: 浅色={light_value} 深色={dark_value}")
+
+        # 扩展 provider 声明的自定义字段必须能保存与回读（插件架构承诺）
+        class ProbeProvider(TranslationProvider):
+            name = 'probe_api'
+            display_name = '探针翻译'
+            config_fields = (('probe_custom_field', '自定义字段', False),)
+
+        provider_registry.register(ProbeProvider, override=True)
+        probe_win = None
+        try:
+            probe_win = ConfigWindow(main_app)
+            probe_win.api_type_combo.setCurrentIndex(
+                probe_win.api_type_combo.findData('probe_api'))
+            _spin(150, app)
+            assert 'probe_custom_field' in probe_win._api_field_edits, \
+                f"扩展provider字段未生成: {list(probe_win._api_field_edits)}"
+            probe_win._api_field_edits['probe_custom_field'].setText('扩展字段值')
+            probe_win._save_form_fields()
+            assert win.config_manager.get_translation_option('probe_custom_field') == '扩展字段值', \
+                "扩展provider字段未写入配置"
+            probe_win.close()
+            probe_win = ConfigWindow(main_app)
+            probe_win.api_type_combo.setCurrentIndex(
+                probe_win.api_type_combo.findData('probe_api'))
+            _spin(150, app)
+            assert probe_win._api_field_edits['probe_custom_field'].text() == '扩展字段值', \
+                "扩展provider字段未回读"
+        finally:
+            if probe_win is not None:
+                probe_win.close()
+            provider_registry.unregister('probe_api')
+            # 还原：主题回深色，清掉探针字段（config.ini 最后整体还原）
+            win.theme_combo.setCurrentIndex(win.theme_combo.findData('dark'))
+            _spin(100, app)
+            win.config_manager.set_translation_option('probe_custom_field', '')
+    check("主题切换（浅色渲染实测）与扩展provider字段持久化", t_theme_and_extension)
+
     # ---- 8. 遮罩结果态：就地覆盖 + 工具条 + 气泡卡片 ----
     def t_overlay_result():
         from PIL import Image, ImageDraw
@@ -353,6 +430,68 @@ def _run_tests(app, failures):
             widget.close()
             widget.deleteLater()
     check("遮罩结果态：就地覆盖/工具条/段落卡片/降级/失败", t_overlay_result)
+
+    # ---- 11. 设置页排版：滚轮免疫 / 紧凑间距 / 标签右对齐 ----
+    def t_layout_polish():
+        from PyQt5.QtCore import QPointF, QPoint, Qt
+        from PyQt5.QtGui import QWheelEvent
+        from PyQt5.QtWidgets import QComboBox, QFormLayout, QGroupBox, QScrollArea
+
+        def wheel_down(widget):
+            """向控件投递一次滚轮向下事件（走 QApplication.notify，会经过事件过滤器）"""
+            center = widget.rect().center()
+            ev = QWheelEvent(QPointF(center), widget.mapToGlobal(center),
+                             QPoint(), QPoint(0, -120),
+                             Qt.NoButton, Qt.NoModifier, Qt.ScrollUpdate, False)
+            QApplication.sendEvent(widget, ev)
+
+        # 对照组：未加过滤的下拉框必须能被滚轮改变，证明事件本身有效
+        ctrl = QComboBox()
+        ctrl.addItems(['甲', '乙', '丙'])
+        ctrl.setCurrentIndex(1)
+        wheel_down(ctrl)
+        assert ctrl.currentIndex() != 1, "对照组滚轮未改变下拉值，事件构造无效"
+        ctrl.deleteLater()
+
+        # 设置页下拉框：滚轮必须被忽略，选项不变
+        combos = (win.theme_combo, win.api_type_combo, win.target_lang_combo,
+                  win.fallback_api_combo, win.ocr_type_combo)
+        for combo in combos:
+            before = combo.currentIndex()
+            wheel_down(combo)
+            assert combo.currentIndex() == before, \
+                f"下拉框响应了滚轮: {before} -> {combo.currentIndex()}"
+
+        # 紧凑间距：分组间 ≤10px，各表单行距 ≤6px
+        scroll = win.findChildren(QScrollArea)[0]
+        content_layout = scroll.widget().layout()
+        assert content_layout.spacing() <= 10, f"分组间距过大: {content_layout.spacing()}"
+
+        # 滚轮转交：鼠标停在下拉框上时页面照常滚动（不是被吞掉）
+        vbar = scroll.verticalScrollBar()
+        if vbar.maximum() > 0:
+            vbar.setValue(0)
+            _spin(50, app)
+            before_scroll = vbar.value()
+            wheel_down(win.theme_combo)
+            assert vbar.value() > before_scroll, \
+                f"滚轮未转交滚动区: {before_scroll} -> {vbar.value()}"
+        group_count = 0
+        for group in win.findChildren(QGroupBox):
+            form = group.layout()
+            if isinstance(form, QFormLayout):
+                group_count += 1
+                assert form.verticalSpacing() <= 6, \
+                    f"{group.title()} 行距过大: {form.verticalSpacing()}"
+                assert form.labelAlignment() & Qt.AlignRight, \
+                    f"{group.title()} 标签未右对齐"
+        assert group_count >= 6, f"分组数量异常: {group_count}"
+
+        # 操作行：测试按钮与保存按钮同排固定在滚动区外
+        from PyQt5.QtWidgets import QPushButton
+        btn_texts = [b.text() for b in win.findChildren(QPushButton)]
+        assert '测试翻译' in btn_texts and '保存' in btn_texts
+    check("设置页排版：滚轮免疫/紧凑间距/标签右对齐", t_layout_polish)
 
     win.close()
 

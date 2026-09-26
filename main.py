@@ -12,16 +12,16 @@ import threading
 
 from logging.handlers import RotatingFileHandler
 
-from PyQt5.QtCore import QTimer
+from PyQt5.QtCore import QEvent, Qt, QTimer
 from PyQt5.QtWidgets import (
     QApplication, QDialog, QVBoxLayout, QLineEdit, QPushButton,
     QComboBox, QCheckBox, QGroupBox, QFormLayout, QMessageBox,
-    QHBoxLayout, QLabel
+    QHBoxLayout, QLabel, QScrollArea, QFrame, QWidget
 )
 
 # 配置日志（全局唯一入口，其他模块只使用 logging.getLogger）
 # 日志路径按运行形态定位：源码→项目根，exe→~/.screenshot-translation（可写）
-from managers import app_paths, result_render
+from managers import app_paths, result_render, styles
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -44,6 +44,32 @@ from managers.hotkey import HotkeyManager
 from managers.thread_pool import thread_pool_manager
 from managers.error_handler import error_handler
 from managers.qt_dispatcher import get_qt_app, qt_dispatcher
+
+_APP_QICON = None
+
+
+def _app_qicon():
+    """
+    程序全局窗口图标：16~256 全阶梯多尺寸 QIcon
+
+    托盘图标同样来自 managers.icon.generate_icon，保证托盘/任务栏/
+    窗口/Alt-Tab 看到的是同一套图标；多尺寸让 Windows 在任何 DPI 下
+    都能取到原生清晰的那档（以前只给 64px 一张，系统拉大就糊）。
+    """
+    global _APP_QICON
+    if _APP_QICON is not None:
+        return _APP_QICON
+    from PyQt5.QtGui import QIcon, QImage, QPixmap
+    from managers.icon import generate_icon
+    qicon = QIcon()
+    for size in (16, 24, 32, 48, 64, 128, 256):
+        pil_img = generate_icon(size)
+        data = pil_img.tobytes('raw', 'RGBA')
+        qimage = QImage(data, pil_img.width, pil_img.height,
+                        pil_img.width * 4, QImage.Format_RGBA8888)
+        qicon.addPixmap(QPixmap.fromImage(qimage))
+    _APP_QICON = qicon
+    return qicon
 
 
 class MainApp:
@@ -121,13 +147,11 @@ class MainApp:
             # 托盘常驻，关闭配置窗口不应结束事件循环
             self.app.setQuitOnLastWindowClosed(False)
 
-            # 全局深色蓝主题与程序图标
-            from managers import styles
-            self.app.setStyleSheet(styles.STYLE_SHEET)
-            self._apply_app_icon()
-
-            # 初始化配置管理器
+            # 配置管理器先就位：主题存在配置里，样式表要按它生成
             self.config_manager = ConfigManager()
+            styles.set_current_theme(self.config_manager.get_theme())
+            styles.apply_app(self.app)
+            self._apply_app_icon()
 
             # 初始化OCR管理器（必须传入配置，否则 [OCR] 段的引擎与语言配置不生效）
             self.ocr_manager = OCRManager(self.config_manager)
@@ -183,13 +207,7 @@ class MainApp:
     def _apply_app_icon(self):
         """设置应用全局图标（窗口与任务栏）"""
         try:
-            from managers.icon import generate_icon
-            from PyQt5.QtGui import QIcon, QImage, QPixmap
-            pil_img = generate_icon(64)
-            data = pil_img.tobytes('raw', 'RGBA')
-            qimage = QImage(data, pil_img.width, pil_img.height,
-                            pil_img.width * 4, QImage.Format_RGBA8888)
-            self.app.setWindowIcon(QIcon(QPixmap.fromImage(qimage)))
+            self.app.setWindowIcon(_app_qicon())
         except Exception as e:
             logger.warning(f"设置应用图标失败: {e}")
 
@@ -303,8 +321,8 @@ class MainApp:
                 if self.app:
                     try:
                         self.app.quit()
-                    except:
-                        pass
+                    except Exception as e:
+                        logger.error(f"退出Qt应用失败: {e}")
 
 class ConfigWindow(QDialog):
     """
@@ -324,22 +342,16 @@ class ConfigWindow(QDialog):
         self.config_manager = main_app.config_manager
 
         self.setWindowTitle("截图翻译工具 - 设置")
-        self.resize(640, 560)
+        # 设置项较多，内容用滚动区承载，小屏也能完整操作
+        self.resize(640, 620)
+        self.setMinimumSize(520, 420)
 
-        # 应用统一深色蓝主题
-        from managers import styles
+        # 应用当前主题（深色/浅色由 [UI] theme 决定，与全局样式一致）
         styles.apply_to(self)
 
         # 任务栏/窗口图标（PIL Image → QPixmap）
         try:
-            from managers.icon import generate_icon
-            from PyQt5.QtGui import QIcon, QImage, QPixmap
-            from PyQt5.QtCore import Qt
-            pil_img = generate_icon(64)
-            data = pil_img.tobytes('raw', 'RGBA')
-            qimage = QImage(data, pil_img.width, pil_img.height,
-                            pil_img.width * 4, QImage.Format_RGBA8888)
-            self.setWindowIcon(QIcon(QPixmap.fromImage(qimage)))
+            self.setWindowIcon(_app_qicon())
         except Exception as e:
             logger.debug(f"设置窗口图标失败: {e}")
 
@@ -353,11 +365,55 @@ class ConfigWindow(QDialog):
     def _init_ui(self):
         """构建配置窗口的表单控件并载入当前配置"""
         try:
-            layout = QVBoxLayout()
+            outer_layout = QVBoxLayout()
+            outer_layout.setContentsMargins(0, 0, 0, 0)
+
+            # 内容区放进滚动视图：设置项变多后小屏也能看到全部配置
+            scroll_area = QScrollArea()
+            scroll_area.setWidgetResizable(True)
+            scroll_area.setFrameShape(QFrame.NoFrame)
+            content = QWidget()
+            layout = QVBoxLayout(content)
+            layout.setContentsMargins(16, 10, 16, 10)
+            # 分组之间紧凑排布（原 14px 偏松）
+            layout.setSpacing(10)
+            scroll_area.setWidget(content)
+
+            def _new_form():
+                """统一表单规格：标签右对齐、行距紧凑、字段列随窗口伸展"""
+                form = QFormLayout()
+                form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+                form.setVerticalSpacing(6)
+                form.setHorizontalSpacing(10)
+                return form
+
+            # 外观配置（界面主题）
+            appearance_group = QGroupBox("外观")
+            appearance_layout = _new_form()
+
+            self.theme_combo = QComboBox()
+            for theme_key, theme_label in styles.available_themes():
+                self.theme_combo.addItem(theme_label, theme_key)
+            current_theme = (self.config_manager.get_theme()
+                             if self.config_manager else styles.DEFAULT_THEME)
+            theme_index = self.theme_combo.findData(current_theme)
+            if theme_index >= 0:
+                self.theme_combo.setCurrentIndex(theme_index)
+            # 切换即预览：先看效果，点保存后才长期生效
+            self.theme_combo.currentIndexChanged.connect(self._on_theme_changed)
+            appearance_layout.addRow("界面主题:", self.theme_combo)
+
+            theme_hint = QLabel("切换后立即预览，点“保存”后长期生效")
+            theme_hint.setObjectName("hintLabel")
+            appearance_layout.addRow("", theme_hint)
+
+            appearance_group.setLayout(appearance_layout)
+            layout.addWidget(appearance_group)
 
             # 翻译API配置
             api_group = QGroupBox("翻译API配置")
-            api_layout = QFormLayout()
+            api_layout = _new_form()
 
             # 从provider注册表获取可用的API（支持插件式扩展）
             from managers.providers import provider_registry
@@ -409,7 +465,7 @@ class ConfigWindow(QDialog):
             api_layout.addRow("降级API:", self.fallback_api_combo)
 
             # 当前API的动态字段区域（根据所选provider动态生成）
-            self.api_fields_layout = QFormLayout()
+            self.api_fields_layout = _new_form()
             api_layout.addRow(self.api_fields_layout)
             self._api_field_edits = {}
 
@@ -421,7 +477,7 @@ class ConfigWindow(QDialog):
 
             # OCR引擎配置
             ocr_group = QGroupBox("OCR引擎配置")
-            ocr_layout = QFormLayout()
+            ocr_layout = _new_form()
 
             # 从OCR provider注册表获取可用引擎
             from managers.ocr_providers import ocr_provider_registry
@@ -443,7 +499,7 @@ class ConfigWindow(QDialog):
             ocr_layout.addRow("OCR引擎:", self.ocr_type_combo)
 
             # 当前OCR引擎的动态字段区域
-            self.ocr_fields_layout = QFormLayout()
+            self.ocr_fields_layout = _new_form()
             ocr_layout.addRow(self.ocr_fields_layout)
             self._ocr_field_edits = {}
 
@@ -455,19 +511,29 @@ class ConfigWindow(QDialog):
 
             # 截图遮罩配置（磁吸阈值/暗角透明度滑条）
             overlay_group = QGroupBox("截图遮罩")
-            overlay_layout = QFormLayout()
+            overlay_layout = _new_form()
 
             def _make_slider(lo, hi, current, suffix):
                 """构造带数值标签的滑条行"""
-                from PyQt5.QtWidgets import QSlider, QLabel
-                from PyQt5.QtCore import Qt as QtCore
-                slider = QSlider(QtCore.Horizontal)
+                from PyQt5.QtWidgets import QSlider
+                slider = QSlider(Qt.Horizontal)
                 slider.setRange(lo, hi)
                 slider.setValue(current)
+                slider.setMinimumWidth(180)
                 value_label = QLabel(f"{current}{suffix}")
+                value_label.setMinimumWidth(46)
+                value_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 slider.valueChanged.connect(
                     lambda v: value_label.setText(f"{v}{suffix}"))
                 return slider, value_label
+
+            def _slider_row(slider, value_label):
+                """滑条与数值标签并排成一行（避免标签单独占一行）"""
+                row = QHBoxLayout()
+                row.setContentsMargins(0, 0, 0, 0)
+                row.addWidget(slider, 1)
+                row.addWidget(value_label)
+                return row
 
             cm = self.config_manager
 
@@ -485,30 +551,20 @@ class ConfigWindow(QDialog):
 
             self.snap_slider, self.snap_value_label = _make_slider(
                 0, 48, max(0, min(48, snap_current)), " px")
-            overlay_layout.addRow("磁吸阈值:", self.snap_slider)
-            overlay_layout.addRow("", self.snap_value_label)
+            overlay_layout.addRow("磁吸阈值:", _slider_row(
+                self.snap_slider, self.snap_value_label))
 
             self.dim_slider, self.dim_value_label = _make_slider(
                 0, 180, max(0, min(180, dim_current)), "")
-            overlay_layout.addRow("暗角透明度:", self.dim_slider)
-            overlay_layout.addRow("", self.dim_value_label)
+            overlay_layout.addRow("暗角透明度:", _slider_row(
+                self.dim_slider, self.dim_value_label))
 
             overlay_group.setLayout(overlay_layout)
             layout.addWidget(overlay_group)
 
-            # 测试按钮行
-            test_layout = QHBoxLayout()
-            self.test_button = QPushButton("测试翻译")
-            self.test_button.clicked.connect(self._on_test_translation)
-            test_layout.addWidget(self.test_button)
-            self.test_result_label = QLabel("")
-            test_layout.addWidget(self.test_result_label)
-            test_layout.addStretch()
-            layout.addLayout(test_layout)
-
             # 快捷键配置
             hotkey_group = QGroupBox("快捷键配置")
-            hotkey_layout = QFormLayout()
+            hotkey_layout = _new_form()
 
             self.hotkey_edit = QLineEdit()
             if self.config_manager:
@@ -523,7 +579,7 @@ class ConfigWindow(QDialog):
 
             # 启动行为配置
             startup_group = QGroupBox("启动行为")
-            startup_layout = QFormLayout()
+            startup_layout = _new_form()
 
             self.minimize_to_tray_check = QCheckBox()
             if self.config_manager:
@@ -536,22 +592,46 @@ class ConfigWindow(QDialog):
             startup_group.setLayout(startup_layout)
             layout.addWidget(startup_group)
 
-            # 按钮
+            # 操作行固定在滚动区下方：测试与保存在任何滚动位置都可点
             button_layout = QHBoxLayout()
+            button_layout.setContentsMargins(16, 2, 16, 12)
+            button_layout.setSpacing(8)
+            self.test_button = QPushButton("测试翻译")
+            self.test_button.clicked.connect(self._on_test_translation)
+            button_layout.addWidget(self.test_button)
+            self.test_result_label = QLabel("")
+            self.test_result_label.setObjectName("testResultLabel")
+            button_layout.addWidget(self.test_result_label)
             button_layout.addStretch()
             self.save_button = QPushButton("保存")
             self.save_button.setObjectName("primary")
             self.save_button.clicked.connect(self._on_save)
             button_layout.addWidget(self.save_button)
 
-            layout.addLayout(button_layout)
+            outer_layout.addWidget(scroll_area, 1)
+            outer_layout.addLayout(button_layout)
+            self.setLayout(outer_layout)
 
-            self.setLayout(layout)
+            # 下拉框不跟随鼠标滚轮：滚轮只滚页面，改选项必须点击或键盘，
+            # 避免滚动浏览设置时误改当前选中项（弹出列表自身的滚动不受影响）
+            for combo in content.findChildren(QComboBox):
+                combo.installEventFilter(self)
+
             logger.info("配置窗口UI初始化成功")
         except Exception as e:
             logger.error(f"初始化配置窗口UI失败: {e}")
             import traceback
             traceback.print_exc()
+
+    def eventFilter(self, obj, event):
+        """下拉框不吃滚轮：转交给滚动区滚页面，选项只靠点击/键盘改"""
+        if event.type() == QEvent.Wheel and isinstance(obj, QComboBox):
+            scroll = self.findChild(QScrollArea)
+            if scroll is not None:
+                # 与事件冒泡等效：页面照常滚动，下拉值不变
+                QApplication.sendEvent(scroll.viewport(), event)
+            return True
+        return super().eventFilter(obj, event)
 
     def _target_languages(self):
         """获取目标语言列表（翻译管理器可用时从其读取，否则用默认值）"""
@@ -562,6 +642,18 @@ class ConfigWindow(QDialog):
             pass
         from managers.providers.base import TARGET_LANGUAGES
         return TARGET_LANGUAGES
+
+    def _on_theme_changed(self, index):
+        """主题下拉切换：立即应用进程级样式做预览，保存后才落盘"""
+        theme = self.theme_combo.currentData()
+        if not theme:
+            return
+        styles.set_current_theme(theme)
+        app = QApplication.instance()
+        if app is not None:
+            styles.apply_app(app)
+        styles.apply_to(self)
+        logger.info(f"主题预览: {theme}（点保存后长期生效）")
 
     def _current_provider(self):
         """获取当前选中的provider类，未找到时返回None"""
@@ -608,7 +700,11 @@ class ConfigWindow(QDialog):
                 'llm_model': self.config_manager.get_llm_model,
             }
             getter = getters.get(field_name)
-            return getter() if getter else ""
+            if getter is not None:
+                return getter()
+            # 扩展provider的新字段：走通用通道读 [Translation] 段，
+            # 否则插件声明的字段在界面上永远是空的
+            return self.config_manager.get_translation_option(field_name)
         except Exception as e:
             logger.error(f"读取字段 {field_name} 失败: {e}")
             return ""
@@ -633,55 +729,80 @@ class ConfigWindow(QDialog):
             'llm_model': self.config_manager.set_llm_model,
         }
         setter = setters.get(field_name)
-        if setter:
+        if setter is not None:
             setter(value)
+        else:
+            # 扩展provider的新字段：走通用通道写 [Translation] 段
+            self.config_manager.set_translation_option(field_name, value)
 
     def _on_test_translation(self):
-        """用当前表单配置（未保存也生效）测试翻译API"""
-        try:
-            self.test_result_label.setText("测试中...")
-            QApplication.processEvents()
+        """
+        用当前表单配置（未保存也生效）测试翻译API
 
+        真实请求放线程池：同步发起会让界面白屏到超时（最长百秒级）。
+        """
+        if not self.main_app.translation_manager:
+            self.test_result_label.setText("❌ 翻译管理器未初始化")
+            return
+        try:
+            from managers.providers import provider_registry
             api_type = self.api_type_combo.currentData()
+            if provider_registry.get(api_type) is None:
+                self.test_result_label.setText("❌ 未知API类型")
+                return
+
+            # 表单值先写入内存配置，线程里构造的 provider 才能读到最新值
+            self._save_form_fields()
             target_lang = self.target_lang_combo.currentData() or 'zh'
 
-            if self.main_app.translation_manager:
-                # 直接构造临时provider测试，不影响已保存配置
-                from managers.providers import provider_registry
-                provider_cls = provider_registry.get(api_type)
-                if provider_cls is None:
-                    self.test_result_label.setText("❌ 未知API类型")
-                    return
-
-                # 先把表单值写入配置，确保测试读到最新值
-                self._save_form_fields()
-
-                provider = provider_cls(
-                    config_manager=self.config_manager,
-                    session=self.main_app.translation_manager.session,
-                )
-                result = provider.translate("Hello, world!", source='auto', target=target_lang)
-                if result and not result.startswith('[翻译失败'):
-                    self.test_result_label.setText(f"✅ {result[:50]}")
-                else:
-                    self.test_result_label.setText(f"❌ {result[:60]}")
-            else:
-                self.test_result_label.setText("❌ 翻译管理器未初始化")
+            self.test_button.setEnabled(False)
+            self.test_result_label.setText("测试中…")
+            thread_pool_manager.submit(
+                self._run_test_translation, api_type, target_lang)
         except Exception as e:
             logger.error(f"测试翻译失败: {e}")
             self.test_result_label.setText(f"❌ {str(e)[:60]}")
 
+    def _run_test_translation(self, api_type, target_lang):
+        """在池线程真实调用一次翻译，结果回主线程展示"""
+        try:
+            from managers.providers import provider_registry
+            provider_cls = provider_registry.get(api_type)
+            provider = provider_cls(
+                config_manager=self.config_manager,
+                session=self.main_app.translation_manager.session,
+            )
+            result = provider.translate(
+                "Hello, world!", source='auto', target=target_lang)
+            if result and not result.startswith('[翻译失败'):
+                text = f"✅ {result[:50]}"
+            else:
+                text = f"❌ {result[:60]}"
+        except Exception as e:
+            logger.error(f"测试翻译失败: {e}")
+            text = f"❌ {str(e)[:60]}"
+        qt_dispatcher.dispatch_to_main_thread(self._finish_test_translation, text)
+
+    def _finish_test_translation(self, text):
+        """主线程回填测试结果并恢复按钮"""
+        self.test_button.setEnabled(True)
+        self.test_result_label.setText(text)
+
     def _save_form_fields(self):
         """保存当前表单的动态字段值到配置（翻译API + OCR引擎 + 截图遮罩）"""
-        for field_name, edit in self._api_field_edits.items():
-            self._save_field_value(field_name, edit.text().strip())
-        for field_name, edit in self._ocr_field_edits.items():
-            self.config_manager.set_ocr_option(field_name, edit.text().strip())
-        # 截图遮罩滑条
-        self.config_manager.set_overlay_option(
-            'snap_threshold', str(self.snap_slider.value()))
-        self.config_manager.set_overlay_option(
-            'dim_opacity', str(self.dim_slider.value()))
+        if not self.config_manager:
+            return
+        # 一次“保存/测试”会写十几个选项，批量上下文里只落盘一次
+        with self.config_manager.batch():
+            for field_name, edit in self._api_field_edits.items():
+                self._save_field_value(field_name, edit.text().strip())
+            for field_name, edit in self._ocr_field_edits.items():
+                self.config_manager.set_ocr_option(field_name, edit.text().strip())
+            # 截图遮罩滑条
+            self.config_manager.set_overlay_option(
+                'snap_threshold', str(self.snap_slider.value()))
+            self.config_manager.set_overlay_option(
+                'dim_opacity', str(self.dim_slider.value()))
 
     def _current_ocr_provider(self):
         """获取当前选中的OCR provider类，未找到时返回None"""
@@ -715,53 +836,64 @@ class ConfigWindow(QDialog):
     def _on_save(self):
         """保存表单配置并同步到翻译与快捷键管理器"""
         try:
-            if self.config_manager:
-                # 保存API类型与OCR引擎类型（userData 存的是provider名称）
-                api_type = self.api_type_combo.currentData()
+            if not self.config_manager:
+                return
+
+            # save 前把值取出来：后面要在批量写盘之外用
+            api_type = self.api_type_combo.currentData()
+            ocr_type = self.ocr_type_combo.currentData()
+            target_lang = self.target_lang_combo.currentData() or 'zh'
+            hotkey = self.hotkey_edit.text()
+            hotkey_ok = True
+
+            # 所有配置写入放进批量上下文：十几次 setter 只落盘一次
+            with self.config_manager.batch():
+                # API类型与OCR引擎类型（userData 存的是provider名称）
                 self.config_manager.set_api_type(api_type)
-                self.config_manager.set_ocr_type(self.ocr_type_combo.currentData())
-
-                # 保存目标语言与降级API
-                self.config_manager.set_target_lang(self.target_lang_combo.currentData() or 'zh')
-                self.config_manager.set_fallback_api_type(self.fallback_api_combo.currentData() or '')
-
-                # 保存当前API的动态字段（密钥/URL等）
+                self.config_manager.set_ocr_type(ocr_type)
+                # 目标语言与降级API
+                self.config_manager.set_target_lang(target_lang)
+                self.config_manager.set_fallback_api_type(
+                    self.fallback_api_combo.currentData() or '')
+                # 界面主题（切换时已预览生效，这里只落盘）
+                theme = self.theme_combo.currentData()
+                if theme:
+                    self.config_manager.set_theme(theme)
+                # 当前API/OCR的动态字段（密钥/URL等）与遮罩滑条
                 self._save_form_fields()
-
-                # 保存启动行为
-                minimize_to_tray = self.minimize_to_tray_check.isChecked()
-                self.config_manager.set_minimize_to_tray(minimize_to_tray)
-
-                # 同步翻译管理器
-                if self.main_app.translation_manager:
-                    self.main_app.translation_manager.set_api_type(api_type)
-                    self.main_app.translation_manager.set_target_lang(
-                        self.target_lang_combo.currentData() or 'zh')
-                    self.main_app.translation_manager.reload_config()
-
-                # 同步OCR管理器
-                ocr_type = self.ocr_type_combo.currentData()
-                if self.main_app.ocr_manager:
-                    self.main_app.ocr_manager.set_ocr_type(ocr_type)
-                    self.main_app.ocr_manager.reload_config()
-
-                # 更新全局快捷键：注册成功后由 set_hotkey 负责写配置，失败则不落盘
-                hotkey = self.hotkey_edit.text()
+                # 启动行为
+                self.config_manager.set_minimize_to_tray(
+                    self.minimize_to_tray_check.isChecked())
+                # 全局快捷键：注册成功后由 set_hotkey 负责写配置，失败则不落盘
                 if self.main_app.hotkey_manager:
-                    if not self.main_app.hotkey_manager.set_hotkey(hotkey):
-                        QMessageBox.warning(
-                            self,
-                            "快捷键无效",
-                            f"快捷键 {hotkey} 注册失败，已保留原快捷键，其他配置已保存。"
-                        )
-                        return
+                    hotkey_ok = self.main_app.hotkey_manager.set_hotkey(hotkey)
                 else:
-                    # 快捷键管理器不可用（启动降级场景），无法校验注册结果，仅记录并落盘
+                    # 快捷键管理器不可用（启动降级场景），无法校验注册结果，仅记录
                     logger.warning(f"快捷键管理器不可用，未校验直接保存快捷键: {hotkey}")
                     self.config_manager.set_global_hotkey(hotkey)
 
-                QMessageBox.information(self, "保存成功", "配置已保存")
-                self.close()
+            # 同步翻译管理器
+            if self.main_app.translation_manager:
+                self.main_app.translation_manager.set_api_type(api_type)
+                self.main_app.translation_manager.set_target_lang(target_lang)
+                self.main_app.translation_manager.reload_config()
+
+            # 同步OCR管理器
+            if self.main_app.ocr_manager:
+                self.main_app.ocr_manager.set_ocr_type(ocr_type)
+                self.main_app.ocr_manager.reload_config()
+
+            if not hotkey_ok:
+                # 配置已全部落盘、管理器已同步，只有热键保持原值
+                QMessageBox.warning(
+                    self,
+                    "快捷键无效",
+                    f"快捷键 {hotkey} 注册失败，已保留原快捷键，其他配置已保存。"
+                )
+                return
+
+            QMessageBox.information(self, "保存成功", "配置已保存")
+            self.close()
 
         except Exception as e:
             logger.error(f"保存配置失败: {e}")

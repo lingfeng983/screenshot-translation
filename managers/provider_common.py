@@ -20,9 +20,26 @@ import importlib
 import logging
 import pkgutil
 
-from .retry_handler import default_retry_handler
+from .retry_handler import NonRetryableError, default_retry_handler
 
 logger = logging.getLogger('screenshot-translation')
+
+
+class ProviderConfigError(NonRetryableError):
+    """配置缺失类错误（未填密钥/未设置地址）：重试无用，直接降级"""
+
+
+class ProviderUnsupportedError(NonRetryableError):
+    """能力不支持类错误（如引擎不提供行级坐标）：重试无用，直接降级"""
+
+
+class ProviderEmptyResultError(NonRetryableError):
+    """
+    确定性“没有结果”类错误（如本地引擎在同一张图上识别不到文字）
+
+    仅用于结果可复现的引擎：同一张图重试必然得到同样结果，等退避只是
+    拖长反馈。云端引擎偶发返回空结果可能是限流/抖动，仍保留重试。
+    """
 
 
 class ProviderRegistry:
@@ -182,9 +199,9 @@ class BaseProvider:
             return fallback
 
     def _require_value(self, value, error_hint):
-        """配置值为空时抛出带提示的异常"""
+        """配置值为空时抛出带提示的异常（不抛 Exception：重试器要区分可重试性）"""
         if not value:
-            raise Exception(error_hint)
+            raise ProviderConfigError(error_hint)
         return value
 
     # ---- 文本工具 ----

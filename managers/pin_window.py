@@ -8,7 +8,7 @@
 """
 
 from PyQt5.QtCore import Qt, QPoint
-from PyQt5.QtGui import QPainter, QPixmap
+from PyQt5.QtGui import QKeySequence, QPainter, QPixmap
 from PyQt5.QtWidgets import QWidget
 
 # 钉住的窗口没有 Qt 父级，需要模块级引用防止被 Python GC 回收
@@ -108,7 +108,9 @@ class PinWindow(QWidget):
         """ESC 关闭，Ctrl+C 复制图片到剪贴板"""
         if event.key() == Qt.Key_Escape:
             self.close()
-        elif event.matches(event.Copy):
+        elif event.matches(QKeySequence.Copy):
+            # 注意用 QKeySequence.Copy：QKeyEvent 上没有 Copy 属性，
+            # 写 event.Copy 会在任意按键时抛 AttributeError
             from PyQt5.QtWidgets import QApplication
             QApplication.clipboard().setPixmap(self._source)
         else:

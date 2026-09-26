@@ -8,10 +8,8 @@
 
 import logging
 import threading
-import time
 
 import pystray
-from PIL import Image
 
 from .icon import generate_icon
 
@@ -73,8 +71,6 @@ class SystemTrayManager:
         self._click_window = _get_double_click_window()
         logger.info(f"托盘防抖窗口: {self._click_window:.2f}秒")
 
-        print("系统托盘管理器初始化")
-
     def initialize(self):
         """
         初始化系统托盘
@@ -96,30 +92,29 @@ class SystemTrayManager:
 
             # 启动托盘图标
             self.is_running = True
-            # 使用独立的线程启动系统托盘，确保它不会影响主程序的事件循环
+
             def run_tray():
                 """在独立线程中运行pystray事件循环"""
                 try:
-                    print("系统托盘线程开始运行")
+                    logger.debug("系统托盘线程开始运行")
                     self.tray_icon.run()
-                    print("系统托盘线程结束运行")
+                    logger.debug("系统托盘线程结束运行")
                 except Exception as e:
-                    print(f"系统托盘线程错误: {e}")
+                    logger.error(f"系统托盘线程错误: {e}")
                     import traceback
-                    traceback.print_exc()
+                    logger.debug(traceback.format_exc())
 
             # 守护线程：主程序退出时不会被托盘线程阻塞，避免残留进程
             tray_thread = threading.Thread(target=run_tray, daemon=True)
             tray_thread.start()
-            print("系统托盘已在独立线程中启动")
 
-            print("系统托盘初始化成功")
+            logger.info("系统托盘初始化成功")
             return True
 
         except Exception as e:
-            print(f"系统托盘初始化失败: {e}")
+            logger.error(f"系统托盘初始化失败: {e}")
             import traceback
-            traceback.print_exc()
+            logger.debug(traceback.format_exc())
             return False
 
     def _create_tray_icon(self):
@@ -200,26 +195,23 @@ class SystemTrayManager:
         """
         开始截图菜单项回调
         """
-        print("开始截图")
+        logger.info("托盘菜单：开始截图")
         if self.screenshot_manager:
             try:
                 # 直接调用截图功能，避免线程池可能的问题
                 self.screenshot_manager.start_screenshot()
             except Exception as e:
-                print(f"启动截图失败: {e}")
+                logger.error(f"启动截图失败: {e}")
                 import traceback
-                traceback.print_exc()
+                logger.debug(traceback.format_exc())
         else:
-            print("截图管理器未初始化")
+            logger.error("截图管理器未初始化")
 
     def _on_open_config(self, icon=None, item=None):
         """
         "设置"菜单项/双击图标回调：打开设置页面
         """
-        import logging
-        logger = logging.getLogger('screenshot-translation')
         logger.info("打开设置")
-
         if self.main_app:
             try:
                 # open_config_window 内部已负责调度到主线程
@@ -227,7 +219,7 @@ class SystemTrayManager:
             except Exception as e:
                 logger.error(f"打开设置窗口失败: {e}")
                 import traceback
-                traceback.print_exc()
+                logger.debug(traceback.format_exc())
         else:
             logger.error("主应用未初始化")
 
@@ -235,7 +227,7 @@ class SystemTrayManager:
         """
         退出菜单项回调
         """
-        print("退出应用")
+        logger.info("托盘菜单：退出应用")
         try:
             # 先清理托盘资源
             self.cleanup()
@@ -248,14 +240,12 @@ class SystemTrayManager:
                 import sys
                 sys.exit(0)
         except Exception as e:
-            print(f"退出应用时发生错误: {e}")
+            logger.error(f"退出应用时发生错误: {e}")
             import traceback
-            traceback.print_exc()
+            logger.debug(traceback.format_exc())
             # 强制退出
             import sys
             sys.exit(1)
-
-
 
     def show_notification(self, title, message):
         """
@@ -270,12 +260,14 @@ class SystemTrayManager:
                 # pystray 在 Windows 上支持 notify 接口
                 self.tray_icon.notify(message, title)
                 # 部分平台通知常驻，几秒后移除
-                threading.Timer(5.0, self._remove_notification).start()
+                timer = threading.Timer(5.0, self._remove_notification)
+                timer.daemon = True
+                timer.start()
                 logger.info(f"托盘通知: {title} - {message}")
             else:
                 logger.warning("托盘图标未就绪，通知未显示")
         except Exception as e:
-            print(f"显示通知失败: {e}")
+            logger.warning(f"显示通知失败: {e}")
 
     def _remove_notification(self):
         """移除托盘通知（平台不支持时静默忽略）"""
@@ -300,11 +292,9 @@ class SystemTrayManager:
                 self.tray_icon.stop()
                 self.tray_icon = None
 
-            print("系统托盘已清理")
+            logger.debug("系统托盘已清理")
 
         except Exception as e:
-            print(f"清理系统托盘失败: {e}")
+            logger.error(f"清理系统托盘失败: {e}")
             import traceback
-            traceback.print_exc()
-
-
+            logger.debug(traceback.format_exc())

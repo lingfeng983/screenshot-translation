@@ -11,6 +11,8 @@ translation_cache.json
 # ===== PyInstaller 构建产物 =====
 build/
 dist/
+# 最终交付用的 exe 目录（从 dist/ 拷出）
+release/
 *.spec.bak
 
 # ===== Python =====

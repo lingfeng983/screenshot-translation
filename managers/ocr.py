@@ -12,7 +12,7 @@ import logging
 
 from .error_handler import error_handler
 from .ocr_providers import ocr_provider_registry
-from .provider_common import ProviderChainManager
+from .provider_common import ProviderChainManager, ProviderEmptyResultError
 from .retry_handler import RetryHandler
 
 logger = logging.getLogger('screenshot-translation')
@@ -46,6 +46,8 @@ class OCRManager(ProviderChainManager):
         self.config_manager = config_manager
         self.ocr_type = 'tesseract'  # 默认本地Tesseract
         self._providers = {}
+        # 最近一次识别失败的异常：用于区分“引擎坏了”与“图里没字”
+        self._last_error = None
         self._load_config()
 
         logger.info(f"OCR管理器初始化完成，当前引擎: {self.ocr_type}，"
@@ -125,6 +127,11 @@ class OCRManager(ProviderChainManager):
 
         # 2) 最后兜底：模拟OCR，保证流程不中断
         if self._is_failure(result):
+            if isinstance(self._last_error, ProviderEmptyResultError):
+                # 引擎都跑通了、只是这张图里没文字：给可行动的提示，
+                # 否则用户看到"OCR识别不可用，请检查配置"会以为配置坏了
+                logger.info("所有OCR引擎都未识别到文字")
+                return "未识别到文字，请重新框选包含文字的区域"
             mock_cls = ocr_provider_registry.get('mock')
             if mock_cls is not None:
                 logger.warning("所有OCR引擎均失败，降级为模拟OCR")
@@ -215,13 +222,20 @@ class OCRManager(ProviderChainManager):
             return self._get_provider(provider_cls)
 
         def call(provider):
-            return provider.recognize(image)
+            try:
+                return provider.recognize(image)
+            except Exception as e:
+                # 在这里记真实异常：重试器降级时只把 None 交给 failure_text，
+                # 异常类型拿不到，而上层要靠它区分“引擎坏了”与“图里没字”
+                self._last_error = e
+                raise
 
         def failure_text(err):
             if err is not None:
                 return f"{_OCR_FAIL_PREFIX}: {err}]"
             return f"{_OCR_FAIL_PREFIX}: {provider_cls.display_name}]"
 
+        self._last_error = None
         return self._run_provider(factory, call, failure_text, retry_handler)
 
     def get_available_languages(self):

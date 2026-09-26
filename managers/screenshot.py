@@ -184,8 +184,10 @@ class ScreenshotManager:
         try:
             updated['translated_text'] = self._translate_all(
                 payload['original_text'], target_lang, force_refresh)
+            # 把整段译文传给行级对齐：重译（跳过缓存）时不再重复请求同一段文本
             updated['block_texts'] = self._translate_blocks(
-                payload['blocks'], payload['original_text'], target_lang, force_refresh)
+                payload['blocks'], payload['original_text'], target_lang,
+                force_refresh, whole=updated['translated_text'])
             updated['error'] = None
         except Exception as e:
             logger.error(f"重新翻译失败: {e}")
@@ -232,7 +234,8 @@ class ScreenshotManager:
             payload['translated_text'] = self._translate_all(
                 original_text, target_lang, force_refresh)
             payload['block_texts'] = self._translate_blocks(
-                blocks, original_text, target_lang, force_refresh)
+                blocks, original_text, target_lang, force_refresh,
+                whole=payload['translated_text'])
         except Exception as e:
             from .error_handler import error_handler
             error_handler.handle_error(e, "截图处理")
@@ -267,7 +270,8 @@ class ScreenshotManager:
             logger.error(f"翻译失败: {e}")
             return ''
 
-    def _translate_blocks(self, blocks, full_text, target_lang, force_refresh=False):
+    def _translate_blocks(self, blocks, full_text, target_lang, force_refresh=False,
+                          whole=None):
         """
         行级译文：整段一次请求后按行对齐，对不齐时逐块请求兜底
 
@@ -276,6 +280,7 @@ class ScreenshotManager:
             full_text (str): 整段原文（行块拼接）
             target_lang (str 或 None): 目标语言
             force_refresh (bool): 是否跳过翻译缓存
+            whole (str 或 None): 已算好的整段译文；None 时自行请求
 
         Returns:
             list[str]: 与 blocks 等长的译文；拿不到对齐结果时返回[]
@@ -283,7 +288,8 @@ class ScreenshotManager:
         if not blocks or self.translation_manager is None:
             return []
 
-        whole = self._translate_all(full_text, target_lang, force_refresh)
+        if whole is None:
+            whole = self._translate_all(full_text, target_lang, force_refresh)
         lines = [line.strip() for line in (whole or '').splitlines() if line.strip()]
         if len(lines) == len(blocks):
             return lines
@@ -1236,12 +1242,11 @@ class ScreenshotWidget(QWidget):
         """
         取消截图
         """
-        print("取消截图")
+        logger.info("用户取消截图")
         # 发送取消信号
         self.screenshot_canceled.emit()
         # 关闭窗口
         self.close()
-        print("截图窗口已关闭")
 
     def _get_rect(self):
         """

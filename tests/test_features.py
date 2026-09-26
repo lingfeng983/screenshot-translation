@@ -276,6 +276,145 @@ def test_app_paths_user_data():
     print("✅ 打包态数据目录测试通过\n")
 
 
+def test_theme_system():
+    """主题系统：深色/浅色 QSS 可生成、非法值回退、配置往返"""
+    print("=== 测试主题系统 ===")
+    import tempfile
+    from managers import styles
+    from config import ConfigManager
+
+    keys = [k for k, _ in styles.available_themes()]
+    assert keys == ['dark', 'light'], f"主题列表不符: {keys}"
+    dark_qss = styles.style_sheet('dark')
+    light_qss = styles.style_sheet('light')
+    assert dark_qss != light_qss, "两套主题 QSS 不应相同"
+
+    assert styles.set_current_theme('light') == 'light'
+    assert styles.style_sheet() == light_qss, "无参时应使用当前主题"
+    assert styles.current_theme() == 'light'
+    assert styles.set_current_theme('不存在的主题') == 'dark', "非法主题应回退默认"
+
+    # 关键控件样式必须齐备：浅色下缺样式会出现看不清的默认控件
+    for selector in ('QSlider::handle:horizontal', 'QScrollBar::handle:vertical',
+                     'QToolTip', 'QComboBox QAbstractItemView',
+                     'QPushButton#primary', 'QGroupBox::title'):
+        assert selector in light_qss, f"主题缺少控件样式: {selector}"
+        assert selector in dark_qss, f"深色主题缺少控件样式: {selector}"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, 'config.ini')
+        cm = ConfigManager(path)
+        assert cm.get_theme() == 'dark', "新配置默认应为深色主题"
+        cm.set_theme('light')
+        assert cm.get_theme() == 'light'
+        cm.set_theme('bogus')
+        assert cm.get_theme() == 'dark', "非法主题写入后读回应回退"
+        with open(path, encoding='utf-8') as f:
+            assert '[UI]' in f.read(), "配置里未生成 [UI] 段"
+    print("✅ 主题系统测试通过\n")
+
+
+def test_config_batch_and_sections():
+    """配置写盘：批量上下文只落一次盘；写某段选项不得重置其它段（含已修复的回归）"""
+    print("=== 测试配置批量写盘与配置段隔离 ===")
+    import tempfile
+    from config import ConfigManager
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, 'config.ini')
+        # 故意不写 [OCR]：命中"段缺失时补默认值"的分支
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write('[Translation]\napi_type = edge_free\n\n'
+                    '[Overlay]\nsnap_threshold = 40\ndim_opacity = 20\n')
+        cm = ConfigManager(path)
+
+        real_write = cm._write_config
+        writes = []
+        cm._write_config = lambda: writes.append(1) or real_write()
+        with cm.batch():
+            cm.set_api_type('baidu')
+            cm.set_target_lang('ja')
+            cm.set_overlay_option('snap_threshold', '30')
+        assert len(writes) == 1, f"批量上下文应只落盘一次，实际 {len(writes)}"
+        assert cm.get_api_type() == 'baidu' and cm.get_target_lang() == 'ja'
+
+        # 回归：写 OCR 选项时不得把用户调好的遮罩参数重置为默认值
+        cm.set_ocr_option('tesseract_langs', 'eng')
+        assert cm.get_overlay_option('snap_threshold') == '30', "写OCR选项重置了磁吸阈值"
+        assert cm.get_overlay_option('dim_opacity') == '20', "写OCR选项重置了暗角透明度"
+
+        # 扩展 provider 的通用读写通道
+        cm.set_translation_option('probe_custom_field', '自定义值')
+        assert cm.get_translation_option('probe_custom_field') == '自定义值'
+        cm2 = ConfigManager(path)
+        assert cm2.get_translation_option('probe_custom_field') == '自定义值', "通用字段未落盘"
+
+        leftovers = [n for n in os.listdir(tmp) if n.endswith('.tmp')]
+        assert not leftovers, f"原子写盘残留临时文件: {leftovers}"
+    print("✅ 配置批量写盘与配置段隔离测试通过\n")
+
+
+def test_non_retryable_error():
+    """配置类错误不重试：否则每次缺失密钥都要白等两次退避（约3秒）"""
+    print("=== 测试不可重试错误 ===")
+    import time
+    from managers.retry_handler import NonRetryableError, RetryHandler
+
+    calls = []
+
+    def boom():
+        calls.append(1)
+        raise NonRetryableError("API密钥未设置")
+
+    handler = RetryHandler(max_attempts=3, base_delay=1.0)
+    start = time.time()
+    result = handler.execute_with_retry(boom, fallback_result="降级结果")
+    elapsed = time.time() - start
+    assert len(calls) == 1, f"不可重试错误被重试了 {len(calls)} 次"
+    assert elapsed < 0.3, f"不可重试错误等待了 {elapsed:.2f}s"
+    assert result == "降级结果"
+
+    # 普通异常仍然要重试（网络抖动场景）
+    retry_calls = []
+
+    def flaky():
+        retry_calls.append(1)
+        raise RuntimeError("网络抖动")
+
+    RetryHandler(max_attempts=2, base_delay=0.01).execute_with_retry(
+        flaky, fallback_result="降级")
+    assert len(retry_calls) == 2, f"普通异常应重试: {len(retry_calls)}"
+
+    # 配置缺失走 ProviderConfigError（继承 NonRetryableError）
+    from managers.provider_common import ProviderConfigError
+    assert issubclass(ProviderConfigError, NonRetryableError)
+    print("✅ 不可重试错误测试通过\n")
+
+
+def test_pin_window_keys():
+    """钉图窗口任意按键都不得抛异常（历史上误用 event.Copy 会直接抛 AttributeError）"""
+    print("=== 测试钉图窗口按键 ===")
+    from PyQt5.QtCore import QEvent, Qt
+    from PyQt5.QtGui import QKeyEvent, QPixmap
+    from PyQt5.QtWidgets import QApplication
+    from managers.pin_window import PinWindow
+
+    app = QApplication.instance() or QApplication(sys.argv)  # noqa: F841
+    pixmap = QPixmap(60, 40)
+    pixmap.fill(Qt.red)
+    pin = PinWindow(pixmap)
+    try:
+        for key in (Qt.Key_A, Qt.Key_Z, Qt.Key_Return, Qt.Key_C):
+            pin.keyPressEvent(QKeyEvent(QEvent.KeyPress, key, Qt.NoModifier))
+        pin.keyPressEvent(
+            QKeyEvent(QEvent.KeyPress, Qt.Key_C, Qt.ControlModifier))
+        clipboard = QApplication.clipboard()
+        assert not clipboard.pixmap().isNull(), "Ctrl+C 应把钉住的图放进剪贴板"
+    finally:
+        pin.close()
+    print("✅ 钉图窗口按键测试通过\n")
+
+
 def test_qt_dispatcher():
     """测试Qt线程调度器"""
     print("=== 测试Qt线程调度器 ===")
@@ -303,6 +442,10 @@ def main():
         test_ocr_provider_reuse()
         test_app_paths_user_data()
         test_tesseract_no_console_window()
+        test_theme_system()
+        test_config_batch_and_sections()
+        test_non_retryable_error()
+        test_pin_window_keys()
         test_qt_dispatcher()
 
         print("🎉 所有测试通过！新功能工作正常。")

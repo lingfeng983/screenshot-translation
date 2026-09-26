@@ -105,13 +105,20 @@ def generate_icon(size=64):
     return img.copy()
 
 
-def generate_icon_ico(path='resources/icon.ico', sizes=((16, 16), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256))):
+def generate_icon_ico(path='resources/icon.ico',
+                      sizes=((16, 16), (24, 24), (32, 32), (48, 48),
+                             (64, 64), (128, 128), (256, 256))):
     """
-    生成多尺寸 .ico 文件（用于窗口图标/打包）
+    生成多尺寸 .ico 文件（用于窗口图标/快捷方式/打包）
+
+    注意：Pillow 保存 ICO 时会直接跳过比主图大的尺寸条目，
+    所以必须以最大尺寸（256）为主图，其余尺寸以原生渲染从
+    append_images 传入；否则只会写出比主图小的那几档（曾因此
+    只剩 16×16，桌面/任务栏图标被系统拉大到模糊）。
 
     Args:
         path (str): 输出路径
-        sizes (tuple): 包含的尺寸
+        sizes (tuple): 包含的尺寸（均需 ≤ 主图尺寸）
 
     Returns:
         str: 输出路径，失败返回None
@@ -120,10 +127,12 @@ def generate_icon_ico(path='resources/icon.ico', sizes=((16, 16), (32, 32), (48,
         os_dir = os.path.dirname(path)
         if os_dir and not os.path.exists(os_dir):
             os.makedirs(os_dir)
-        images = [generate_icon(s[0]) for s in sizes]
-        images[0].save(path, format='ICO',
-                       sizes=sizes, append_images=images[1:])
-        logger.info(f"ICO图标已生成: {path}")
+        main_size = max(s[0] for s in sizes)
+        main_img = generate_icon(main_size)
+        rest = [generate_icon(s[0]) for s in sizes if s[0] != main_size]
+        main_img.save(path, format='ICO',
+                      sizes=sizes, append_images=rest)
+        logger.info(f"ICO图标已生成: {path}（{len(sizes)} 个尺寸）")
         return path
     except Exception as e:
         logger.warning(f"生成ICO失败: {e}")

@@ -7,7 +7,7 @@ OCR 提供者基类与公共工具
 此处只保留向后兼容的导入别名。
 """
 
-from ..provider_common import BaseProvider
+from ..provider_common import BaseProvider, ProviderUnsupportedError
 
 
 class OCRProvider(BaseProvider):
@@ -28,15 +28,15 @@ class OCRProvider(BaseProvider):
         行级块识别（就地覆盖原文所需的坐标来源）
 
         只有能返回文本框的引擎实现本方法；未实现时抛
-        NotImplementedError，由 OCRManager 降级为纯文本链路。
+        ProviderUnsupportedError，由 OCRManager 降级为纯文本链路。
 
         Args:
             image (PIL.Image.Image): 待识别图像
 
         Raises:
-            NotImplementedError: 当前引擎不提供行级坐标
+            ProviderUnsupportedError: 当前引擎不提供行级坐标
         """
-        raise NotImplementedError(f"{self.display_name} 不支持行级坐标识别")
+        raise ProviderUnsupportedError(f"{self.display_name} 不支持行级坐标识别")
 
     def _get_option(self, option, fallback=''):
         """

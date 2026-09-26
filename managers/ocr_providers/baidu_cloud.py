@@ -61,10 +61,10 @@ class BaiduOCRProvider(OCRProvider):
         Raises:
             Exception: 密钥未设置或令牌获取失败
         """
-        api_key = self._get_option('baidu_ocr_api_key')
-        secret_key = self._get_option('baidu_ocr_secret_key')
-        if not api_key or not secret_key:
-            raise Exception("百度云OCR密钥未设置（需在配置中填入API Key与Secret Key）")
+        api_key = self._require_option(
+            'baidu_ocr_api_key', "百度云OCR密钥未设置（需在配置中填入API Key与Secret Key）")
+        secret_key = self._require_option(
+            'baidu_ocr_secret_key', "百度云OCR密钥未设置（需在配置中填入API Key与Secret Key）")
 
         # 令牌有效期一般为30天，提前10分钟刷新
         if self._access_token and time.time() < self._token_expire_at:

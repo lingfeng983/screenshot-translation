@@ -2,7 +2,45 @@
 
 所有显著改动记录于此。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
-## [Unreleased]
+## [Unreleased] — 界面主题（含浅色/白色主题）与代码审核修复
+
+### 新增
+
+#### 界面
+- **浅色（白色）主题**：`managers/styles.py` 重构为调色板驱动的 QSS 生成器（`dark` / `light`），
+  配置窗口新增“外观”分组下拉框；**切换立即预览，点“保存”后长期生效**，
+  主题持久化在 `[UI] theme`（新增配置段，旧配置自动迁移补齐）
+- **控件样式补齐**：滑条（轨道/已选段/圆角手柄）、滚动条、工具提示、下拉弹层、
+  消息框在两套主题下都成套成对，浅色底上不再出现看不清的默认灰色控件
+- **设置页滚动区**：“保存”按钮固定在滚动区下方，配置项变多后小屏设备也能完整操作
+
+### 修复
+- **钉图窗口按任意键报错**：`pin_window` 误用 `event.Copy`（`QKeyEvent` 上没有该属性）
+  会在任何按键时抛 `AttributeError`；改为 `QKeySequence.Copy`，并补齐钉图的 Ctrl+C 复制
+- **写 OCR 选项会重置遮罩参数**：`set_ocr_option` 在 `[OCR]` 段缺失时调用了整段默认值函数，
+  把用户调好的 `snap_threshold`/`dim_opacity` 覆盖回 12/90；配置段默认值函数已解耦（回归测试固化）
+- **扩展 provider 的配置存不下来**：配置窗口动态字段走硬编码 getter/setter 表，
+  插件自己声明的字段读不到、写不进配置（与“插件无需改主程序”的承诺不符）；
+  新增 `ConfigManager.get/set_translation_option` 通用通道，UI 回归用探针 provider 验证保存与回读
+- **配置类错误被无意义重试**：未填密钥、引擎不支持能力、本地引擎识别不到文字，
+  原本也要等两次指数退避（约 2–4 秒）才降级；新增 `NonRetryableError` 分类
+  （`ProviderConfigError` / `ProviderUnsupportedError` / `ProviderEmptyResultError`），
+  空白选区识别 **2.1s → 0.6s**，且提示从“OCR识别不可用，请检查配置”改为
+  “未识别到文字，请重新框选包含文字的区域”
+- **配置写盘改为原子替换**：先写同目录临时文件再 `os.replace`，写到一半被中断不再
+  留下半截文件导致下次启动整份回退默认值（密钥、快捷键不会丢）
+- **一次“保存”写盘 9 次 → 1 次**：新增 `ConfigManager.batch()` 批量上下文，
+  配置窗口的十几个 setter 合为一次落盘
+- **重译多打一次请求**：`_translate_blocks` 复用已算好的整段译文，
+  跳过缓存重译时不再对同一段文本重复发请求
+- **诊断信息全部丢失**：`hotkey.py`/`tray.py`/`config.py` 的 47 处 `print` 改为 `logger`——
+  打包后没有控制台，print 全部看不到（热键注册失败曾经完全无痕，只能靠猜）
+- 清理未使用导入与裸 `except`（钉图窗口、LLM provider、主应用退出路径）
+
+### 变更
+- 配置新增 `[UI] theme = dark|light`（默认 `dark`，不影响既有用户观感）
+
+## [Unreleased] — 上一轮迭代
 
 本次为一次集中迭代：**翻译/OCR 全面插件化、免费翻译默认直连、结果框交互增强、界面整体美化、遮罩重制与磁吸**。
 

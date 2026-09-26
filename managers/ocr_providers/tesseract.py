@@ -15,6 +15,7 @@ import subprocess
 import sys
 
 from .. import app_paths
+from ..provider_common import ProviderConfigError, ProviderEmptyResultError
 from ..text_block import TextBlock
 from .base import OCRProvider
 
@@ -179,7 +180,7 @@ class TesseractProvider(OCRProvider):
             Exception: pytesseract不可用或识别失败时抛出
         """
         if not pytesseract_available:
-            raise Exception("pytesseract未安装，无法使用Tesseract识别")
+            raise ProviderConfigError("pytesseract未安装，无法使用Tesseract识别")
 
         logger.info("开始Tesseract OCR识别")
         processed = self._preprocess_image(image)
@@ -191,7 +192,8 @@ class TesseractProvider(OCRProvider):
         cleaned = self.clean_text(text)
         logger.info(f"Tesseract识别完成，识别到 {len(cleaned)} 个字符")
         if not cleaned:
-            raise Exception("Tesseract未识别到任何文本")
+            # 本地引擎确定性结果：同一张图重试也是空，不浪费时间退避
+            raise ProviderEmptyResultError("Tesseract未识别到任何文本")
         return cleaned
 
     def recognize_blocks(self, image):
@@ -208,7 +210,7 @@ class TesseractProvider(OCRProvider):
             Exception: pytesseract不可用或未识别到文本
         """
         if not pytesseract_available:
-            raise Exception("pytesseract未安装，无法使用Tesseract识别")
+            raise ProviderConfigError("pytesseract未安装，无法使用Tesseract识别")
 
         processed = self._preprocess_image(image)
         # 预处理会放大图像，框坐标要按比例缩回原图坐标系
@@ -245,7 +247,7 @@ class TesseractProvider(OCRProvider):
 
         logger.info(f"Tesseract块级识别完成，{len(blocks)} 行")
         if not blocks:
-            raise Exception("Tesseract未识别到任何文本")
+            raise ProviderEmptyResultError("Tesseract未识别到任何文本")
         return blocks
 
     def get_available_languages(self):

@@ -6,7 +6,12 @@
 使用keyboard库实现全局热键监听
 """
 
+import logging
+
 import keyboard
+
+logger = logging.getLogger('screenshot-translation')
+
 
 class HotkeyManager:
     """
@@ -29,7 +34,7 @@ class HotkeyManager:
         # keyboard.add_hotkey 返回的句柄，用于精确注销
         self._hotkey_handle = None
 
-        print("全局快捷键管理器初始化")
+        logger.debug("全局快捷键管理器初始化")
 
     def initialize(self):
         """
@@ -49,13 +54,13 @@ class HotkeyManager:
             # 设置运行状态
             self.is_running = True
 
-            print("全局快捷键初始化成功")
+            logger.info(f"全局快捷键初始化完成: {self.hotkey}")
             return True
 
         except Exception as e:
-            print(f"全局快捷键初始化失败: {e}")
+            logger.error(f"全局快捷键初始化失败: {e}")
             import traceback
-            traceback.print_exc()
+            logger.debug(traceback.format_exc())
             return False
 
     def _load_hotkey_config(self):
@@ -65,16 +70,16 @@ class HotkeyManager:
         if self.config_manager:
             try:
                 self.hotkey = self.config_manager.get_global_hotkey()
-                print(f"从配置加载快捷键: {self.hotkey}")
+                logger.info(f"从配置加载快捷键: {self.hotkey}")
             except Exception as e:
-                print(f"加载快捷键配置失败: {e}")
+                logger.error(f"加载快捷键配置失败: {e}")
                 # 使用默认快捷键
                 self.hotkey = 'alt+z'
-                print(f"使用默认快捷键: {self.hotkey}")
+                logger.info(f"使用默认快捷键: {self.hotkey}")
         else:
             # 使用默认快捷键
             self.hotkey = 'alt+z'
-            print(f"配置管理器未初始化，使用默认快捷键: {self.hotkey}")
+            logger.info(f"配置管理器未初始化，使用默认快捷键: {self.hotkey}")
 
     def _register_hotkey(self):
         """
@@ -94,13 +99,13 @@ class HotkeyManager:
                 args=[]
             )
 
-            print(f"快捷键注册成功: {self.hotkey}")
+            logger.info(f"快捷键注册成功: {self.hotkey}")
             return True
 
         except Exception as e:
-            print(f"快捷键注册失败: {e}")
+            logger.error(f"快捷键注册失败: {e}")
             import traceback
-            traceback.print_exc()
+            logger.debug(traceback.format_exc())
             return False
 
     def _unregister_hotkey(self):
@@ -115,12 +120,12 @@ class HotkeyManager:
 
         try:
             keyboard.remove_hotkey(self._hotkey_handle)
-            print("已移除此前注册的快捷键")
+            logger.debug("已移除此前注册的快捷键")
         except (KeyError, ValueError) as e:
             # 句柄已失效（如keyboard内部已清理），忽略即可
-            print(f"快捷键已不存在，跳过移除: {e}")
+            logger.debug(f"快捷键已不存在，跳过移除: {e}")
         except Exception as e:
-            print(f"移除快捷键失败: {e}")
+            logger.warning(f"移除快捷键失败: {e}")
         finally:
             self._hotkey_handle = None
 
@@ -128,20 +133,18 @@ class HotkeyManager:
         """
         快捷键被按下时的回调
         """
-        print(f"快捷键 {self.hotkey} 被按下")
+        logger.info(f"快捷键 {self.hotkey} 被按下")
 
         if self.screenshot_manager:
             try:
                 # 直接调用截图功能，避免线程池可能的问题
                 self.screenshot_manager.start_screenshot()
             except Exception as e:
-                print(f"启动截图失败: {e}")
+                logger.error(f"启动截图失败: {e}")
                 import traceback
-                traceback.print_exc()
+                logger.debug(traceback.format_exc())
         else:
-            print("截图管理器未初始化")
-
-
+            logger.error("截图管理器未初始化")
 
     def set_hotkey(self, hotkey):
         """
@@ -160,7 +163,7 @@ class HotkeyManager:
             self.hotkey = hotkey
             if not self._register_hotkey():
                 # 注册失败：回滚到旧快捷键并尝试恢复，不写配置
-                print(f"快捷键 {hotkey} 注册失败，回滚为: {previous_hotkey}")
+                logger.warning(f"快捷键 {hotkey} 注册失败，回滚为: {previous_hotkey}")
                 self.hotkey = previous_hotkey
                 if previous_hotkey:
                     self._register_hotkey()
@@ -170,13 +173,13 @@ class HotkeyManager:
             if self.config_manager:
                 self.config_manager.set_global_hotkey(hotkey)
 
-            print(f"快捷键已设置为: {hotkey}")
+            logger.info(f"快捷键已设置为: {hotkey}")
             return True
 
         except Exception as e:
-            print(f"设置快捷键失败: {e}")
+            logger.error(f"设置快捷键失败: {e}")
             import traceback
-            traceback.print_exc()
+            logger.debug(traceback.format_exc())
             self.hotkey = previous_hotkey
             return False
 
@@ -197,11 +200,9 @@ class HotkeyManager:
             # 移除快捷键
             self._unregister_hotkey()
 
-            print("全局快捷键已清理")
+            logger.debug("全局快捷键已清理")
 
         except Exception as e:
-            print(f"清理全局快捷键失败: {e}")
+            logger.error(f"清理全局快捷键失败: {e}")
             import traceback
-            traceback.print_exc()
-
-
+            logger.debug(traceback.format_exc())

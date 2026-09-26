@@ -6,9 +6,13 @@
 """
 
 import configparser
+import contextlib
+import logging
 import os
 
 from managers import app_paths
+
+logger = logging.getLogger('screenshot-translation')
 
 class ConfigManager:
     """
@@ -26,7 +30,26 @@ class ConfigManager:
         """
         self.config_file = config_file or app_paths.config_file()
         self.config = configparser.ConfigParser()
+        # 批量写盘：配置窗口保存时几十个 setter 只需落盘一次
+        self._batch_depth = 0
+        self._pending_changes = False
         self._load_config()
+
+    @contextlib.contextmanager
+    def batch(self):
+        """
+        批量修改上下文：块内的 setter 只改内存，退出时统一落盘一次
+
+        配置窗口一次"保存"会接连调用十几个 setter，逐个写文件既慢又
+        增加写坏文件的窗口期；套上本上下文后只写一次。
+        """
+        self._batch_depth += 1
+        try:
+            yield self
+        finally:
+            self._batch_depth -= 1
+            if self._batch_depth == 0 and self._pending_changes:
+                self._write_config()
 
     def _load_config(self):
         """
@@ -36,8 +59,8 @@ class ConfigManager:
         if os.path.exists(self.config_file):
             try:
                 self.config.read(self.config_file, encoding='utf-8')
-                print(f"配置文件加载成功: {self.config_file}")
-                # 旧配置文件自动迁移：补充 [OCR] 与 [Overlay] 段
+                logger.info(f"配置文件加载成功: {self.config_file}")
+                # 旧配置文件自动迁移：补充 [OCR]、[Overlay] 与 [UI] 段
                 migrated = False
                 if not self.config.has_section('OCR'):
                     self._set_ocr_defaults()
@@ -45,13 +68,16 @@ class ConfigManager:
                 if not self.config.has_section('Overlay'):
                     self._set_overlay_defaults()
                     migrated = True
+                if not self.config.has_section('UI'):
+                    self._set_ui_defaults()
+                    migrated = True
                 if migrated:
                     self.save_config()
             except Exception as e:
-                print(f"配置文件加载失败: {e}")
+                logger.error(f"配置文件加载失败，回退默认配置: {e}")
                 self._set_defaults()
         else:
-            print(f"配置文件不存在，创建默认配置: {self.config_file}")
+            logger.info(f"配置文件不存在，创建默认配置: {self.config_file}")
             self._set_defaults()
 
     def _set_defaults(self):
@@ -88,12 +114,20 @@ class ConfigManager:
 
         self.config.set('Startup', 'minimize_to_tray', 'true')  # 默认最小化到托盘
 
+        # 界面外观配置
+        self._set_ui_defaults()
+        # 截图遮罩默认配置
+        self._set_overlay_defaults()
+
         # 保存默认配置
         self.save_config()
 
     def _set_ocr_defaults(self):
         """
         设置OCR段默认配置值
+
+        只碰 [OCR] 段：任何 setter 都不该顺手重置其它配置段的值，
+        否则用户调过的遮罩参数会在写 OCR 选项时被悄悄还原成默认值。
         """
         if not self.config.has_section('OCR'):
             self.config.add_section('OCR')
@@ -102,9 +136,6 @@ class ConfigManager:
         self.config.set('OCR', 'tesseract_langs', 'eng+chi_sim')  # 识别语言组合
         self.config.set('OCR', 'baidu_ocr_api_key', '')
         self.config.set('OCR', 'baidu_ocr_secret_key', '')
-
-        # 截图遮罩配置
-        self._set_overlay_defaults()
 
     def _set_overlay_defaults(self):
         """
@@ -116,25 +147,52 @@ class ConfigManager:
         self.config.set('Overlay', 'snap_threshold', '12')  # 磁吸阈值（像素）
         self.config.set('Overlay', 'dim_opacity', '90')     # 暗角透明度 (0~180)
 
+    def _set_ui_defaults(self):
+        """设置 [UI] 段默认配置值（界面主题）"""
+        if not self.config.has_section('UI'):
+            self.config.add_section('UI')
+
+        self.config.set('UI', 'theme', 'dark')  # dark / light
+
     def save_config(self):
         """
-        保存配置到文件
+        保存配置到文件（batch 上下文中延迟到退出时统一写盘）
 
         写入后尽量收紧文件权限（POSIX 下 0o600）。config.ini 可能包含明文密钥，
         更安全的做法是通过环境变量注入密钥（读取侧已优先环境变量），
         并将 config.ini 排除出版本库与分发包。
         """
+        if self._batch_depth > 0:
+            self._pending_changes = True
+            return
+        self._write_config()
+
+    def _write_config(self):
+        """
+        真正落盘：先写同目录临时文件再原子替换
+
+        直接覆盖原文件时，若写到一半被中断（退出、断电、杀进程）会留下
+        半截文件，下次启动被当成损坏配置整份回退默认值——密钥与快捷键全丢。
+        """
+        self._pending_changes = False
+        tmp_file = f"{self.config_file}.tmp"
         try:
-            with open(self.config_file, 'w', encoding='utf-8') as f:
+            with open(tmp_file, 'w', encoding='utf-8') as f:
                 self.config.write(f)
+            os.replace(tmp_file, self.config_file)
             try:
                 os.chmod(self.config_file, 0o600)
             except OSError:
                 # Windows 等平台 chmod 语义有限，失败不影响主流程
                 pass
-            print(f"配置保存成功: {self.config_file}")
+            logger.debug(f"配置保存成功: {self.config_file}")
         except Exception as e:
-            print(f"配置保存失败: {e}")
+            logger.error(f"配置保存失败: {e}")
+            try:
+                if os.path.exists(tmp_file):
+                    os.remove(tmp_file)
+            except OSError:
+                pass
 
     # 翻译API相关配置
     def get_api_type(self):
@@ -261,6 +319,36 @@ class ConfigManager:
         self.config.set('OCR', option, value)
         self.save_config()
 
+    # 翻译API通用配置项（插件自定义字段的后备读写通道）
+    def get_translation_option(self, option, fallback=''):
+        """
+        读取 [Translation] 段的任意配置项
+
+        provider 声明的 config_fields 若没有专用 getter（扩展 provider 的新字段），
+        配置界面用本方法读值，保证新插件不动主程序也能保存配置。
+
+        Args:
+            option (str): 配置项名
+            fallback (str): 未设置时的默认值
+
+        Returns:
+            str: 配置值
+        """
+        return self.config.get('Translation', option, fallback=fallback)
+
+    def set_translation_option(self, option, value):
+        """
+        写入 [Translation] 段的任意配置项并保存
+
+        Args:
+            option (str): 配置项名
+            value (str): 配置值
+        """
+        if not self.config.has_section('Translation'):
+            self.config.add_section('Translation')
+        self.config.set('Translation', option, value)
+        self.save_config()
+
     # 截图遮罩配置
     def get_overlay_option(self, option, fallback=''):
         """
@@ -284,8 +372,35 @@ class ConfigManager:
             value (str): 配置值
         """
         if not self.config.has_section('Overlay'):
-            self._set_ocr_defaults()
+            self._set_overlay_defaults()
         self.config.set('Overlay', option, value)
+        self.save_config()
+
+    # 界面外观配置
+    def get_theme(self):
+        """
+        获取界面主题标识
+
+        Returns:
+            str: 'dark' 或 'light'；非法值回退 dark
+        """
+        raw = self.config.get('UI', 'theme', fallback='dark')
+        value = str(raw or '').strip().lower()
+        return value if value in ('dark', 'light') else 'dark'
+
+    def set_theme(self, theme):
+        """
+        设置界面主题并保存
+
+        Args:
+            theme (str): 'dark' / 'light'
+        """
+        value = str(theme or '').strip().lower()
+        if value not in ('dark', 'light'):
+            value = 'dark'
+        if not self.config.has_section('UI'):
+            self._set_ui_defaults()
+        self.config.set('UI', 'theme', value)
         self.save_config()
 
     # 快捷键配置
