@@ -103,6 +103,8 @@ _QT_UNUSED = {
     'qt5quick.dll', 'qt5qml.dll', 'qt5qmlmodels.dll', 'qt5qmlxmllistmodel.dll',
     'qt5quickcontrols2.dll', 'qt5quicktemplates2.dll', 'qt5quickdialogs2.dll',
     'qt5designer.dll', 'qt5quick3d.dll', 'qt5quick3druntimerender.dll',
+    # WebGL 平台插件，只链接上面被剔除的 Qt5Quick；光栅 QWidget 永远不会加载它
+    'qwebgl.dll',
     # OpenGL 软件渲染兜底；Windows 自带 opengl32.dll，QWidget 光栅绘制不需要它
     'opengl32sw.dll',
 }
