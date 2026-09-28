@@ -2,6 +2,33 @@
 
 所有显著改动记录于此。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [Unreleased] — 小图识别修复与体验修复
+
+### 修复
+- **截图选区太小翻译不出来**：固定 2 倍放大对 20~30px 高的小选区远远不够——
+  里面的中文只有约 12px，再叠加高斯模糊与固定 128 二值化，Tesseract 几乎
+  必然识别为空。预处理改为：**小图自适应放大 2~4 倍（目标高约 64px）**、
+  去掉高斯模糊与固定阈值（改为 autocontrast + Otsu 自适应二值化，深浅主题
+  都能保住字迹）、二值化后四周留白防止字符贴边截断。实测真实屏幕 12~20px
+  的 ClearType 中文，6 个用例从旧管线 2 个正确提升到 5 个全对
+  （`managers/ocr_providers/tesseract.py`，回归测试 `test_preprocess_image` /
+  `test_scale_factor` / `test_otsu_threshold`）
+- **OCR 降级提示文本被送去翻译**：空白选区或引擎不可用时返回的
+  “未识别到文字…”/“[OCR识别不可用…]”提示被当作原文调用翻译 API，
+  白等一次网络请求后才把提示文本当译文展示；现在识别到提示文本直接
+  跳过翻译阶段立即展示（`managers/screenshot.py`，回归测试
+  `test_ocr_notice_not_translated`）
+- **托盘双击防抖窗口过短**：防抖窗口上限 0.50s 恰好等于系统双击间隔默认值
+  500ms，按系统速度双击时第二击事件几乎必然落在定时器触发之后，被误判为
+  新一轮单击，造成“截图开了又关”。窗口改为系统间隔+50ms 余量（夹取到
+  0.30~0.70s），并增加迟到第二击识别：武装后又有激活则改开设置
+  （`managers/tray.py`，回归测试 `test_tray_debounce`）
+
+### 清理
+- 移除死代码与未用导入（`window_enum` 的占位赋值、`error_handler`/
+  `pin_window`/`result_render`/`providers/llm` 的未用变量与导入），
+  全库通过 pyflakes
+
 ## [Unreleased] — 界面主题（含浅色/白色主题）与代码审核修复
 
 ### 新增

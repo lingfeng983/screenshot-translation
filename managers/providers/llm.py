@@ -10,7 +10,6 @@ LLM 翻译提供者（OpenAI 兼容接口）
 翻译提示词要求只输出译文，适合截图OCR文本的场景。
 """
 
-import json
 import logging
 
 from .base import TranslationProvider

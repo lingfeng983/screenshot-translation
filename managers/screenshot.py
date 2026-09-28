@@ -13,6 +13,7 @@ from PyQt5.QtWidgets import QApplication, QWidget
 
 # 导入必要的模块
 from . import result_render
+from .ocr import is_ocr_notice
 from .overlay_toolbar import OverlayToolbar
 from .pin_window import PinWindow
 from .qt_dispatcher import get_qt_app, qt_dispatcher
@@ -231,6 +232,12 @@ class ScreenshotManager:
             original_text, blocks = self._recognize(image)
             payload['original_text'] = original_text
             payload['blocks'] = blocks
+            # OCR 降级提示（图里没字/引擎不可用）是给用户看的话，不是原文：
+            # 送翻译只会白等一次网络请求，还会把提示文本当译文展示
+            if is_ocr_notice(original_text):
+                qt_dispatcher.dispatch_to_main_thread(
+                    self._apply_result, widget, payload)
+                return
             payload['translated_text'] = self._translate_all(
                 original_text, target_lang, force_refresh)
             payload['block_texts'] = self._translate_blocks(

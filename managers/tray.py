@@ -8,6 +8,7 @@
 
 import logging
 import threading
+import time
 
 import pystray
 
@@ -15,16 +16,22 @@ from .icon import generate_icon
 
 logger = logging.getLogger('screenshot-translation')
 
-# 防抖窗口：固定下限/上限与系统值之间的夹取范围（秒）
+# 防抖窗口：固定下限/上限与系统值之间的夹取范围（秒）。
+# 上限必须大于系统双击间隔的最大可能值：用户按系统速度双击时，
+# 第二击发生在“第一击+系统间隔”处，若窗口恰好等于系统间隔，
+# 第二击的事件总会落在定时器触发之后而被误判为新一轮单击，
+# 造成双击时“截图开了又关”。留出事件处理延迟余量。
 _DEBOUNCE_MIN = 0.30
-_DEBOUNCE_MAX = 0.50
+_DEBOUNCE_MAX = 0.70
+# 叠加在系统双击间隔上的事件处理余量（秒）
+_DEBOUNCE_MARGIN = 0.05
 # 读取不到系统双击速度时的回退值
-_DEBOUNCE_FALLBACK = 0.40
+_DEBOUNCE_FALLBACK = 0.50
 
 
 def _get_double_click_window():
     """
-    计算防抖窗口：优先跟随系统双击速度，夹取到 [0.30, 0.50] 秒
+    计算防抖窗口：系统双击速度 + 事件处理余量，夹取到 [0.30, 0.70] 秒
 
     用户在 Windows「鼠标设置」里调过的双击间隔就是他们的肌肉记忆，
     跟随它可以让单击响应与双击识别都贴合个人习惯。
@@ -37,7 +44,7 @@ def _get_double_click_window():
         # GetDoubleClickTime 返回毫秒（Windows 默认 500ms，可调 200~900）
         sys_ms = ctypes.windll.user32.GetDoubleClickTime()
         if sys_ms and sys_ms > 0:
-            window = sys_ms / 1000.0
+            window = sys_ms / 1000.0 + _DEBOUNCE_MARGIN
             return min(max(window, _DEBOUNCE_MIN), _DEBOUNCE_MAX)
     except Exception:
         pass
@@ -67,6 +74,10 @@ class SystemTrayManager:
         # 左键单击/双击防抖状态
         self._click_timer = None
         self._click_lock = threading.Lock()
+        # 最近一次左键激活的时间戳（monotonic）；与本轮武装时间对比
+        # 可识别“定时器已触发但第二击事件才被处理”的边界竞态
+        self._last_activate_ts = 0.0
+        self._armed_ts = 0.0
         # 防抖窗口：启动时读一次系统双击速度，运行期不变
         self._click_window = _get_double_click_window()
         logger.info(f"托盘防抖窗口: {self._click_window:.2f}秒")
@@ -165,10 +176,11 @@ class SystemTrayManager:
         左键激活回调（单击与双击的第一下都走这里）
 
         防抖区分：
-        - 单击：等待 _DOUBLE_CLICK_WINDOW 后无第二次激活 → 开始截图
+        - 单击：等待防抖窗口后无第二次激活 → 开始截图
         - 双击：窗口内第二次激活 → 取消单击，打开设置
         """
         with self._click_lock:
+            self._last_activate_ts = time.monotonic()
             if self._click_timer is not None:
                 # 这是双击的第二下：取消待执行的单击动作
                 self._click_timer.cancel()
@@ -179,6 +191,7 @@ class SystemTrayManager:
                 return
 
             # 可能是单击：延迟执行，等待是否出现第二次激活
+            self._armed_ts = self._last_activate_ts
             self._click_timer = threading.Timer(
                 self._click_window, self._fire_single_click)
             self._click_timer.daemon = True
@@ -188,6 +201,14 @@ class SystemTrayManager:
         """防抖窗口结束后确认是单击：开始截图"""
         with self._click_lock:
             self._click_timer = None
+            # 边界竞态：第二击事件若在本回调清空 timer 之后才被托盘线程
+            # 处理，会被误判为新一轮单击，造成“截图开了又关”。本轮武装
+            # 之后又出现过激活，说明那是双击的第二下：改开设置而不是截图。
+            late_second_click = self._last_activate_ts > self._armed_ts
+        if late_second_click:
+            logger.info("托盘双击（第二击事件迟到）：打开设置")
+            self._on_open_config()
+            return
         logger.info("托盘单击：开始截图")
         self._on_start_screenshot()
 

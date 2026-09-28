@@ -139,17 +139,78 @@ def test_preprocess_image():
     from PIL import Image
     from managers.ocr_providers.tesseract import TesseractProvider
 
+    # 常规图：放大2倍，四周留白（PAD*2），保持 'L' 模式
     img = Image.new('RGB', (100, 50), color=(200, 200, 200))
     processed = TesseractProvider._preprocess_image(img)
-    assert processed.size == (200, 100), "应放大2倍"
+    assert processed.size == (200 + 24, 100 + 24), "常规图应放大2倍并加四周留白"
     assert processed.mode == 'L', "应转为灰度"
+
+    # 小图：自适应放大到约64px高（倍数限制在2~4），不再固定2倍
+    tiny = Image.new('RGB', (60, 20), color='white')
+    tiny_out = TesseractProvider._preprocess_image(tiny)
+    # 20px 高 -> ceil(64/20)=4倍 -> 80px，再加留白
+    assert tiny_out.size == (60 * 4 + 24, 20 * 4 + 24), "小图应自适应放大4倍"
+
+    # 30px 高：ceil(64/30)=3倍，验证中间档
+    mid = Image.new('RGB', (90, 30), color='white')
+    mid_out = TesseractProvider._preprocess_image(mid)
+    assert mid_out.size == (90 * 3 + 24, 30 * 3 + 24), "30px高应放大3倍"
 
     # 非法输入回退原图
     weird = Image.new('RGBA', (10, 10))
     out = TesseractProvider._preprocess_image(weird)
     assert out is not None
 
+    # 深底浅字（暗色主题）二值化后字迹仍在：暗背景像素应占多数（黑色）
+    dark = Image.new('L', (80, 40), color=20)
+    for x in range(20, 60):
+        for y in range(15, 25):
+            dark.putpixel((x, y), 235)
+    dark_out = TesseractProvider._preprocess_image(dark.convert('RGB'))
+    hist = dark_out.histogram()
+    total = sum(hist)
+    white_ratio = sum(hist[129:]) / total if total else 0.0
+    assert 0.01 < white_ratio < 0.6, (
+        f"深底浅字应保留亮色字迹（白像素占比 {white_ratio:.2f}），固定阈值会抹掉它们")
+
     print("✅ 图像预处理测试通过\n")
+
+
+def test_scale_factor():
+    """放大倍数随选区高度自适应：≥40px 用 2 倍，越小倍数越大，封顶 4 倍"""
+    from managers.ocr_providers.tesseract import TesseractProvider
+
+    assert TesseractProvider._scale_factor(400) == 2
+    assert TesseractProvider._scale_factor(40) == 2
+    assert TesseractProvider._scale_factor(32) == 2   # ceil(64/32)=2
+    assert TesseractProvider._scale_factor(30) == 3   # ceil(64/30)=3
+    assert TesseractProvider._scale_factor(20) == 4   # ceil(64/20)=4
+    assert TesseractProvider._scale_factor(10) == 4   # 封顶
+    assert TesseractProvider._scale_factor(1) == 4
+    print("✅ 放大倍数自适应测试通过\n")
+
+
+def test_otsu_threshold():
+    """Otsu 阈值应落在两峰之间，深浅背景都能正确分离"""
+    from PIL import Image
+    from managers.ocr_providers.tesseract import TesseractProvider
+
+    # 浅底黑字：阈值应在背景(240)与前景(30)之间
+    light = Image.new('L', (100, 40), 240)
+    for x in range(30, 70):
+        for y in range(15, 25):
+            light.putpixel((x, y), 30)
+    t_light = TesseractProvider._otsu_threshold(light)
+    assert 30 < t_light < 240, f"浅底阈值异常: {t_light}"
+
+    # 深底浅字：阈值同样应落在中间（固定128会把暗背景全判成字/背景）
+    dark = Image.new('L', (100, 40), 35)
+    for x in range(30, 70):
+        for y in range(15, 25):
+            dark.putpixel((x, y), 220)
+    t_dark = TesseractProvider._otsu_threshold(dark)
+    assert 35 < t_dark < 220, f"深底阈值异常: {t_dark}"
+    print("✅ Otsu阈值测试通过\n")
 
 
 def test_text_cleaning():
@@ -174,6 +235,8 @@ def main():
         test_dispatch_and_fallback()
         test_per_engine_config_isolation()
         test_preprocess_image()
+        test_scale_factor()
+        test_otsu_threshold()
         test_text_cleaning()
 
         print("🎉 所有OCR架构测试通过！")

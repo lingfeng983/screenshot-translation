@@ -7,8 +7,8 @@
 滚轮缩放、双击或 ESC 关闭。有道截图翻译的"钉住"即此行为。
 """
 
-from PyQt5.QtCore import Qt, QPoint
-from PyQt5.QtGui import QKeySequence, QPainter, QPixmap
+from PyQt5.QtCore import Qt
+from PyQt5.QtGui import QKeySequence, QPainter
 from PyQt5.QtWidgets import QWidget
 
 # 钉住的窗口没有 Qt 父级，需要模块级引用防止被 Python GC 回收

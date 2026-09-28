@@ -172,7 +172,3 @@ def get_current_window_handle():
         return ctypes.windll.kernel32.GetConsoleWindow() or 0
     except Exception:
         return 0
-
-
-# 保留名称供未来扩展；当前未使用
-_ = _GWL_EXSTYLE

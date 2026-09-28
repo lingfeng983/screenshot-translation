@@ -21,6 +21,15 @@ from .base import OCRProvider
 
 logger = logging.getLogger('screenshot-translation')
 
+# 预处理参数
+_MIN_SCALE_FACTOR = 2      # 常规图至少放大2倍
+_MAX_SCALE_FACTOR = 4      # 小图最多放大4倍（再大清晰度不增反降）
+_TARGET_HEIGHT = 64        # 小图放大到约这个高度，Tesseract 对 12px 左右的
+                           # ClearType 中文几乎无法识别，需要拉到更舒适的字号
+_MIN_SCALE_HEIGHT = 40     # 选区高度低于此值时启用自适应放大（2~4倍）
+_AUTOCONTRAST_CUTOFF = 1   # autocontrast 裁掉两侧1%的极值噪声
+_PAD = 12                  # 二值化后四周留白，避免字符贴边被截断
+
 try:
     import pytesseract
     pytesseract_available = True
@@ -268,9 +277,70 @@ class TesseractProvider(OCRProvider):
             return ['eng', 'chi_sim']
 
     @staticmethod
-    def _preprocess_image(image):
+    def _scale_factor(height):
         """
-        预处理图像以提升识别率（放大、灰度、模糊、增强对比度、二值化）
+        根据选区高度计算放大倍数
+
+        固定2倍对很小的选区远远不够：一个 20~30px 高的选区里中文只有约
+        12px，ClearType 亚像素渲染下 Tesseract 基本识别不出，会出现“框
+        住了字却翻译不出来”。高度不足时把图放大到约 _TARGET_HEIGHT，
+        放大倍数夹在 _MIN_SCALE_FACTOR~_MAX_SCALE_FACTOR 之间。
+
+        Args:
+            height (int): 原图高度（像素）
+
+        Returns:
+            int: 放大倍数
+        """
+        if height >= _MIN_SCALE_HEIGHT:
+            return _MIN_SCALE_FACTOR
+        factor = -(-_TARGET_HEIGHT // height)   # ceil，保证达到目标高度
+        return max(_MIN_SCALE_FACTOR, min(_MAX_SCALE_FACTOR, factor))
+
+    @staticmethod
+    def _otsu_threshold(gray):
+        """
+        按类间方差最大原则求二值化阈值（Otsu）
+
+        固定 128 阈值在深底浅字、低对比度文字上会把整图判成背景，
+        字迹直接消失；Otsu 按直方图自适应，两种主题都能保住笔画。
+
+        Args:
+            gray (PIL.Image.Image): 'L' 模式灰度图
+
+        Returns:
+            int: 0~255 的阈值
+        """
+        hist = gray.histogram()
+        total = sum(hist)
+        if not total:
+            return 128
+        sum_all = sum(i * count for i, count in enumerate(hist))
+        sum_b = w_b = 0
+        best_t, best_var = 128, -1.0
+        for t in range(256):
+            w_b += hist[t]
+            if not w_b:
+                continue
+            w_f = total - w_b
+            if not w_f:
+                break
+            sum_b += t * hist[t]
+            var = w_b * w_f * (sum_b / w_b - (sum_all - sum_b) / w_f) ** 2
+            # 平局取更大的 t：保证阈值落在两峰之间而不是压在前景灰度上
+            if var >= best_var:
+                best_var, best_t = var, t
+        return best_t
+
+    @classmethod
+    def _preprocess_image(cls, image):
+        """
+        预处理图像以提升识别率：自适应放大、灰度、自动对比度、留白
+
+        不再做高斯模糊与固定 128 二值化：实测真实 UI 的小号 ClearType
+        文字，模糊会把笔画糊掉、固定阈值在深色主题下直接抹掉字迹，
+        两者都显著降低识别率；灰度 + autocontrast 交给 Tesseract 自己
+        自适应，效果更好。
 
         Args:
             image (PIL.Image.Image): 原始图像
@@ -278,27 +348,27 @@ class TesseractProvider(OCRProvider):
         Returns:
             PIL.Image.Image: 预处理后的图像；处理失败时返回原图
         """
-        from PIL import Image, ImageEnhance, ImageFilter
+        from PIL import Image, ImageOps
 
         try:
-            # 1. 调整图像大小，提高分辨率
             width, height = image.size
-            resized = image.resize((width * 2, height * 2), Image.LANCZOS)
+            if width <= 0 or height <= 0:
+                return image
 
-            # 2. 转换为灰度
+            # 1. 自适应放大：小图放大到约 _TARGET_HEIGHT 高
+            factor = cls._scale_factor(height)
+            resized = image.resize((width * factor, height * factor), Image.LANCZOS)
+
+            # 2. 灰度 + 自动对比度（自动裁掉极值噪声，深浅主题通吃）
             gray = resized.convert('L')
+            enhanced = ImageOps.autocontrast(gray, cutoff=_AUTOCONTRAST_CUTOFF)
 
-            # 3. 高斯模糊，减少噪声
-            blurred = gray.filter(ImageFilter.GaussianBlur(radius=1))
-
-            # 4. 在灰度图上增强对比度
-            # 必须在二值化之前做：ImageEnhance 内部走 Image.blend，
-            # 不支持 1 位图像（mode '1'）
-            enhanced = ImageEnhance.Contrast(blurred).enhance(2.0)
-
-            # 5. 最后二值化，输出 'L' 模式以兼容 pytesseract
-            threshold = 128
-            return enhanced.point(lambda x: 255 if x > threshold else 0, mode='L')
+            # 3. Otsu 自适应二值化，并加四周留白防止字符贴边截断
+            threshold = cls._otsu_threshold(enhanced)
+            binary = enhanced.point(lambda x: 255 if x > threshold else 0, mode='L')
+            padded = Image.new('L', (binary.width + 2 * _PAD, binary.height + 2 * _PAD), 255)
+            padded.paste(binary, (_PAD, _PAD))
+            return padded
         except Exception as e:
             logger.warning(f"图像预处理失败: {e}")
             return image

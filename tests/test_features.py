@@ -429,6 +429,114 @@ def test_qt_dispatcher():
     print(f"调度结果: {result}")
     print("✅ Qt线程调度器测试通过\n")
 
+def test_ocr_notice_not_translated():
+    """OCR 降级提示文本不应被送翻译（图里没字/引擎不可用时直接展示提示）"""
+    print("=== 测试OCR提示文本不送翻译 ===")
+    from managers.ocr import is_ocr_notice
+
+    assert is_ocr_notice("未识别到文字，请重新框选包含文字的区域")
+    assert is_ocr_notice(
+        "[OCR识别不可用：请检查OCR引擎配置（Tesseract未安装或密钥未填写）]")
+    assert is_ocr_notice("  未识别到文字，请重新框选包含文字的区域  ")
+    assert not is_ocr_notice("Hello World")
+    assert not is_ocr_notice("")
+    assert not is_ocr_notice(None)
+
+    # 端到端：ScreenshotManager 收到提示文本时不调用翻译API
+    from managers.screenshot import ScreenshotManager
+
+    class RecordingTM:
+        target_lang = 'zh'
+
+        def __init__(self):
+            self.calls = []
+
+        def perform_translation(self, text, force_refresh=False,
+                                target_lang=None):
+            self.calls.append(text)
+            return f"[译文]{text}"
+
+    sm = ScreenshotManager()
+    sm.translation_manager = RecordingTM()
+    result = sm._translate_all(
+        "未识别到文字，请重新框选包含文字的区域", 'zh')
+    # _translate_all 只负责真实文本；提示文本应在 _process_region 层拦截，
+    # 但这里直接调 _translate_all 应正常翻译（防御性检查：不影响真实文本）
+    assert result == "[译文]未识别到文字，请重新框选包含文字的区域"
+
+    # _process_region 层的拦截：提示文本完全不进翻译阶段。
+    # 用假 OCR 返回提示文本，记录翻译调用次数。
+    from PyQt5.QtCore import QRect
+    from PIL import Image
+
+    class FakeOCR:
+        def perform_ocr_with_blocks(self, image):
+            return "未识别到文字，请重新框选包含文字的区域", []
+
+    sm.ocr_manager = FakeOCR()
+    sm.translation_manager = RecordingTM()   # 重新计数（前面防御性检查调用过一次）
+
+    class StubWidget:
+        _id = 0
+
+        def current_request_id(self):
+            return 1
+
+    img = Image.new('RGB', (40, 20), 'white')
+    sm._process_region(StubWidget(), img, QRect(0, 0, 40, 20), 'zh', False, 1)
+    assert len(sm.translation_manager.calls) == 0, (
+        f"提示文本不应触发翻译API: {sm.translation_manager.calls}")
+    print("✅ OCR提示文本不送翻译测试通过\n")
+
+
+def test_tray_debounce():
+    """托盘单击/双击防抖：双击只开设置，第二击迟到也不误触发截图"""
+    print("=== 测试托盘防抖 ===")
+    import time as _time
+    from managers.tray import SystemTrayManager
+
+    class FakeShot:
+        def __init__(self):
+            self.started = 0
+
+        def start_screenshot(self):
+            self.started += 1
+
+    class FakeApp:
+        def __init__(self):
+            self.config_opened = 0
+
+        def open_config_window(self):
+            self.config_opened += 1
+
+    tray = SystemTrayManager(main_app=FakeApp(), screenshot_manager=FakeShot())
+    tray._click_window = 0.12
+
+    # 双击：两次快速激活
+    tray._on_tray_activate()
+    tray._on_tray_activate()
+    _time.sleep(0.3)
+    assert tray.main_app.config_opened == 1, "双击应打开设置一次"
+    assert tray.screenshot_manager.started == 0, "双击不应触发截图"
+
+    # 单击：一次激活后等待
+    tray._on_tray_activate()
+    _time.sleep(0.3)
+    assert tray.screenshot_manager.started == 1, "单击应触发截图"
+    assert tray.main_app.config_opened == 1
+
+    # 边界竞态：第二击先到（更新了 _last_activate_ts），定时器随后触发。
+    # _fire_single_click 应发现“武装之后又有激活”而改开设置，
+    # 而不是把第二击误判为新一轮单击导致“截图开了又关”
+    tray._on_tray_activate()              # 第一击：武装定时器
+    _time.sleep(0.06)
+    tray._on_tray_activate()              # 第二击落在防抖窗口内：开设置
+    _time.sleep(0.3)
+    assert tray.screenshot_manager.started == 1
+    assert tray.main_app.config_opened == 2
+    print("✅ 托盘防抖测试通过\n")
+
+
 def main():
     """主测试函数"""
     print("开始功能测试...\n")
@@ -447,6 +555,8 @@ def main():
         test_non_retryable_error()
         test_pin_window_keys()
         test_qt_dispatcher()
+        test_ocr_notice_not_translated()
+        test_tray_debounce()
 
         print("🎉 所有测试通过！新功能工作正常。")
 

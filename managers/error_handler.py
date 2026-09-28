@@ -7,6 +7,7 @@
 
 import traceback
 import logging
+
 from PyQt5.QtWidgets import QMessageBox
 
 from .qt_dispatcher import qt_dispatcher
@@ -33,10 +34,8 @@ class ErrorHandler:
         Returns:
             str: 错误信息
         """
-        error_message = f"{module_name}模块发生错误: {str(error)}"
-
         # 记录错误日志
-        logger.error(error_message)
+        logger.error(f"{module_name}模块发生错误: {str(error)}")
         logger.error(traceback.format_exc())
 
         # 显示错误提示（可能被工作线程调用，QMessageBox 必须在主线程创建）
@@ -45,7 +44,7 @@ class ErrorHandler:
                 ErrorHandler._show_critical_box, module_name, error
             )
 
-        return error_message
+        return f"{module_name}模块发生错误: {str(error)}"
 
     @staticmethod
     def _show_critical_box(module_name, error):
@@ -78,7 +77,7 @@ class ErrorHandler:
         Returns:
             str: 默认的OCR结果
         """
-        error_message = ErrorHandler.handle_error(error, "OCR", show_message)
+        ErrorHandler.handle_error(error, "OCR", show_message)
 
         # OCR失败时返回默认文本
         return "[OCR识别失败，请确保已安装Tesseract OCR]"
@@ -95,7 +94,7 @@ class ErrorHandler:
         Returns:
             str: 错误信息
         """
-        error_message = ErrorHandler.handle_error(error, "翻译", show_message)
+        ErrorHandler.handle_error(error, "翻译", show_message)
 
         # 翻译失败时返回错误信息
         return f"[翻译失败: {str(error)}]"

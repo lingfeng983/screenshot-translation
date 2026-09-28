@@ -15,7 +15,7 @@
 from collections import Counter
 import weakref
 
-from PyQt5.QtCore import Qt, QRect, QPoint
+from PyQt5.QtCore import Qt, QRect
 from PyQt5.QtGui import QColor, QFont, QFontMetrics, QImage, QPainter, QPen
 
 from . import styles

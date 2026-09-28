@@ -23,6 +23,26 @@ ocr_retry_handler = RetryHandler(max_attempts=2, base_delay=0.5)
 # 识别结果错误标记，与翻译的 [翻译失败] 风格一致
 _OCR_FAIL_PREFIX = '[OCR识别失败'
 
+# OCR 降级提示文本（mock 引擎的输出与“图里没字”的可行动提示）。
+# 这类文本是给用户看的提示，不是原文，不应再送翻译 API。
+OCR_NOTICE_TEXTS = (
+    "[OCR识别不可用：请检查OCR引擎配置（Tesseract未安装或密钥未填写）]",
+    "未识别到文字，请重新框选包含文字的区域",
+)
+
+
+def is_ocr_notice(text):
+    """
+    判断 OCR 结果是否为降级提示文本（而非真实识别内容）
+
+    Args:
+        text (str): OCR 返回的文本
+
+    Returns:
+        bool: True 表示这是提示文本，调用方应跳过翻译
+    """
+    return (text or '').strip() in OCR_NOTICE_TEXTS
+
 
 class OCRManager(ProviderChainManager):
     """
