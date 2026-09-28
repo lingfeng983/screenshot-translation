@@ -21,8 +21,10 @@ from .retry_handler import RetryHandler
 
 logger = logging.getLogger('screenshot-translation')
 
-# 降级API使用轻量重试（次数少、间隔短），避免降级链整体耗时过长
-fallback_retry_handler = RetryHandler(max_attempts=2, base_delay=0.5)
+# 统一重试策略：次数少、间隔短，避免降级链整体耗时过长。
+# 主API与降级API都用它：主API若落到基类通用的 3 次/1s 策略，一次瞬时故障会
+# 先白等约 3 秒（1s+2s 退避）才降级，还多打一次请求（云端API是算额度/计费的）。
+translation_retry_handler = RetryHandler(max_attempts=2, base_delay=0.5)
 
 
 class TranslationManager(ProviderChainManager):
@@ -35,6 +37,18 @@ class TranslationManager(ProviderChainManager):
     _registry = provider_registry
     _default_provider_name = 'edge_free'
     _failure_prefix = '[翻译失败'
+
+    def _default_retry_handler(self):
+        """
+        默认重试器：翻译链统一的轻量策略
+
+        主API、配置的降级API与免费兜底接口共用同一套重试参数，
+        避免只有主API落回基类的 3 次/1s 通用策略。
+
+        Returns:
+            RetryHandler: 翻译重试处理器
+        """
+        return translation_retry_handler
 
     def __init__(self, config_manager=None):
         """
@@ -181,7 +195,7 @@ class TranslationManager(ProviderChainManager):
                 logger.warning(f"主API失败，尝试降级API: {self.fallback_api_type}")
                 fallback_result = self._translate_via(
                     fallback_cls, text, target_lang=effective_target,
-                    retry_handler=fallback_retry_handler)
+                    retry_handler=translation_retry_handler)
                 if not self._is_failure(fallback_result):
                     return fallback_result
 
@@ -194,7 +208,7 @@ class TranslationManager(ProviderChainManager):
                 logger.warning(f"所有配置API均失败，兜底尝试免费接口: {free_name}")
                 free_result = self._translate_via(
                     free_cls, text, target_lang=effective_target,
-                    retry_handler=fallback_retry_handler)
+                    retry_handler=translation_retry_handler)
                 if not self._is_failure(free_result):
                     return free_result
 
@@ -209,7 +223,7 @@ class TranslationManager(ProviderChainManager):
             provider_cls: provider类
             text (str): 要翻译的文本
             target_lang (str): 目标语言；None时使用全局配置
-            retry_handler: 重试处理器，缺省用主重试器
+            retry_handler: 重试处理器，缺省用主重试器（见 _default_retry_handler）
 
         Returns:
             str: 翻译后的文本，彻底失败时返回 [翻译失败] 前缀文本

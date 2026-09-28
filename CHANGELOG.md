@@ -2,6 +2,48 @@
 
 所有显著改动记录于此。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [Unreleased] — 重试策略、坐标回映射与覆盖外扩修复
+
+### 修复
+- **主引擎没走自己的重试策略**：`_default_retry_handler()` 从未被覆盖，主引擎
+  一直落在基类通用的 3 次/1s 策略上（退避 1s+2s，一次瞬时故障先白等约 3 秒
+  才降级，还多打一次请求；云端翻译/OCR 是靠额度与计费的），而块级链路、
+  降级链路用的却是 2 次/0.5s。现在 OCR 与翻译两个管理器都显式指定各自的重试器，
+  主引擎退避从约 3.0s 降到约 0.5s、请求数 3 → 2（`managers/ocr.py`、
+  `managers/translation.py`，回归测试 `test_primary_retry_policy` ×2）
+- **就地覆盖的译文与原文错位**：块级识别的坐标只按 `image.width /
+  processed.width` 缩回原图，漏算了预处理为了防截断而加的四周 12px 留白——
+  留白图上满足 `x_pad = x_orig * factor + pad`，正确回映射要先减 pad 再除以
+  factor。偏差为 `pad / factor`，随横向位置线性变化（左端右偏、右端左偏，
+  中心恰好抵消）：2 倍放大时两端各偏约 6px，靠 2px 的覆盖外扩才没醒目地
+  露馅。真实截屏实测（`scratch/probe_align.py` + `scratch/align_check.html`）：
+  三行文本横向偏差从 +5/+2/-3px 降到 0/0/0px，原文字迹从“边缘露出”变为
+  “完整覆盖”（`managers/ocr_providers/tesseract.py`，回归测试
+  `test_block_coords_round_trip`）
+- **大字号就地覆盖盖不住原文边缘**：覆盖块外扩一直是固定 2px，而字号越大
+  笔画越粗、抗锯齿（含 ClearType 彩色边）外溢越宽——实测真实截屏上，
+  固定 2px 对 21px 行高的可见字迹外露余量为 **0px**（再宽 1px 就露出原文），
+  33px 行高也只剩 1px。改成横向按行高比例外扩（`行高 × 0.12`，夹在 2~6px）：
+  常见 UI 行高仍是 2px（不改变原有观感），大字号行高 33px 的余量从 1px 提到
+  3px。纵向不跟着变（行框本身已含升部/降部余量，实测字迹距框顶 2px、
+  距框底 5~7px），免得向上去吃上一行的译文；译文起点仍锚在原文左边界，
+  外扩变宽不会把译文推歪（`managers/result_render.py`，回归测试
+  `test_cover_pad_adaptive`）
+- **反复打开设置会重建窗口、丢掉未保存的输入**：托盘双击/菜单「设置」每次都
+  新建一个 `ConfigWindow`，旧窗口被销毁——刚粘进去还没点保存的密钥/URL
+  连同滚动位置一起消失，窗口位置也回到默认。现在已打开时只置前复用同一实例
+  （`main.py`，回归测试 `test_config_ui` 第 12 项）
+
+### 测试
+- 新增**像素级就地覆盖回归** `test_inplace_cover_pixel_alignment`：离屏把四行
+  真实文本渲染成真像素（真字体引擎，不弹窗不抓屏）→ 真 Tesseract 识别 →
+  真 `paint_blocks` 绘制，然后逐像素确认原文的每一个可见像素（含抗锯齿彩边，
+  阈值 250）都落在绘制出的覆盖块里，并核对块框与字迹偏差 ≤2px、大字号行的
+  横向外扩确实按行高放宽。把原先只能手跑的 `scratch/probe_align.py` 变成了
+  套件里自动跑的用例（引擎/中文训练数据缺失时跳过），已反向验证能抓住“坐标
+  漏算留白”（报 dx=5）与“外扩退回固定 2px”两种回归。保留了 scratch 里的
+  探针作为抓真屏 + 出视觉报告的对照工具
+
 ## [Unreleased] — 小图识别修复与体验修复
 
 ### 修复

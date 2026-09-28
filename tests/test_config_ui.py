@@ -493,6 +493,53 @@ def _run_tests(app, failures):
         assert '测试翻译' in btn_texts and '保存' in btn_texts
     check("设置页排版：滚轮免疫/紧凑间距/标签右对齐", t_layout_polish)
 
+    # ---- 12. 设置窗口单实例：反复打开只置前，不重建 ----
+    def t_single_config_window():
+        def windows():
+            return [w for w in app.topLevelWidgets()
+                    if isinstance(w, ConfigWindow)]
+
+        # 本用例自行接管这一状态，不受其他用例影响
+        main_app.config_window = None
+        baseline = len(windows())
+
+        main_app.open_config_window()
+        _spin(120, app)
+        first = main_app.config_window
+        assert isinstance(first, ConfigWindow), "设置窗口未创建"
+        assert first.isVisible(), "设置窗口应显示"
+        assert len(windows()) == baseline + 1, \
+            f"首次打开应只增一个窗口: {baseline} -> {len(windows())}"
+
+        # 托盘双击/菜单「设置」可反复触发：必须置前同一实例。
+        # 旧实现每次重建窗口，旧窗口连同未保存的表单输入（如刚粘的密钥）
+        # 一起被销毁 —— 改完配置还没点保存就被清空。
+        first.hotkey_edit.setText('ctrl+alt+q')
+        for _ in range(3):
+            main_app.open_config_window()
+            _spin(80, app)
+        assert main_app.config_window is first, \
+            "重复打开设置应复用同一实例，而不是重建窗口"
+        assert first.hotkey_edit.text() == 'ctrl+alt+q', \
+            "再次打开设置丢失了未保存的表单内容"
+        assert first.isVisible(), "复用时应置前显示"
+        assert len(windows()) == baseline + 1, \
+            f"重复打开设置叠出了 {len(windows()) - baseline} 个窗口"
+
+        # 用户关掉后再打开：复用同一实例并重新显示（而不是新建一个）
+        first.close()
+        _spin(80, app)
+        main_app.open_config_window()
+        _spin(120, app)
+        assert main_app.config_window is first, "关闭后重开应复用同一实例"
+        assert first.isVisible(), "关闭后重开应重新显示"
+        assert first.hotkey_edit.text() == 'ctrl+alt+q', "重开后表单内容应保留"
+        assert len(windows()) == baseline + 1, "关闭后重开不应新建窗口"
+        first.close()
+        _spin(50, app)
+    check("设置窗口单实例：反复打开只置前不重建", t_single_config_window)
+
+
     win.close()
 
 

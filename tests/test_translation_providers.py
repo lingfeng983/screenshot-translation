@@ -147,6 +147,54 @@ def test_dispatch_and_fallback():
     print("✅ 分发与降级测试通过\n")
 
 
+def test_primary_retry_policy():
+    """
+    测试主API也走翻译链统一的轻量重试（2 次/0.5s）
+
+    漏覆盖 _default_retry_handler 时主API会落到基类通用的 3 次/1s 策略：
+    一次瞬时故障先白等 1s+2s 才降级，还多打一次请求（付费/计次 API 是烧额度的），
+    而配置的降级API与免费兜底接口用的却是 2 次/0.5s。
+    """
+    print("=== 测试主API重试策略 ===")
+    import time
+    from managers.translation import TranslationManager, translation_retry_handler
+    from managers.providers import provider_registry
+    from managers.providers.base import TranslationProvider
+    from managers.retry_handler import default_retry_handler
+
+    calls = {'n': 0}
+
+    class FakeRetryableProvider(TranslationProvider):
+        name = 'fake_tr_retryable'
+        display_name = '瞬时故障API'
+
+        def translate(self, text, source='auto', target='zh'):
+            calls['n'] += 1
+            # 普通异常（非 NonRetryableError）才会走退避重试
+            raise Exception("模拟瞬时故障")
+
+    provider_registry.register(FakeRetryableProvider, override=True)
+    manager = TranslationManager(config_manager=None)
+
+    assert manager._default_retry_handler() is translation_retry_handler, \
+        "主API应使用翻译链统一重试器而非基类通用重试器"
+
+    # 直接走单provider链路，避开免费接口兜底的真实网络请求
+    started = time.monotonic()
+    result = manager._translate_via(FakeRetryableProvider, "hello")
+    elapsed = time.monotonic() - started
+
+    assert result.startswith('[翻译失败'), f"故障应转为失败文本: {result}"
+    assert calls['n'] == translation_retry_handler.max_attempts, (
+        f"主API应重试 {translation_retry_handler.max_attempts} 次，实际 {calls['n']} 次"
+        f"（通用策略是 {default_retry_handler.max_attempts} 次）")
+    # 通用策略退避 1s+2s≈3s；统一策略两次之间只等 0.5s±25% 抖动
+    assert elapsed < 1.5, f"主API退避过久: {elapsed:.2f}s，应使用短间隔重试"
+
+    provider_registry.unregister('fake_tr_retryable')
+    print("✅ 主API重试策略测试通过\n")
+
+
 def test_per_translation_target_lang():
     """测试单次翻译指定目标语言（结果对话框切换语言场景）"""
     print("=== 测试单次翻译目标语言 ===")
@@ -235,6 +283,7 @@ def main():
         test_edge_free_provider()
         test_chunk_text()
         test_dispatch_and_fallback()
+        test_primary_retry_policy()
         test_per_translation_target_lang()
         test_llm_messages()
         test_target_languages()

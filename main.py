@@ -254,9 +254,22 @@ class MainApp:
             traceback.print_exc()
 
     def _open_config_window_main_thread(self):
-        """在主线程创建并显示配置窗口"""
+        """
+        在主线程显示配置窗口，同一时间只保留一个
+
+        托盘左键双击、菜单「设置」与启动行为都会走这里：每次都新建窗口会让
+        设置页叠成一堆（关掉最上面那个，下面的还在），所以已存在时只置前。
+        """
         try:
             logger.debug("在主线程中打开配置窗口")
+            window = self._live_config_window()
+            if window is not None:
+                # 已打开（或关掉后仍留着的实例）：置前并抢焦点，不叠新窗口
+                window.show()
+                window.raise_()
+                window.activateWindow()
+                logger.debug("配置窗口已存在，置前显示")
+                return
             self.config_window = ConfigWindow(self)
             self.config_window.show()
             logger.debug("配置窗口已在主线程中打开")
@@ -267,6 +280,23 @@ class MainApp:
             QMessageBox.critical(None, "错误", f"打开配置窗口失败: {e}")
 
 
+
+    def _live_config_window(self):
+        """
+        返回当前可复用的配置窗口实例
+
+        Returns:
+            ConfigWindow 或 None: 实例已被销毁（底层 C++ 对象没了）时返回 None
+        """
+        window = self.config_window
+        if window is None:
+            return None
+        try:
+            window.isVisible()   # 已销毁的包装对象在这里抛 RuntimeError
+        except RuntimeError:
+            self.config_window = None
+            return None
+        return window
 
     def quit(self):
         """退出应用：清理资源并结束事件循环"""

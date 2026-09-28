@@ -9,6 +9,12 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+def _rect_class():
+    """QRect 延迟导入（测试脚本不在导入期拉 Qt）"""
+    from PyQt5.QtCore import QRect
+    return QRect
+
+
 def test_retry_handler():
     """测试重试处理器"""
     print("=== 测试重试处理器 ===")
@@ -137,8 +143,9 @@ def test_result_render_layout():
     aside = TextBlock('x', 300, 40, 100, 20)
     bounds = QRect(0, 0, 400, 100)
 
-    # 横向重叠的下一行决定下沿；不相干的行不挡
-    assert rr._block_bottom_limit(upper, [lower, aside], bounds) == lower.top - rr.COVER_PAD
+    # 横向重叠的下一行决定下沿（下沿留出纵向外扩量）；不相干的行不挡
+    assert (rr._block_bottom_limit(upper, [lower, aside], bounds)
+            == lower.top - rr.COVER_PAD_Y)
     assert rr._block_bottom_limit(upper, [aside], bounds) == bounds.bottom()
 
     font = QFont()
@@ -147,6 +154,305 @@ def test_result_render_layout():
     pixel_size, source_height = rr.bilingual_source_layout(font, 18, 40)
     assert source_height > 0 and pixel_size >= rr.FONT_MIN_PX
     print("✅ 译文就地覆盖排版测试通过\n")
+
+
+class _RecordingPainter:
+    """记录 drawRect/drawText 矩形的假 painter（只嵌 QFont 度量，不真的画）"""
+
+    def __init__(self, font):
+        self._font = font
+        self.rects = []
+        self.texts = []
+
+    def font(self):
+        return self._font
+
+    def setFont(self, font):
+        self._font = font
+
+    def setPen(self, *args, **kwargs):
+        pass
+
+    def setBrush(self, *args, **kwargs):
+        pass
+
+    def drawRect(self, rect):
+        QRect = _rect_class()
+        self.rects.append(QRect(rect))
+
+    def drawText(self, rect, flags, text):
+        QRect = _rect_class()
+        self.texts.append((QRect(rect), text))
+
+
+def test_cover_pad_adaptive():
+    """
+    覆盖块横向外扩随行高自适应
+
+    固定 2px 在大字号上盖不干净（笔画粗、ClearType 彩色边缘宽），原文首尾会
+    从覆盖块两侧露出来；但外扩变宽后译文起点不能跟着往左移，否则就地覆盖
+    就与原文错位了——两个不变量一起守。纵向不跟着变：行框本身已含升部/
+    降部余量，变宽只会吃掉上一行的译文。
+    """
+    print("=== 测试覆盖块外扩自适应 ===")
+    from PyQt5.QtCore import QPoint
+    from PyQt5.QtGui import QFont
+    from PyQt5.QtWidgets import QApplication
+    from PIL import Image
+
+    import managers.result_render as rr
+    from managers.text_block import TextBlock
+
+    app = QApplication.instance() or QApplication(sys.argv)  # noqa: F841
+
+    # 常见 UI 行高保持 2px（不改变原有观感）；大字号才变宽；有上下限
+    assert rr.cover_pad_x(20) == 2, f"常规行高应仍为 2px: {rr.cover_pad_x(20)}"
+    assert rr.cover_pad_x(50) > rr.cover_pad_x(20), "大字号外扩应更宽"
+    assert rr.cover_pad_x(400) == rr.COVER_PAD_MAX
+    assert rr.cover_pad_x(1) == rr.COVER_PAD_MIN
+    values = [rr.cover_pad_x(h) for h in range(1, 300)]
+    assert values == sorted(values), "外扩应随行高单调不减"
+    assert rr.cover_pad_x(0) == rr.COVER_PAD_MIN
+    assert rr.cover_pad_x(None) == rr.COVER_PAD_MIN
+    assert rr.cover_pad_x('bad') == rr.COVER_PAD_MIN
+
+    # 大行高块：横向覆盖矩形向外扩，但译文起点仍在原文左边界
+    image = Image.new('RGB', (260, 80), (255, 255, 255))
+    for x in range(60, 110):          # 块内放深色让前景色采样稳定
+        for y in range(30, 40):
+            image.putpixel((x, y), (20, 20, 20))
+    block = TextBlock('测试译文', 60, 16, 140, 50)
+    pad_x = rr.cover_pad_x(block.height)
+    assert pad_x == rr.COVER_PAD_MAX, f"50px 行高应取到最大外扩: {pad_x}"
+
+    painter = _RecordingPainter(QFont())
+    rr.paint_blocks(painter, image, [block], ['译文段落'],
+                    QPoint(0, 0), rr.MODE_TRANSLATED, scale=1.0)
+
+    assert len(painter.rects) == 1, f"应只画一个覆盖块: {len(painter.rects)}"
+    cover = painter.rects[0]
+    assert cover.left() == block.left - pad_x, \
+        f"覆盖块未向外扩: {cover.left()} != {block.left - pad_x}"
+    assert cover.width() == block.width + 2 * pad_x, \
+        f"覆盖块宽度应含两侧外扩: {cover.width()}"
+    # 纵向恒为 COVER_PAD_Y：不跟着行高变宽，免得吃掉上一行译文
+    assert cover.top() == block.top - rr.COVER_PAD_Y, \
+        f"纵向外扩应变: {cover.top()} != {block.top - rr.COVER_PAD_Y}"
+
+    assert painter.texts, "没有画出译文"
+    text_rect, text = painter.texts[0]
+    assert text_rect.left() == block.left, \
+        f"译文起点应为块左边界 {block.left}，实际 {text_rect.left()}（外扩把文字推歪了）"
+    assert text_rect.width() == block.width, \
+        f"译文可用宽度应等于块宽 {block.width}，实际 {text_rect.width()}"
+    assert text.strip(), "译文内容为空"
+
+    print("✅ 覆盖块外扩自适应测试通过\n")
+
+
+def _skip(reason):
+    """跳过用例：pytest 下标记 skip，直接跑脚本时只打印"""
+    try:
+        import pytest
+        pytest.skip(reason)
+    except ImportError:
+        print(f"⏭ 跳过：{reason}")
+
+
+def _tesseract_unavailable_reason():
+    """
+    Tesseract 引擎/训练数据不可用时的原因（可用时返回 None）
+
+    本用例的价值就在于用真引擎验真像素，引擎不在时跳过而不是假装通过。
+    """
+    try:
+        from managers.ocr_providers import tesseract as tess_mod
+    except Exception as e:
+        return f"无法导入 Tesseract provider: {e}"
+    if not tess_mod.pytesseract_available:
+        return "pytesseract 未安装"
+    try:
+        langs = tess_mod.TesseractProvider(None).get_available_languages()
+    except Exception as e:
+        return f"Tesseract 引擎不可用: {e}"
+    missing = {'eng', 'chi_sim'} - set(langs)
+    if missing:
+        return f"训练数据缺少 {sorted(missing)}: {langs}"
+    return None
+
+
+def _qpixmap_to_pil(pixmap):
+    """QPixmap → PIL.Image（按 bytesPerLine 处理扫描行对齐）"""
+    from PIL import Image
+    from PyQt5.QtGui import QImage
+
+    image = pixmap.toImage().convertToFormat(QImage.Format_RGB888)
+    stride = image.bytesPerLine()
+    ptr = image.constBits()
+    ptr.setsize(stride * image.height())
+    return Image.frombytes('RGB', (image.width(), image.height()),
+                           bytes(ptr), 'raw', 'RGB', stride, 1)
+
+
+def _text_pixels(image, band, threshold):
+    """band 内比阈值暗的像素坐标列表（band = 左, 上, 右, 下，右/下不含）"""
+    left, top, right, bottom = band
+    px = image.load()
+    hits = []
+    for y in range(top, bottom):
+        for x in range(left, right):
+            r, g, b = px[x, y][:3]
+            if (r + g + b) / 3 < threshold:
+                hits.append((x, y))
+    return hits
+
+
+def _bounds(points):
+    """点集的包围盒 (left, top, width, height)"""
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+    return (min(xs), min(ys), max(xs) - min(xs) + 1, max(ys) - min(ys) + 1)
+
+
+def _scan_band(rect, width, height, margin=10):
+    """
+    字迹扫描带：在绘制矩形外留一圈余量
+
+    绘制矩形贴边（左对齐/右对齐）时首尾字形就压在矩形边上，直接用矩形当
+    扫描带会把字迹截断；上下 10px 也刚好与相邻行的带子相接而不重叠。
+    """
+    return (max(0, rect.left() - margin),
+            max(0, rect.top() - margin),
+            min(width, rect.right() + 1 + margin),
+            min(height, rect.bottom() + 1 + margin))
+
+
+def _match_block(blocks, box):
+    """按纵向中心就近 + 横向重叠，把字迹框匹配到识别块"""
+    center_y = box[1] + box[3] / 2
+    best = None
+    for block in blocks:
+        if (block.left + block.width < box[0] - 8
+                or block.left > box[0] + box[2] + 8):
+            continue
+        dy = abs((block.top + block.height / 2) - center_y)
+        if dy <= 18 and (best is None or dy < best[1]):
+            best = (block, dy)
+    return best[0] if best else None
+
+
+def test_inplace_cover_pixel_alignment():
+    """
+    就地覆盖的像素级回归：真实渲染像素 + 真实 Tesseract + 真实绘制
+
+    守住三件用户直接看得见的事：
+    1. 对齐：识别块相对实心字迹的偏差 ≤2px（坐标回映射漏算留白会偏到 6px）；
+    2. 盖住：原文的**每一个可见像素**（含抗锯齿彩边）都落在绘制出的覆盖块里，
+       不能从边上露出——这是就地覆盖的底线；
+    3. 外扩：大字号行的横向外扩确实放宽了（固定 2px 会在大字号上露边）。
+
+    渲染走离屏 QPixmap（真字体引擎、真 ClearType 像素），不弹窗、不抓屏，
+    因此可在测试套件里自动跑；引擎不在时跳过。
+    """
+    print("=== 测试就地覆盖的像素级对齐 ===")
+    reason = _tesseract_unavailable_reason()
+    if reason:
+        _skip(reason)
+        return
+
+    from PyQt5.QtCore import QPoint, QRect, Qt
+    from PyQt5.QtGui import QColor, QFont, QPainter, QPixmap
+    from PyQt5.QtWidgets import QApplication
+
+    import managers.result_render as rr
+    from managers.ocr_providers.tesseract import TesseractProvider
+
+    app = QApplication.instance() or QApplication(sys.argv)  # noqa: F841
+
+    # 小/中/大字号 × 贴左/居中/贴右，凑齐横向偏移能显现的几种位置
+    lines = [
+        (QRect(14, 20, 802, 34),
+         '快捷键在设置里可以直接改，改完点保存', 15, Qt.AlignLeft),
+        (QRect(14, 74, 802, 34),
+         'The quick brown fox jumps over the lazy dog', 16, Qt.AlignHCenter),
+        (QRect(14, 128, 802, 34),
+         '译文必须盖住原文，不能错位', 18, Qt.AlignRight),
+        (QRect(14, 182, 802, 52),
+         '大号字体的边缘也要盖住', 34, Qt.AlignRight),
+    ]
+    width, height = 830, 250
+
+    # ---- 1. 离屏渲染真实文本 ----
+    pixmap = QPixmap(width, height)
+    pixmap.fill(QColor('#ffffff'))
+    painter = QPainter(pixmap)
+    painter.setPen(QColor('#202020'))
+    for rect, text, size, align in lines:
+        font = QFont('Microsoft YaHei UI')
+        font.setPixelSize(size)
+        painter.setFont(font)
+        painter.drawText(rect, align | Qt.AlignVCenter, text)
+    painter.end()
+    image = _qpixmap_to_pil(pixmap)
+
+    # ---- 2. 真实引擎识别 ----
+    blocks = TesseractProvider(None).recognize_blocks(image)
+    assert blocks, "Tesseract 未识别到任何行块"
+
+    matched = []
+    for index, (rect, text, _size, _align) in enumerate(lines):
+        band = _scan_band(rect, width, height)
+        # 128 为实心字迹，250 为含抗锯齿彩边的可见字迹（要盖住的就是后者）
+        solid = _text_pixels(image, band, 128)
+        assert solid, f"第{index}行没渲染出文字: {text!r}"
+        box = _bounds(solid)
+        # 扫描带必须完整包住字迹，否则量出来的框是被截断的
+        assert (box[0] > band[0] and box[1] > band[1]
+                and box[0] + box[2] < band[2]
+                and box[1] + box[3] < band[3]), \
+            f"第{index}行字迹贴到扫描带边缘，扫描带需留白: {box} vs {band}"
+
+        block = _match_block(blocks, box)
+        assert block is not None, \
+            f"第{index}行没匹配到识别块（共识别 {len(blocks)} 块）: {text!r}"
+        dx, dy = block.left - box[0], block.top - box[1]
+        assert abs(dx) <= 2 and abs(dy) <= 2, \
+            f"第{index}行块框与字迹错位 dx={dx} dy={dy}" \
+            f"（坐标回映射漏算留白会偏离到 6px）"
+        matched.append((index, block, text))
+
+    # ---- 3. 真实绘制，逐像素确认原文没有露出 ----
+    canvas = QPixmap(width, height)
+    canvas.fill(QColor('#ffffff'))
+    painter = QPainter(canvas)
+    painted = rr.paint_blocks(
+        painter, image, blocks, [f'译文第{i + 1}行' for i in range(len(blocks))],
+        QPoint(0, 0), rr.MODE_TRANSLATED, scale=1.0)
+    painter.end()
+    assert painted, "没有绘制任何覆盖块"
+
+    for index, block, text in matched:
+        band = _scan_band(lines[index][0], width, height)
+        visible = _text_pixels(image, band, 250)
+        leaked = [p for p in visible
+                  if not any(r.contains(p[0], p[1]) for r in painted)]
+        assert not leaked, (
+            f"第{index}行有 {len(leaked)} 个原文像素露在覆盖块外"
+            f"（如 {leaked[:3]}）: {text!r}")
+
+    # 大字号那行：画出来的覆盖块必须真用了自适应外扩（不是常量 2px）
+    big = matched[-1][1]
+    pad_x = rr.cover_pad_x(big.height)
+    assert pad_x > rr.COVER_PAD_MIN, \
+        f"行高 {big.height} 的外扩仍为固定值 {pad_x}px，大字号会露边"
+    big_cover = max(painted, key=lambda rect: rect.top())
+    assert big_cover.left() == big.left - pad_x, \
+        f"大字行覆盖块左侧外扩不符: {big_cover.left()} != {big.left - pad_x}"
+    assert big_cover.width() == big.width + 2 * pad_x, \
+        f"大字行覆盖块宽度不符: {big_cover.width()} != {big.width + 2 * pad_x}"
+
+    print(f"✅ 就地覆盖像素级对齐测试通过（{len(matched)} 行；"
+          f"大字行高 {big.height} 外扩 {pad_x}px）\n")
 
 
 def test_result_render_cache():
@@ -546,6 +852,8 @@ def main():
         test_cache_manager()
         test_screenshot_widget()
         test_result_render_layout()
+        test_cover_pad_adaptive()
+        test_inplace_cover_pixel_alignment()
         test_result_render_cache()
         test_ocr_provider_reuse()
         test_app_paths_user_data()

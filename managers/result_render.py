@@ -29,8 +29,17 @@ MODE_TRANSLATED = 'translated'
 MODES = (MODE_ORIGINAL, MODE_BILINGUAL, MODE_TRANSLATED)
 MODE_LABELS = {MODE_ORIGINAL: '原文', MODE_BILINGUAL: '双语', MODE_TRANSLATED: '译文'}
 
-# 覆盖块：外扩几像素把原文描边/抗锯齿边缘一起吃掉
-COVER_PAD = 2
+# 覆盖块横向外扩：把原文首/尾字形外沿的抗锯齿（含 ClearType 彩色边）吃掉。
+# 实测识别出的行框与字迹在横向上是齐边的（首字墨迹正好落在框左沿），
+# 所以横向完全靠外扩吸收边缘；而笔画越粗、字号越大，边缘外溢越宽，
+# 固定 2px 在大字号上会漏出原文。按行高取比例并夹取：常见 UI 字号
+# （行高约 20px）算出来仍是 2px，不改变原有观感，只有大字号才变宽。
+COVER_PAD_RATIO = 0.12
+COVER_PAD_MIN = 2
+COVER_PAD_MAX = 6
+# 覆盖块纵向外扩：行框本身含升部/降部余量（实测字迹距框顶 2px、距框底 5~7px），
+# 只需要盖住抗锯齿，不必跟着字号变宽，免得向上吃掉上一行的译文
+COVER_PAD_Y = 2
 # 双语模式下原文行压缩到原行高的比例
 BILINGUAL_SOURCE_RATIO = 0.72
 # 覆盖文字的最小/最大字号（像素）
@@ -437,6 +446,32 @@ def bilingual_source_layout(base_font, base_px, avail):
     return max(FONT_MIN_PX, int(font.pixelSize() * height / natural)), height
 
 
+def cover_pad_x(block_height):
+    """
+    覆盖块横向外扩的像素数（按行高自适应）
+
+    行高越大字号越大，描边越粗、抗锯齿（含 ClearType 子像素）外溢越宽，
+    固定 2px 盖不干净，原文首尾边缘会从覆盖块两侧露出来；按行高取比例并夹在
+    [COVER_PAD_MIN, COVER_PAD_MAX]：小字号不会多盖一圈压到邻居，
+    大字号又能把边缘完整吃掉。比例是相对的，所以逻辑坐标与物理像素
+    （就地图层与导出/钉图两套绘制）算出来的覆盖范围一致。
+
+    Args:
+        block_height (int): 行块高度（与调用方同一坐标系）
+
+    Returns:
+        int: 左右各外扩的像素数
+    """
+    try:
+        height = int(block_height)
+    except (TypeError, ValueError):
+        return COVER_PAD_MIN
+    if height <= 0:
+        return COVER_PAD_MIN
+    return max(COVER_PAD_MIN,
+               min(COVER_PAD_MAX, int(round(height * COVER_PAD_RATIO))))
+
+
 def _block_bottom_limit(block, following, bounds):
     """
     本块可向下借用的空间下沿
@@ -458,7 +493,7 @@ def _block_bottom_limit(block, following, bounds):
         overlap = (min(block.right, other.right)
                    - max(block.left, other.left))
         if overlap > max(4, block.width * 0.2):
-            limit = min(limit, other.top - COVER_PAD)
+            limit = min(limit, other.top - COVER_PAD_Y)
     return max(block.bottom, limit)
 
 
@@ -551,8 +586,11 @@ def paint_blocks(painter, image, blocks, texts, origin, mode, scale=1.0):
     painted = []
     for index, (block, text) in enumerate(pairs):
         rect = QRect(block.left, block.top, block.width, block.height)
-        limit = _block_bottom_limit(block,
-                                    [b for b, _ in pairs[index + 1:]], bounds)
+        # 横向外扩随行高自适应；下面绘制文字时要用同一个值缩回内边距，
+        # 否则外扩越宽，译文起点会被推得越靠左，与原文对不齐
+        pad_x = cover_pad_x(rect.height())
+        limit = _block_bottom_limit(
+            block, [b for b, _ in pairs[index + 1:]], bounds)
         # 可借用高度：从块顶到"下一行/选区下沿"之前
         avail = max(rect.height(), limit - rect.top())
         key = (rect.left(), rect.top(), rect.width(), rect.height(),
@@ -566,8 +604,8 @@ def paint_blocks(painter, image, blocks, texts, origin, mode, scale=1.0):
         # 覆盖块高度按实际排版内容收敛，多出的留白会压住下面的原文行
         content = source_height + len(lines) * line_height
         target = QRect(rect).translated(origin.x(), origin.y())
-        target = target.adjusted(-COVER_PAD, -COVER_PAD, COVER_PAD, COVER_PAD)
-        target.setHeight(max(rect.height(), min(content, avail)) + 2 * COVER_PAD)
+        target = target.adjusted(-pad_x, -COVER_PAD_Y, pad_x, COVER_PAD_Y)
+        target.setHeight(max(rect.height(), min(content, avail)) + 2 * COVER_PAD_Y)
 
         painter.setPen(Qt.NoPen)
         painter.setBrush(bg)
@@ -581,9 +619,9 @@ def paint_blocks(painter, image, blocks, texts, origin, mode, scale=1.0):
             painter.setFont(source_font)
             painter.setPen(QPen(QColor(fg.red(), fg.green(), fg.blue(), 150)))
             metrics = QFontMetrics(source_font)
-            source_text = _ellipsis(metrics, block.text, target.width() - 4)
-            painter.drawText(QRect(target.left() + 2, y,
-                                   target.width() - 4, source_height),
+            source_text = _ellipsis(metrics, block.text, target.width() - 2 * pad_x)
+            painter.drawText(QRect(target.left() + pad_x, y,
+                                   target.width() - 2 * pad_x, source_height),
                              Qt.AlignLeft | Qt.AlignVCenter, source_text)
             y += source_height
             painter.setFont(font)
@@ -592,8 +630,8 @@ def paint_blocks(painter, image, blocks, texts, origin, mode, scale=1.0):
         for line in lines:
             if y + line_height > target.bottom() + 1:
                 break
-            painter.drawText(QRect(target.left() + 2, y,
-                                   target.width() - 4, line_height),
+            painter.drawText(QRect(target.left() + pad_x, y,
+                                   target.width() - 2 * pad_x, line_height),
                              Qt.AlignLeft | Qt.AlignVCenter, line)
             y += line_height
         painted.append(target)

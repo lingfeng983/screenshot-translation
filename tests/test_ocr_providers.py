@@ -38,7 +38,7 @@ def test_ocr_provider_registry():
 def test_dispatch_and_fallback():
     """测试OCR分发与降级链（fake provider，无需真实引擎）"""
     print("=== 测试OCR分发与降级 ===")
-    from managers.ocr import OCRManager
+    from managers.ocr import OCRManager, ocr_retry_handler
     from managers.ocr_providers import ocr_provider_registry
     from managers.ocr_providers.base import OCRProvider
 
@@ -71,7 +71,9 @@ def test_dispatch_and_fallback():
     # 降级链：fake_ocr_fail -> tesseract(本机未装则也失败) -> mock（mock总成功）
     assert result and not result.startswith('[OCR识别失败'), \
         f"最终应降级到mock成功: {result}"
-    assert calls['fail'] >= 2, "主引擎应至少重试过"
+    assert calls['fail'] == ocr_retry_handler.max_attempts, (
+        f"主引擎应按 OCR 策略重试 {ocr_retry_handler.max_attempts} 次，"
+        f"实际 {calls['fail']} 次")
 
     # 主引擎正常时不走降级
     manager.set_ocr_type('fake_ocr_ok')
@@ -87,6 +89,53 @@ def test_dispatch_and_fallback():
     ocr_provider_registry.unregister('fake_ocr_ok')
 
     print("✅ OCR分发与降级测试通过\n")
+
+
+def test_primary_retry_policy():
+    """
+    测试文本链路的主引擎也走 OCR 自己的重试策略
+
+    漏覆盖 _default_retry_handler 时主引擎会落到基类通用的 3 次/1s 策略：
+    一次瞬时故障要先退避 1s+2s 才降级，还多打一次识别请求（云端引擎算配额），
+    且与块级链路/降级链路的 2 次/0.5s 不一致。
+    """
+    print("=== 测试主引擎重试策略 ===")
+    import time
+    from managers.ocr import OCRManager, ocr_retry_handler
+    from managers.ocr_providers import ocr_provider_registry
+    from managers.ocr_providers.base import OCRProvider
+    from managers.retry_handler import default_retry_handler
+
+    calls = {'n': 0}
+
+    class FakeRetryableOCR(OCRProvider):
+        name = 'fake_ocr_retryable'
+        display_name = '瞬时故障OCR'
+
+        def recognize(self, image):
+            calls['n'] += 1
+            # 普通异常（非 NonRetryableError）才会走退避重试
+            raise Exception("模拟瞬时故障")
+
+    ocr_provider_registry.register(FakeRetryableOCR, override=True)
+    manager = OCRManager(config_manager=None)
+
+    # 默认重试器就是 OCR 重试器：块级、文本、降级三条链路共用同一套参数
+    assert manager._default_retry_handler() is ocr_retry_handler, \
+        "主引擎应使用 OCR 重试器而非基类通用重试器"
+
+    started = time.monotonic()
+    manager._recognize_via(FakeRetryableOCR, None)
+    elapsed = time.monotonic() - started
+
+    assert calls['n'] == ocr_retry_handler.max_attempts, (
+        f"主引擎应重试 {ocr_retry_handler.max_attempts} 次，实际 {calls['n']} 次"
+        f"（通用策略是 {default_retry_handler.max_attempts} 次）")
+    # 通用策略退避 1s+2s≈3s；OCR 策略两次之间只等 0.5s±25% 抖动
+    assert elapsed < 1.5, f"主引擎退避过久: {elapsed:.2f}s，应使用短间隔重试"
+
+    ocr_provider_registry.unregister('fake_ocr_retryable')
+    print("✅ 主引擎重试策略测试通过\n")
 
 
 def test_per_engine_config_isolation():
@@ -176,6 +225,85 @@ def test_preprocess_image():
     print("✅ 图像预处理测试通过\n")
 
 
+def test_block_coords_round_trip():
+    """
+    块级坐标必须精确回到原图坐标系
+
+    识别图 = 原图放大 factor 倍 + 四周各 pad 像素留白，所以回映射要
+    “先减 pad 再除以 factor”。只按 image.width/processed.width 缩放会漏算
+    留白，块位置会随横向位置线性偏移（越靠左越偏右、越靠右越偏左，
+    中心附近恰好抵消），就地覆盖的译文就会与原文错开。
+
+    用假 pytesseract 把地面真值词框按“放大+留白”变换成留白图上的坐标，
+    再要求 recognize_blocks 原样返还——不需安装引擎，也不靠目测。
+    """
+    print("=== 测试块级坐标回映射 ===")
+    from PIL import Image
+    import managers.ocr_providers.tesseract as tess_mod
+    from managers.ocr_providers.tesseract import TesseractProvider, _PAD
+
+    width, height = 1000, 120
+    factor = TesseractProvider._scale_factor(height)
+    assert factor == 2
+    image = Image.new('RGB', (width, height), 'white')
+
+    # 地面真值：词框在原图坐标系下的位置（左/中/右三段，放大后可分辨）
+    truth = [(40, 20, 120, 20), (500, 24, 90, 18), (900, 22, 80, 22)]
+
+    class FakeOutput:
+        """pytesseract.Output 的占位（provider 只把它透传给 image_to_data）"""
+        DICT = 'dict'
+
+    class FakePytesseract:
+        """把地面真值变换成留白图上的词框，模拟 Tesseract 的输出"""
+
+        Output = FakeOutput
+
+        @staticmethod
+        def image_to_data(processed, config=None, output_type=None):
+            assert processed.size == (width * factor + 2 * _PAD,
+                                      height * factor + 2 * _PAD), \
+                f"预处理尺寸异常: {processed.size}"
+            data = {k: [] for k in (
+                'text', 'conf', 'block_num', 'par_num', 'line_num',
+                'word_num', 'left', 'top', 'width', 'height')}
+            for i, (left, top, w, h) in enumerate(truth):
+                data['text'].append(f'word{i}')
+                data['conf'].append('95')      # 引擎返回的是字符串
+                data['block_num'].append(1)
+                data['par_num'].append(1)
+                data['line_num'].append(i + 1)
+                data['word_num'].append(1)
+                data['left'].append(left * factor + _PAD)
+                data['top'].append(top * factor + _PAD)
+                data['width'].append(w * factor)
+                data['height'].append(h * factor)
+            return data
+
+    # 跳过 __init__（它要探测引擎路径、跑子进程并扫盘找 tessdata）
+    provider = TesseractProvider.__new__(TesseractProvider)
+    provider.config_manager = None
+
+    saved = (tess_mod.pytesseract, tess_mod.pytesseract_available)
+    tess_mod.pytesseract = FakePytesseract
+    tess_mod.pytesseract_available = True
+    try:
+        blocks = provider.recognize_blocks(image)
+    finally:
+        tess_mod.pytesseract, tess_mod.pytesseract_available = saved
+
+    assert len(blocks) == len(truth), f"块数不符: {len(blocks)} != {len(truth)}"
+    for block, (left, top, w, h) in zip(blocks, truth):
+        # 缩放系数是 1/factor，int() 取整最多差 1px
+        assert abs(block.left - left) <= 1, \
+            f"块横向位置错位: 应 {left}，实际 {block.left}（漏算留白的线性偏移）"
+        assert abs(block.top - top) <= 1, \
+            f"块纵向位置错位: 应 {top}，实际 {block.top}"
+        assert abs(block.width - w) <= 1, f"块宽错位: {block.width} != {w}"
+
+    print("✅ 块级坐标回映射测试通过\n")
+
+
 def test_scale_factor():
     """放大倍数随选区高度自适应：≥40px 用 2 倍，越小倍数越大，封顶 4 倍"""
     from managers.ocr_providers.tesseract import TesseractProvider
@@ -233,8 +361,10 @@ def main():
     try:
         test_ocr_provider_registry()
         test_dispatch_and_fallback()
+        test_primary_retry_policy()
         test_per_engine_config_isolation()
         test_preprocess_image()
+        test_block_coords_round_trip()
         test_scale_factor()
         test_otsu_threshold()
         test_text_cleaning()

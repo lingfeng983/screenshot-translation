@@ -221,9 +221,7 @@ class TesseractProvider(OCRProvider):
         if not pytesseract_available:
             raise ProviderConfigError("pytesseract未安装，无法使用Tesseract识别")
 
-        processed = self._preprocess_image(image)
-        # 预处理会放大图像，框坐标要按比例缩回原图坐标系
-        scale = image.width / processed.width if processed.width else 1.0
+        processed, scale, pad = self._preprocess_with_geometry(image)
         custom_config = f"--psm 6 -l {self._get_langs()}"
         data = pytesseract.image_to_data(
             processed, config=custom_config, output_type=pytesseract.Output.DICT)
@@ -238,11 +236,14 @@ class TesseractProvider(OCRProvider):
             if not text or conf <= 0:
                 continue
             key = (data['block_num'][i], data['par_num'][i], data['line_num'][i])
+            # 先扣掉四周留白再交给 merge_words 乘 scale：词框在留白图上满足
+            # x_pad = x_orig * factor + pad，只减 left/top 不改变宽高，
+            # 等价于把整个框平移回原图坐标系
             lines.setdefault(key, []).append({
                 'text': text,
                 'word_num': data['word_num'][i],
-                'left': data['left'][i],
-                'top': data['top'][i],
+                'left': data['left'][i] - pad,
+                'top': data['top'][i] - pad,
                 'width': data['width'][i],
                 'height': data['height'][i],
             })
@@ -335,12 +336,7 @@ class TesseractProvider(OCRProvider):
     @classmethod
     def _preprocess_image(cls, image):
         """
-        预处理图像以提升识别率：自适应放大、灰度、自动对比度、留白
-
-        不再做高斯模糊与固定 128 二值化：实测真实 UI 的小号 ClearType
-        文字，模糊会把笔画糊掉、固定阈值在深色主题下直接抹掉字迹，
-        两者都显著降低识别率；灰度 + autocontrast 交给 Tesseract 自己
-        自适应，效果更好。
+        预处理图像以提升识别率（只取图，坐标换算见 _preprocess_with_geometry）
 
         Args:
             image (PIL.Image.Image): 原始图像
@@ -348,12 +344,39 @@ class TesseractProvider(OCRProvider):
         Returns:
             PIL.Image.Image: 预处理后的图像；处理失败时返回原图
         """
+        return cls._preprocess_with_geometry(image)[0]
+
+    @classmethod
+    def _preprocess_with_geometry(cls, image):
+        """
+        预处理图像以提升识别率：自适应放大、灰度、自动对比度、留白
+
+        不再做高斯模糊与固定 128 二值化：实测真实 UI 的小号 ClearType
+        文字，模糊会把笔画糊掉、固定阈值在深色主题下直接抹掉字迹，
+        两者都显著降低识别率；灰度 + autocontrast 交给 Tesseract 自己
+        自适应，效果更好。
+
+        同时给出词框坐标回映射所需的几何信息：识别图是在原图放大 factor
+        倍后再四周各加 pad 像素留白，因此留白图上某点的坐标满足
+        x_pad = x_orig * factor + pad，回映射必须**先减 pad 再除以 factor**。
+        只按 image.width / processed.width 缩放会漏算留白，使得块位置随
+        横向位置线性偏移（PAD 固定，图越宽倍数越小、偏差越大：2 倍放大的
+        1000px 图两端各有约 6px 误差），就地覆盖译文就会对不齐原文。
+
+        Args:
+            image (PIL.Image.Image): 原始图像
+
+        Returns:
+            tuple: (预处理图, 缩放系数, 留白像素)。缩放系数为 1/factor，
+                供 TextBlock.merge_words 把像素坐标缩回原图；返回原图本身
+                （未放大也未留白）时系数为 1.0、留白为 0
+        """
         from PIL import Image, ImageOps
 
         try:
             width, height = image.size
             if width <= 0 or height <= 0:
-                return image
+                return image, 1.0, 0
 
             # 1. 自适应放大：小图放大到约 _TARGET_HEIGHT 高
             factor = cls._scale_factor(height)
@@ -368,10 +391,10 @@ class TesseractProvider(OCRProvider):
             binary = enhanced.point(lambda x: 255 if x > threshold else 0, mode='L')
             padded = Image.new('L', (binary.width + 2 * _PAD, binary.height + 2 * _PAD), 255)
             padded.paste(binary, (_PAD, _PAD))
-            return padded
+            return padded, 1.0 / factor, _PAD
         except Exception as e:
             logger.warning(f"图像预处理失败: {e}")
-            return image
+            return image, 1.0, 0
 
 
 def register(registry):

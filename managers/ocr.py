@@ -56,6 +56,20 @@ class OCRManager(ProviderChainManager):
     _default_provider_name = 'tesseract'
     _failure_prefix = _OCR_FAIL_PREFIX
 
+    def _default_retry_handler(self):
+        """
+        默认重试器：OCR 的轻量策略（2 次、0.5s 起）
+
+        不覆盖这里，主引擎会落到基类通用的 3 次/1s 策略上：一次失败先白等
+        约 3 秒才降级，还多打一次识别请求（云端引擎是算配额的）；
+        而块级链路与降级链路用的都是 ocr_retry_handler，同一张图两条链路
+        的重试策略不一致。
+
+        Returns:
+            RetryHandler: OCR 重试处理器
+        """
+        return ocr_retry_handler
+
     def __init__(self, config_manager=None):
         """
         初始化OCR管理器
@@ -140,8 +154,7 @@ class OCRManager(ProviderChainManager):
             fallback_cls = ocr_provider_registry.get('tesseract')
             if fallback_cls is not None and fallback_cls is not provider_cls:
                 logger.warning("当前OCR引擎失败，尝试本地Tesseract")
-                fallback_result = self._recognize_via(
-                    fallback_cls, image, retry_handler=ocr_retry_handler)
+                fallback_result = self._recognize_via(fallback_cls, image)
                 if not self._is_failure(fallback_result):
                     return fallback_result
 
@@ -221,8 +234,7 @@ class OCRManager(ProviderChainManager):
         def call(provider):
             return provider.recognize_blocks(image)
 
-        result = self._run_provider(
-            factory, call, lambda err: None, retry_handler=ocr_retry_handler)
+        result = self._run_provider(factory, call, lambda err: None)
         return result if isinstance(result, list) else []
 
     def _recognize_via(self, provider_cls, image, retry_handler=None):
@@ -233,7 +245,7 @@ class OCRManager(ProviderChainManager):
         Args:
             provider_cls: OCR provider类
             image (PIL.Image.Image): 待识别的图像
-            retry_handler: 重试处理器，缺省用OCR重试器
+            retry_handler: 重试处理器，缺省用OCR重试器（见 _default_retry_handler）
 
         Returns:
             str: 识别出的文本，彻底失败时返回 [OCR识别失败...] 文本
