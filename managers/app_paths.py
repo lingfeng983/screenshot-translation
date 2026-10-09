@@ -134,30 +134,52 @@ def log_file() -> str:
     return os.path.join(data_dir(), 'screenshot_translation.log')
 
 
+def _dedupe(paths: list) -> list:
+    """去重保序（候选列表里源码态会出现同一路径）"""
+    seen, result = set(), []
+    for p in paths:
+        if p and p not in seen:
+            seen.add(p)
+            result.append(p)
+    return result
+
+
+def ocr_resources_dir() -> str:
+    """
+    OCR 组件（Tesseract 便携包 + tessdata）所在目录
+
+    打包态由安装程序在装填阶段从 Gitee Release 下载解压到这里
+    （~/.screenshot-translation/resources/）：225 MiB 的引擎不塞进 exe，
+    安装包只装程序本体，可写目录里的组件也不会在覆盖升级时被删掉。
+    源码态即项目 resources/。
+    """
+    return os.path.join(data_dir(), 'resources')
+
+
 def tesseract_cmd_candidates() -> list:
     """
     tesseract.exe 候选路径（按优先级）：
-    1. 打包资源内的便携版（exe 的 _MEIPASS/resources/tesseract/）
-    2. 源码运行时的项目 resources/
-    3. 系统安装路径
+    1. 下载/安装到可写数据目录的便携版
+    2. 打包资源内的便携版（历史包或手动放置）
+    3. 源码运行时的项目 resources/
+    4. 系统安装路径
     """
-    candidates = []
-    bundled = os.path.join(bundled_root(), 'resources', 'tesseract', 'tesseract.exe')
-    candidates.append(bundled)
-    # 源码形态 bundled_root == app_root，去重即可
-    local = os.path.join(app_root(), 'resources', 'tesseract', 'tesseract.exe')
-    if local not in candidates:
-        candidates.append(local)
-    candidates.append(os.path.join(
-        os.environ.get('ProgramFiles', ''), 'Tesseract-OCR', 'tesseract.exe'))
-    candidates.append(os.path.join(
-        os.environ.get('LOCALAPPDATA', ''), 'Tesseract-OCR', 'tesseract.exe'))
-    return [c for c in candidates if c]
+    candidates = [
+        os.path.join(ocr_resources_dir(), 'tesseract', 'tesseract.exe'),
+        os.path.join(bundled_root(), 'resources', 'tesseract', 'tesseract.exe'),
+        os.path.join(app_root(), 'resources', 'tesseract', 'tesseract.exe'),
+        os.path.join(
+            os.environ.get('ProgramFiles', ''), 'Tesseract-OCR', 'tesseract.exe'),
+        os.path.join(
+            os.environ.get('LOCALAPPDATA', ''), 'Tesseract-OCR', 'tesseract.exe'),
+    ]
+    return _dedupe(candidates)
 
 
 def tessdata_candidates() -> list:
     """tessdata 训练数据目录候选路径（按优先级）"""
     candidates = [
+        os.path.join(ocr_resources_dir(), 'tessdata'),
         os.path.join(bundled_root(), 'resources', 'tessdata'),
         os.path.join(app_root(), 'resources', 'tessdata'),
         os.path.join(os.getcwd(), 'tessdata'),
@@ -166,10 +188,4 @@ def tessdata_candidates() -> list:
         os.path.join(os.environ.get('LOCALAPPDATA', ''),
                      'Tesseract-OCR', 'tessdata'),
     ]
-    # 去重保序
-    seen, result = set(), []
-    for c in candidates:
-        if c and c not in seen:
-            seen.add(c)
-            result.append(c)
-    return result
+    return _dedupe(candidates)

@@ -744,6 +744,63 @@ def test_ocr_provider_reuse():
     print("✅ OCR provider 实例复用测试通过\n")
 
 
+def test_app_paths_ocr_component_location():
+    """
+    OCR 组件的安装位置与运行时探测路径必须是同一个
+
+    安装包（scripts/setup.iss 调 scripts/fetch_ocr.ps1）把 Tesseract 解压到
+    ~/.screenshot-translation/resources/，exe 不再自带这 225MB。
+    两侧路径各改一半的表现是"装完仍然没有本地识别"，所以这条耦合要钉住。
+    """
+    print("=== 测试 OCR 组件探测路径 ===")
+    import tempfile
+    from managers import app_paths
+
+    env_names = ('HOME', 'USERPROFILE', 'HOMEDRIVE', 'HOMEPATH')
+    saved_env = {name: os.environ.get(name) for name in env_names}
+    saved_frozen = getattr(sys, 'frozen', None)
+    saved_meipass = getattr(sys, '_MEIPASS', None)
+    saved_executable = sys.executable
+    try:
+        with tempfile.TemporaryDirectory() as home, \
+                tempfile.TemporaryDirectory() as appdir:
+            os.environ['HOME'] = home
+            os.environ['USERPROFILE'] = home
+            os.environ.pop('HOMEDRIVE', None)
+            os.environ.pop('HOMEPATH', None)
+            sys.frozen = True
+            sys._MEIPASS = os.path.join(appdir, '_internal')
+            os.makedirs(sys._MEIPASS, exist_ok=True)
+            sys.executable = os.path.join(appdir, 'ScreenshotTranslator.exe')
+
+            ocr_dir = os.path.join(home, '.screenshot-translation', 'resources')
+            assert app_paths.ocr_resources_dir() == ocr_dir
+            assert app_paths.tesseract_cmd_candidates()[0] == \
+                os.path.join(ocr_dir, 'tesseract', 'tesseract.exe'), "下载目录未排在首位"
+            assert app_paths.tessdata_candidates()[0] == \
+                os.path.join(ocr_dir, 'tessdata')
+
+            # 组件真落地时，探测函数要能命中它
+            exe = app_paths.tesseract_cmd_candidates()[0]
+            os.makedirs(os.path.dirname(exe), exist_ok=True)
+            open(exe, 'w').close()
+            from managers.ocr_providers import tesseract as tess_mod
+            assert tess_mod._find_tesseract_cmd() == exe
+    finally:
+        for name, value in saved_env.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        for attr, value in (('frozen', saved_frozen), ('_MEIPASS', saved_meipass)):
+            if value is None:
+                if hasattr(sys, attr):
+                    delattr(sys, attr)
+            else:
+                setattr(sys, attr, value)
+        sys.executable = saved_executable
+
+
 def test_app_paths_user_data():
     """打包态可写文件落 ~/.screenshot-translation，旧文件只补缺迁移"""
     print("=== 测试打包态数据目录 ===")

@@ -2,6 +2,39 @@
 
 所有显著改动记录于此。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [v1.3.0] — 2026-10-10 — 安装包瘦身：OCR 组件改为安装时从 Gitee 下载
+
+### 变更
+- **交付物只剩 `ScreenshotTranslator-Setup.exe`**：不再产出单文件 exe，
+  onedir 仅作为安装器的输入目录（`release/onedir/`）
+- **Tesseract 不再打进 exe**：225MB 的 OCR 运行最小集改为装填阶段从本仓库
+  Gitee Release 附件下载（`ocr-components.zip.00N` + `.sha256`），解压到
+  `%USERPROFILE%\.screenshot-translation\resources\`；安装包因此从 105MB 降到 30MB。
+  新增 `scripts/fetch_ocr.ps1`（分卷合并、SHA256 校验、按 `ocr-version.txt`
+  标记跳过重复下载、先解到临时目录再整体替换），
+  安装脚本 `scripts/setup.iss` 在 `PrepareToInstall` 里调它
+- **下载失败即中止安装**：`PrepareToInstall` 返回错误串让 Inno 在任何文件落盘前
+  退出；勾选框「下载 OCR 组件」可取消，用于确实不需要本地识别的场景
+- **卸载会清掉下载的识别组件**（`resources\tesseract`、`resources\tessdata` 与
+  标记文件），用户数据目录里的配置与缓存保留
+- **OCR 组件附件包名去掉日期**（固定 `ocr-components`）：装填器按名字取附件，
+  带日期会让升级后的安装包找不到文件；分卷改由 `dist/ocr-bundle` 最小集产出
+  （85MB，单个附件即可，不必再分卷）
+
+### 修复
+- **打包脚本漏了 OCR 出包步骤**：`scripts/publish_release.py` 现在一并产出
+  OCR 附件分卷，并把版本号与 Release 标签一起注入 iss
+  （`/DMyAppVersion` `/DMyAppOcrTag`），避免安装包引用的 tag 与实际上传附件的 tag 脱节
+- **`setup.iss` 缺 UTF-8 BOM**：中文向导文案会被 Inno 按系统 ANSI（GBK）解释成乱码，
+  现在文件带 BOM
+
+### 测试
+- 新增 `test_app_paths_ocr_component_location`：钉住「安装落盘位置」与
+  「运行时探测首位候选」是同一个目录，防止两侧各改一半导致装完没有本地识别
+- `scripts/fetch_ocr.ps1` 按本地 HTTP 源全量跑过：下载→校验→解压→识别出文字；
+  同一标签重跑走跳过分支；标签不存在时退出码为 1
+- pytest 48 passed
+
 ## [v1.2.0] — 2026-10-10 — 遮罩冻结、快捷键可靠性、默认配置不落盘与翻译提速
 
 ### 修复

@@ -4,16 +4,17 @@
 
 ## 🚀 快速开始
 
-### 方式一：下载打包产物（推荐普通用户）
-从 [Releases](https://gitee.com/lingfeng983/screenshot-translation/releases) 下载 `ScreenshotTranslator.zip`
-（约298MB，解压后是一个目录，入口 `ScreenshotTranslator/ScreenshotTranslator.exe`）：
+### 方式一：安装程序（推荐普通用户）
+从 [Releases](https://gitee.com/lingfeng983/screenshot-translation/releases) 下载
+`ScreenshotTranslator-Setup.exe`（约 10MB），双击安装：
 
-1. 整目录解压到任意位置，双击 exe 运行——默认配置直接在内存里生效，不生成任何文件；
-   直到你在设置里改过东西，才会写入 `%USERPROFILE%\.screenshot-translation\config.ini`
-2. 右下角托盘出现图标（若被折叠，点任务栏 `^` 展开并右键图标→设置常显）
-3. **Tesseract OCR 已内置**（含中英文语言包），无需额外下载，开箱即用
-4. 按 `Alt+Z` 截图翻译
+1. 安装时会问你是否**下载 OCR 离线识别组件**（默认勾选，约 85MB，从同一 Release 的
+   附件取，装到 `%USERPROFILE%\.screenshot-translation\resources\`）。
+   断网/下载失败会让安装中止，重试或取消勾选即可只装程序本体
+2. 装完托盘出现图标（若被折叠，点任务栏 `^` 展开并右键图标→设置常显）
+3. 按 `Alt+Z` 截图翻译
 
+> 不装 OCR 组件时，识别需改用设置里的在线 OCR（百度云等）或系统已装的 Tesseract。
 > 使用百度云OCR/LLM 等需密钥的服务时，右键托盘→设置 填入密钥。
 
 ### 方式二：源码运行（开发者）
@@ -30,18 +31,20 @@ pip install -r requirements.txt
 # 3. 创建本地配置（含API密钥，不入库）
 copy config.example.ini config.ini
 
-# 4. 下载 OCR 组件（Tesseract 便携包+语言数据，约110MB，不入仓库，走 Release 附件）
+# 4. 下载 OCR 组件（Tesseract 运行最小集，约85MB，不入仓库，走 Release 附件）
 python scripts/setup_ocr.py
 
 # 5. 启动
 python main.py
 ```
 
-> **OCR 组件分发方式**：仓库只保留源码；Tesseract 便携包与语言数据以分卷 zip
-> 附件形式发布在 Gitee [Releases](https://gitee.com/lingfeng983/screenshot-translation/releases)，
-> `scripts/setup_ocr.py` 自动下载、SHA256 校验并解压。
+> **OCR 组件分发方式**：仓库只保留源码；Tesseract 运行最小集（约 85MB）以
+> `ocr-components.zip.00N` 附件形式发布在 Gitee [Releases](https://gitee.com/lingfeng983/screenshot-translation/releases)。
+> 源码端 `scripts/setup_ocr.py` 自动下载、SHA256 校验并解压到 `resources/`；
 > 离线环境可用 `python scripts/setup_ocr.py --local <分卷目录>`。
-> 维护者更新组件后运行 `python scripts/make_release_package.py` 重新打包。
+> 安装程序走的是同一批附件，由 `scripts/fetch_ocr.ps1` 拉取解压到用户数据目录。
+> 维护者更新组件后运行 `python scripts/collect_ocr_bundle.py` +
+> `python scripts/make_release_package.py` 重新打包（包名固定，勿加日期）。
 
 ### 启动程序
 ```bash
@@ -271,18 +274,29 @@ ScreenshotTranslation/
 新翻译API放 `managers/providers/`，新OCR引擎放 `managers/ocr_providers/`，
 定义 `name`/`display_name`/`config_fields` + 工作方法 + `register(registry)` 即自动上架配置界面。
 
-### 打包（onedir 目录形态）
+### 打包（onedir + 安装包）
 ```bash
-# 1. 收集 Tesseract 运行最小集（排除约60MB训练工具）
-python scripts/collect_ocr_bundle.py
-
-# 2. 打包（自动包含 OCR 最小集）
+# 1. 打包程序本体（不含 OCR，整个目录约 73MB）
 python -m PyInstaller screenshot-translator.spec --noconfirm
-# 产物：dist/ScreenshotTranslator/ScreenshotTranslator.exe（整个目录约298MB，需整体分发）
+
+# 2. 出 OCR 组件附件（安装时要从 Gitee Release 拉它）
+python scripts/collect_ocr_bundle.py      # → dist/ocr-bundle（约225MB）
+python scripts/make_release_package.py    # → dist/release/ocr-components.zip.001 + .sha256（约85MB）
+
+# 3. 编译安装器（先把 dist/ScreenshotTranslator/ 拷进 release/onedir/）
+iscc.exe /DMyAppVersion=1.3.0 /DMyAppOcrTag=v1.3.0 scripts\setup.iss
+# 产物：release/ScreenshotTranslator-Setup.exe（约30MB，唯一对外分发包）
 ```
+> 上面三步 `python scripts/publish_release.py --version 1.3.0` 一条命令串完，
+> 顺带提交、打 tag、发 Release。
+
+Tesseract **不再打进 exe**：安装程序在装填阶段从 Gitee Release 附件下载
+`ocr-components.zip.00N`，SHA256 校验后解压到
+`%USERPROFILE%\.screenshot-translation\resources\`（`scripts/fetch_ocr.ps1`）。
+代价是安装时要联网，好处是安装包从 105MB 降到 30MB，225MB 的二进制不跟着每个包跑。
+
 打包时自动裁剪无用依赖：Qt 的 QML/场景图/Vulkan 插件与翻译文件、PIL 的
-`_avif/_webp/_imagingtk` 等扩展、tesseract 副本在根目录重复落地的 47 个 DLL
-（仅 `libffi-8.dll`、`zlib1.dll` 被 CPython/Qt/PIL 真实加载，必须留在根目录）。
+`_avif/_webp/_imagingtk` 等扩展。
 
 exe 启动即加载本目录下的 `_internal`，不再解包到临时目录。可写文件统一落在
 `%USERPROFILE%\.screenshot-translation\`（`config.ini`、`translation_cache.json`、
@@ -291,7 +305,6 @@ exe 启动即加载本目录下的 `_internal`，不再解包到临时目录。�
 产物目录保持只读——放进
 Program Files 或整目录覆盖升级都不会丢配置；旧版本留在 exe 同目录的配置与缓存
 首次启动会自动搬进该目录（只补缺，不覆盖已有文件）。源码运行仍在项目根。
-OCR 组件随 `_internal` 分发，无需安装。
 
 ## 🆘 技术支持
 

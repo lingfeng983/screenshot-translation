@@ -3,19 +3,24 @@
 """
 制作 OCR 组件发行包
 
-把 resources/tesseract/（便携版主程序）与 resources/tessdata/（语言数据）
-打成分卷文件（默认 ≤90MB/卷），供上传到 Gitee Release 附件
-（Gitee 单附件上限 100MB）。
+把 dist/ocr-bundle/（scripts/collect_ocr_bundle.py 抽出的 Tesseract 运行最小集：
+便携版主程序 + 依赖 DLL + eng/chi_sim 语言数据）打成分卷文件（默认 ≤90MB/卷），
+供上传到 Gitee Release 附件（Gitee 单附件上限 100MB）。
+
+安装程序（scripts/setup.iss）在装填阶段按固定包名 ocr-components 从这个仓库的
+Release 附件下载并解压到 ~/.screenshot-translation/resources/，所以包名不要带日期：
+换了标签装填器就找不到文件了。
 
 分卷格式：单个 zip 按字节顺序切分；恢复端按序合并后即为完整 zip。
 sha256 文件记录完整 zip 的校验值。
 
 用法：
+    python scripts/collect_ocr_bundle.py
     python scripts/make_release_package.py
     python scripts/make_release_package.py --out dist/release --part-size 80
 
-输出：dist/release/ocr-components-<日期>.zip.001 / .002 / ...
-      dist/release/ocr-components-<日期>.zip.sha256
+输出：dist/release/ocr-components.zip.001 / .002 / ...
+      dist/release/ocr-components.zip.sha256
 """
 
 import argparse
@@ -26,11 +31,12 @@ import zipfile
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# 打包的目录（相对项目根）→ zip 内前缀
-INCLUDED_DIRS = [
-    ('resources/tesseract', 'tesseract'),
-    ('resources/tessdata', 'tessdata'),
-]
+# 打包源目录（相对项目根）：collect_ocr_bundle.py 的最小集产物，
+# 内部已是 tesseract/ 与 tessdata/ 两个前缀，直接按原样入包
+BUNDLE_DIR = os.path.join(PROJECT_ROOT, 'dist', 'ocr-bundle')
+
+# 装填器按这个名字找附件，改动要同步 scripts/setup.iss 与 setup_ocr.py
+DEFAULT_LABEL = 'ocr-components'
 
 _CHUNK = 1024 * 1024  # 1MB
 
@@ -42,17 +48,15 @@ def collect_sources():
     Returns:
         list[tuple[str, str]]: (磁盘路径, zip内相对路径)
     """
+    if not os.path.isdir(BUNDLE_DIR):
+        print(f"❌ 缺少 {BUNDLE_DIR}（先运行 python scripts/collect_ocr_bundle.py）")
+        return []
     sources = []
-    for src_rel, arc_prefix in INCLUDED_DIRS:
-        src_dir = os.path.join(PROJECT_ROOT, src_rel)
-        if not os.path.isdir(src_dir):
-            print(f"⚠ 目录不存在，跳过: {src_rel}")
-            continue
-        for root, _dirs, files in os.walk(src_dir):
-            for name in files:
-                path = os.path.join(root, name)
-                arcname = f"{arc_prefix}/{os.path.relpath(path, src_dir).replace(os.sep, '/')}"
-                sources.append((path, arcname))
+    for root, _dirs, files in os.walk(BUNDLE_DIR):
+        for name in files:
+            path = os.path.join(root, name)
+            arcname = os.path.relpath(path, BUNDLE_DIR).replace(os.sep, '/')
+            sources.append((path, arcname))
     return sources
 
 
@@ -129,12 +133,11 @@ def main():
                         help='输出目录（默认 dist/release）')
     parser.add_argument('--part-size', type=int, default=90,
                         help='单卷上限MB（默认90，Gitee附件上限100）')
-    parser.add_argument('--label', default=None, help='包名（默认 ocr-components-日期）')
+    parser.add_argument('--label', default=DEFAULT_LABEL,
+                        help=f'包名（默认 {DEFAULT_LABEL}，装填器按此名找附件，勿加日期）')
     args = parser.parse_args()
 
-    from datetime import date
-    label = args.label or f"ocr-components-{date.today():%Y%m%d}"
-    make_package(args.out, args.part_size, label)
+    make_package(args.out, args.part_size, args.label)
     return 0
 
 

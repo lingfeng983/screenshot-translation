@@ -5,14 +5,17 @@
 
 流程：
     1. pytest 全量测试（--skip-tests 可跳过）
-    2. PyInstaller 构建 onedir + onefile
-    3. onedir 产物同步到 release/onedir/，Inno Setup 编译安装器（版本号经 /D 注入）
+    2. PyInstaller 构建 onedir（OCR 组件不进 exe，见第 3 步）
+    3. 出包：onedir 同步到 release/onedir/ → Inno Setup 编译唯一的交付物
+       release/ScreenshotTranslator-Setup.exe；再抽 OCR 最小集切成
+       dist/release/ocr-components.zip.00N，作为安装包安装时要下载的 Release 附件
     4. CHANGELOG 的 [Unreleased] 段落就地改名为 [v版本] — 日期
     5. git commit + tag + push（含 tag）
     6. Gitee API 创建 Release（正式），取 [v版本] 段作为说明
        注意：Gitee 开放 API 的 attachments 只收 URL、不支持本地文件上传，
-       所以 Setup.exe / Onefile.exe 附件由脚本打开 Release 编辑页人工拖入
-       （附件不进 git，仅 Release 分发）
+       所以附件由脚本打开 Release 编辑页人工拖入（附件不进 git，仅 Release 分发）。
+       Setup.exe 与 ocr-components 分卷必须传到同一个 tag 的 Release 下，
+       否则安装程序按 v版本 取附件会 404，按设计中止安装。
 
 用法：
     python scripts/publish_release.py --version 1.2.0
@@ -65,11 +68,10 @@ def step_build(no_build):
         print("跳过（--no-build）")
         return
     run([sys.executable, "-m", "PyInstaller", "screenshot-translator.spec", "--noconfirm"])
-    run([sys.executable, "-m", "PyInstaller", "screenshot-translator-onefile.spec", "--noconfirm"])
 
 
 def step_assemble(version):
-    print("\n=== 3/6 同步 release/ 并编译安装器 ===")
+    print("\n=== 3/6 出包：Setup.exe + OCR 组件分卷 ===")
     src = os.path.join(PROJECT_ROOT, "dist", "ScreenshotTranslator")
     dst = os.path.join(PROJECT_ROOT, "release", "onedir")
     if not os.path.isdir(src):
@@ -77,14 +79,22 @@ def step_assemble(version):
     if os.path.isdir(dst):
         shutil.rmtree(dst)
     shutil.copytree(src, dst)
-    one_src = os.path.join(PROJECT_ROOT, "dist", "ScreenshotTranslator-Onefile.exe")
-    if os.path.isfile(one_src):
-        shutil.copy2(one_src, os.path.join(PROJECT_ROOT, "release"))
+
     iscc = next((p for p in ISCC_CANDIDATES if os.path.isfile(p)), None)
     if not iscc:
         sys.exit("未找到 Inno Setup 编译器 iscc.exe，请安装后重试")
     iss = os.path.join(PROJECT_ROOT, "scripts", "setup.iss")
-    run([iscc, f"/DMyAppVersion={version}", iss])
+    run([iscc, f"/DMyAppVersion={version}", f"/DMyAppOcrTag=v{version}", iss])
+
+    # OCR 组件不进 exe，改成安装时从本次 Release 的附件拉取，
+    # 所以分卷必须跟安装包一起产出、一起上传（包名固定，装填器按名字找）
+    run([sys.executable, "scripts/collect_ocr_bundle.py"])
+    run([sys.executable, "scripts/make_release_package.py"])
+    parts_dir = os.path.join(PROJECT_ROOT, "dist", "release")
+    for name in ("ocr-components.zip.001", "ocr-components.zip.sha256"):
+        path = os.path.join(parts_dir, name)
+        if not os.path.isfile(path):
+            sys.exit(f"缺少 OCR 附件：{path}（安装包里勾了下载的都会失败）")
 
 
 def step_changelog(version):
@@ -176,8 +186,10 @@ def step_release(version, notes, token, no_api):
     except Exception as e:  # 已存在等情况
         print(f"⚠ API 创建失败（可能 Release 已存在）: {e}")
     # 附件无法走开放 API 上传（只收 URL），打开编辑页人工拖入
+    print("附件清单：release/ScreenshotTranslator-Setup.exe、"
+          "dist/release/ocr-components.zip.001（+后续分卷）、ocr-components.zip.sha256")
     edit_url = f"https://gitee.com/{GITEE_REPO}/releases/edit/{tag}"
-    print(f"附件请拖入（Setup.exe / Onefile.exe / OCR 分卷），正在打开编辑页: {edit_url}")
+    print(f"正在打开编辑页: {edit_url}")
     webbrowser.open(edit_url)
 
 
