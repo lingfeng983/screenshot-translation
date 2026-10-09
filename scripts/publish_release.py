@@ -161,7 +161,8 @@ def step_release(version, notes, token, no_api):
     body = {
         "access_token": token,
         "tag_name": tag,
-        "title": tag,
+        # Gitee API 必填的是 name（title 会被忽略并报 "name is missing"）
+        "name": tag,
         "body": notes,
         "target_commitish": "master",
     }
