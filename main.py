@@ -171,6 +171,10 @@ class MainApp:
             # 初始化全局快捷键管理器
             self.hotkey_manager = HotkeyManager(self.screenshot_manager, self.config_manager)
             self.hotkey_manager.initialize()
+            # 原生注册被别的程序占用时只能退到键盘钩子，而钩子在提权窗口/锁屏切换后
+            # 收不到按键——用户侧的感受就是“快捷键时灵时不灵”。启动时就明确提示一次，
+            # 能换组合早换，而不是等他事后抱怨。
+            self._notify_hotkey_conflict()
 
             # 初始化线程池管理器
             thread_pool_manager.initialize()
@@ -183,6 +187,10 @@ class MainApp:
             # 第一次往画布上画中文时 Qt 会现加载字体并整形，实测约 290ms；
             # 趁启动后的空闲把它预热掉，截图结果态首帧就不卡这一下
             QTimer.singleShot(1500, result_render.warm_up_fonts)
+
+            # 翻译链路预热：首个请求要付 DNS+TLS 握手（约 0.3 秒），
+            # 趁启动空闲提前付掉，第一次截图就少等这一截
+            QTimer.singleShot(800, self._warm_up_translation)
 
             # 启动时处理启动行为
             self._handle_startup_behavior()
@@ -242,6 +250,43 @@ class MainApp:
                     logger.info("非首次启动，跳过托盘提示通知")
             except Exception as e:
                 logger.error(f"处理启动行为失败: {e}")
+
+    def _notify_hotkey_conflict(self):
+        """
+        快捷键处于兼容模式（原生注册被占用）时，托盘就绪后提示一次
+
+        提示要延迟发出：pystray 的 Icon.run 未就绪时 notify 会被丢掉，
+        而 QTimer 在 exec_ 之前创建不触发（Qt 对象尚未关联事件循环）。
+        """
+        try:
+            hint = self.hotkey_manager.native_conflict_hint() if self.hotkey_manager else ''
+        except Exception as e:
+            logger.debug(f"读取快捷键冲突提示失败: {e}")
+            return
+        if not hint:
+            return
+        logger.warning(hint)
+
+        def _show_conflict_notice():
+            """托盘通知：告诉用户当前是兼容模式，换个组合就稳了"""
+            try:
+                if self.tray_manager:
+                    self.tray_manager.show_notification("快捷键已降级为兼容模式", hint)
+            except Exception as e:
+                logger.warning(f"快捷键兼容模式通知失败: {e}")
+
+        # 比首次运行提示（2.0s）晚一点：两者同时发出会互相顶掉
+        notice_timer = threading.Timer(3.5, _show_conflict_notice)
+        notice_timer.daemon = True
+        notice_timer.start()
+
+    def _warm_up_translation(self):
+        """启动后在后台预热翻译链路（失败只记日志，不影响使用）"""
+        try:
+            if self.translation_manager:
+                thread_pool_manager.submit(self.translation_manager.warm_up)
+        except Exception as e:
+            logger.warning(f"翻译链路预热调度失败: {e}")
 
     def open_config_window(self):
         """打开配置窗口，非主线程调用时自动调度到主线程执行"""
@@ -915,11 +960,23 @@ class ConfigWindow(QDialog):
 
             if not hotkey_ok:
                 # 配置已全部落盘、管理器已同步，只有热键保持原值
+                fail_reason = getattr(
+                    self.main_app.hotkey_manager, 'last_error', '') or \
+                    f"快捷键 {hotkey} 注册失败，已保留原快捷键。"
                 QMessageBox.warning(
                     self,
                     "快捷键无效",
-                    f"快捷键 {hotkey} 注册失败，已保留原快捷键，其他配置已保存。"
+                    f"{fail_reason}其他配置已保存。"
                 )
+                return
+
+            # 被其他程序占用时只能退到键盘钩子：提前告知比事后抱怨"快捷键失效"好
+            conflict_hint = ''
+            if self.main_app.hotkey_manager:
+                conflict_hint = self.main_app.hotkey_manager.native_conflict_hint()
+            if conflict_hint:
+                QMessageBox.information(self, "快捷键已保存（兼容模式）", conflict_hint)
+                self.close()
                 return
 
             QMessageBox.information(self, "保存成功", "配置已保存")

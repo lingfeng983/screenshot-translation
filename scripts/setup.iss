@@ -11,7 +11,9 @@
 
 #define MyAppName "ScreenshotTranslator"
 #define MyAppNameZh "截图翻译"
-#define MyAppVersion "0.1.0"
+#ifndef MyAppVersion
+  #define MyAppVersion "0.1.0"
+#endif
 #define MyAppPublisher "ScreenshotTranslation Project"
 #define MyAppExeName "ScreenshotTranslator.exe"
 

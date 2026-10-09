@@ -129,6 +129,8 @@ class TesseractProvider(OCRProvider):
     config_fields = (
         ('tesseract_langs', '识别语言(如 eng+chi_sim)', False),
     )
+    # 本地引擎：同一张图重试必然同一结果，空结果可直接定案
+    deterministic_results = True
 
     def __init__(self, config_manager=None):
         """

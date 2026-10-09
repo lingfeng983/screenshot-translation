@@ -15,6 +15,30 @@ def _rect_class():
     return QRect
 
 
+_QT_APP = None
+
+
+def _ensure_qt_app():
+    """
+    取得 QApplication 并一直持有引用
+
+    必须持有引用：QApplication 一旦被 GC，其底层 C++ 对象随之销毁，
+    之后再构造任何 QWidget 都触发 Qt 的 qFatal（"Must construct a
+    QApplication before a QWidget"）——进程直接终止，既没有 Python 异常
+    也没有回溯。本次剪贴板用例就这么静默退出过，比失败更难排查。
+
+    Returns:
+        QApplication: 全局唯一实例
+    """
+    global _QT_APP
+    from PyQt5.QtWidgets import QApplication
+    app = QApplication.instance()
+    if app is None:
+        app = QApplication(sys.argv)
+    _QT_APP = app
+    return app
+
+
 def test_retry_handler():
     """测试重试处理器"""
     print("=== 测试重试处理器 ===")
@@ -73,14 +97,13 @@ def test_screenshot_widget():
     """测试截图遮罩窗口：初始化属性完整、可绘制、能获得焦点（ESC 退出依赖焦点）"""
     print("=== 测试截图遮罩窗口 ===")
     try:
-        from PyQt5.QtWidgets import QApplication
         from PyQt5.QtCore import Qt, QPoint
         from managers.screenshot import ScreenshotWidget
     except Exception as e:
         print(f"⚠️ 截图遮罩测试跳过 (导入失败): {e}\n")
         return
 
-    app = QApplication.instance() or QApplication(sys.argv)
+    _ensure_qt_app()
     widget = ScreenshotWidget()
 
     for attr in ('begin', 'end', 'is_selecting', 'full_screen',
@@ -94,6 +117,212 @@ def test_screenshot_widget():
     widget.is_selecting = True
     widget.grab()  # 选区状态绘制边框/气泡/参考线
     print("✅ 截图遮罩窗口测试通过\n")
+
+
+def test_screenshot_overlay_freezes_screen():
+    """
+    遮罩必须锁住整屏：选区里不能再透出实时桌面
+
+    以前选区靠 CompositionMode_Clear“挖空”窗口露出真实屏幕，用户框的时候
+    选区里自刷新的内容（视频、时钟、进度条）会继续动，框到的画面与最终识别
+    的画面也可能不是同一帧。现在整屏抓拍铺在遮罩底层，选区从同一张冻结图重绘。
+    """
+    print("=== 测试遮罩冻结整屏 ===")
+    from PyQt5.QtCore import QPoint, QRect
+    from PyQt5.QtGui import QColor, QImage, QPainter
+
+    from managers.screenshot import ScreenshotWidget
+
+    _ensure_qt_app()
+    widget = ScreenshotWidget()
+
+    assert widget._frozen_pixmap is not None, "遮罩没有冻结的整屏抓拍"
+    dpr = widget._frozen_pixmap.devicePixelRatio() or 1.0
+    frozen = widget._frozen_pixmap.toImage()
+
+    # 品红底当“实时桌面”：遮罩渲染到它上面，凡是还能看见透明或品红的地方，
+    # 都说明实时桌面从遮罩里透了上来
+    canvas = QImage(int(widget.width() * dpr), int(widget.height() * dpr),
+                    QImage.Format_ARGB32)
+    canvas.setDevicePixelRatio(dpr)
+    canvas.fill(QColor(255, 0, 255))
+
+    def render_over_live_screen():
+        """按真实 paintEvent 把遮罩画到“实时桌面”上"""
+        painter = QPainter(canvas)
+        widget.render(painter)
+        painter.end()
+
+    def rendered_vs_frozen(point):
+        """同一点上：遮罩渲染结果 与 冻结图本身 的颜色"""
+        x, y = int(point.x() * dpr), int(point.y() * dpr)
+        return canvas.pixelColor(x, y), frozen.pixelColor(x, y)
+
+    # 1) 选区态：选区保持原亮度，且必须是冻结图那一帧
+    widget.begin, widget.end = QPoint(40, 40), QPoint(240, 160)
+    widget.is_selecting = True
+    render_over_live_screen()
+
+    got, expected = rendered_vs_frozen(widget._get_rect().center())
+    assert got.alpha() == 255, f"选区里透出了实时桌面（alpha={got.alpha()}）"
+    delta = max(abs(a - b) for a, b in zip(
+        (got.red(), got.green(), got.blue()),
+        (expected.red(), expected.green(), expected.blue())))
+    assert delta <= 2, f"选区里不是冻结画面: {got.name()} != {expected.name()}"
+
+    got_out, expected_out = rendered_vs_frozen(
+        QPoint(widget.width() - 5, widget.height() - 5))
+    assert got_out.name() != QColor(255, 0, 255).name(), "选区外透出了实时桌面"
+    assert (got_out.red(), got_out.green(), got_out.blue()) <= \
+        (expected_out.red(), expected_out.green(), expected_out.blue()), \
+        "选区外没有压上暗角"
+
+    # 2) 结果/加载态：选区图还没回投时也必须亮出冻结画面，不能挖空
+    widget.is_selecting = False
+    widget._loading = True
+    widget._crop_pixmap = None
+    widget._result_rect = QRect(40, 40, 200, 120)
+    render_over_live_screen()
+    got, expected = rendered_vs_frozen(widget._result_rect.topLeft() + QPoint(20, 20))
+    assert got.alpha() == 255 and got.name() == expected.name(), \
+        f"结果态透出了实时桌面: {got.name()}(alpha={got.alpha()}) != {expected.name()}"
+
+    # 3) 冻结图要活到遮罩关闭为止（整屏抓拍是遮罩里最大的一块内存）
+    widget.close()
+    assert widget._frozen_pixmap is None, "遮罩关闭后应释放整屏冻结图"
+    print("✅ 遮罩冻结整屏测试通过\n")
+
+
+def test_screenshot_snap_screen_seam():
+    """
+    跨屏接缝也要能磁吸
+
+    多屏时两块显示器之间那条边是常用对齐线，现只把整个桌面的外沿当参考线，
+    选区贴到接缝上就只能靠手对准。
+    """
+    print("=== 测试跨屏接缝磁吸 ===")
+    from PyQt5.QtCore import QRect
+
+    from managers.screenshot import ScreenshotWidget
+
+    _ensure_qt_app()
+    widget = ScreenshotWidget()
+    try:
+        # 合成一个左右双屏布局，与真实显示器数量无关
+        widget._screen_rects = [QRect(0, 0, 1920, 1080), QRect(1920, 0, 2560, 1440)]
+        widget.screen_width, widget.screen_height = 4480, 1440
+        widget._snap_window_rects = []
+        widget._snap_threshold = 12
+
+        rect, guides = widget._snap_rect(QRect(1600, 100, 314, 400))
+        assert rect.right() + 1 == 1920, f"没吸到屏幕接缝: {rect}"
+        assert ('x2', 1920) in guides, f"接缝参考线没绘制: {guides}"
+
+        # 远离任何参考线时不吸
+        rect, guides = widget._snap_rect(QRect(800, 300, 300, 200))
+        assert guides == [], f"不该乱吸: {guides}"
+    finally:
+        widget.close()
+    print("✅ 跨屏接缝磁吸测试通过\n")
+
+
+def _make_color_marker(color, geometry):
+    """造一块纯色置顶不透明窗口：用来在抓拍图里定位坐标"""
+    from PyQt5.QtCore import Qt
+    from PyQt5.QtGui import QPainter
+    from PyQt5.QtWidgets import QWidget
+
+    class _Marker(QWidget):
+        def __init__(self):
+            super().__init__()
+            self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+            self.setGeometry(geometry)
+
+        def paintEvent(self, event):
+            painter = QPainter(self)
+            painter.fillRect(self.rect(), color)
+            painter.end()
+
+    return _Marker()
+
+
+def test_screenshot_overlay_multi_screen():
+    """
+    多显示器：遮罩覆盖整个虚拟桌面，冻结图覆盖全部屏幕且坐标能对上
+
+    以前遮罩只盖主屏：副屏不但没被冻结（内容继续刷新），选区也选不到副屏的
+    内容。现在覆盖整个虚拟桌面，用一块副屏上的纯色标记窗口验证抓拍图与局部
+    坐标的对应关系（副屏在主屏左侧/上方时桌面原点为负）。
+    """
+    print("=== 测试遮罩多屏覆盖 ===")
+    import time
+
+    from PyQt5.QtCore import QPoint, QRect, QSize
+    from PyQt5.QtGui import QColor
+    from PyQt5.QtWidgets import QApplication
+
+    from managers.screenshot import ScreenshotWidget, desktop_bounds
+
+    app = _ensure_qt_app()
+    screens = app.screens()
+    union = QRect(screens[0].geometry())
+    for screen in screens:
+        union = union.united(screen.geometry())
+
+    bounds = desktop_bounds()
+    assert bounds is not None, "取不到屏幕信息"
+    desktop_rect, cover_all_screens = bounds
+    assert desktop_rect == union, f"覆盖范围不是整个虚拟桌面: {desktop_rect} != {union}"
+    if len(screens) < 2:
+        print("⚠️ 单屏环境，仅校验覆盖范围\n")
+        return
+
+    # 副屏左上角附近放一块纯白标记：它在冻结图里的位置能证明跨屏坐标换算
+    marker_color = QColor(0, 255, 0)
+    marker_offset = QPoint(60, 60)
+    marker_size = QSize(240, 180)
+    marker = _make_color_marker(
+        marker_color,
+        QRect(screens[1].geometry().topLeft() + marker_offset, marker_size))
+    marker.show()
+    marker.raise_()
+    deadline = time.time() + 0.6
+    while time.time() < deadline:
+        app.processEvents()
+        time.sleep(0.02)
+
+    widget = ScreenshotWidget()
+    try:
+        assert widget.covers_multiple_screens(), "多屏环境应覆盖所有显示器"
+        assert (widget.width(), widget.height()) == (union.width(), union.height())
+        assert widget._desktop_rect.topLeft() == union.topLeft(), "桌面原点不对"
+        assert len(widget._screen_rects) == len(screens), "没有记录每块显示器的位置"
+        for screen, rect in zip(screens, widget._screen_rects):
+            assert rect.topLeft() == screen.geometry().topLeft() - union.topLeft()
+
+        scale = widget._grab_scale
+        frozen = widget._frozen_pixmap.toImage()
+        assert abs(frozen.width() - union.width() * scale) <= 2, \
+            f"冻结图没有覆盖整个桌面: {frozen.width()} != {union.width()}x{scale:.3f}"
+        assert abs(frozen.height() - union.height() * scale) <= 2, \
+            f"冻结图高度不对: {frozen.height()} != {union.height()}x{scale:.3f}"
+
+        # 副屏上的标记在冻结图里应出现在 (桌面局部 + 标记内缩) 的位置
+        local = (screens[1].geometry().topLeft() + marker_offset
+                 - union.topLeft() + QPoint(20, 20))
+        got = frozen.pixelColor(int(local.x() * scale), int(local.y() * scale))
+        assert got.green() >= 240 and got.red() <= 12 and got.blue() <= 12, \
+            f"副屏坐标没有对上冻结图: {got.name()}（期望纯绿）"
+        # 顺带确认这台机器上副屏确实在主屏左侧（原点为负的换算分支）
+        assert cover_all_screens, "多屏时应整桌面抓拍"
+    finally:
+        widget.close()
+        marker.close()
+        deadline = time.time() + 0.2
+        while time.time() < deadline:
+            app.processEvents()
+            time.sleep(0.02)
+    print("✅ 遮罩多屏覆盖测试通过\n")
 
 def test_tesseract_no_console_window():
     """Tesseract 子进程必须带 no-window 标志：无控制台的 exe 里否则会闪终端窗口"""
@@ -251,12 +480,14 @@ def test_cover_pad_adaptive():
 
 
 def _skip(reason):
-    """跳过用例：pytest 下标记 skip，直接跑脚本时只打印"""
-    try:
+    """跳过用例：pytest 下标记 skip，直接跑脚本时只打印后继续"""
+    # PYTEST_CURRENT_TEST 只在 pytest 收集执行期间存在，可可靠区分两种模式；
+    # 不能用 try/except 吞 Skipped——那会把 pytest 下的 skip 变成"通过"，
+    # 让后续环境相关断言被静默跳过（本次剪贴板用例就吃过这个亏）
+    if 'PYTEST_CURRENT_TEST' in os.environ:
         import pytest
         pytest.skip(reason)
-    except ImportError:
-        print(f"⏭ 跳过：{reason}")
+    print(f"⏭ 跳过：{reason}")
 
 
 def _tesseract_unavailable_reason():
@@ -703,19 +934,35 @@ def test_pin_window_keys():
     from PyQt5.QtCore import QEvent, Qt
     from PyQt5.QtGui import QKeyEvent, QPixmap
     from PyQt5.QtWidgets import QApplication
-    from managers.pin_window import PinWindow
+    from managers import pin_window
 
     app = QApplication.instance() or QApplication(sys.argv)  # noqa: F841
     pixmap = QPixmap(60, 40)
     pixmap.fill(Qt.red)
-    pin = PinWindow(pixmap)
+    pin = pin_window.PinWindow(pixmap)
     try:
         for key in (Qt.Key_A, Qt.Key_Z, Qt.Key_Return, Qt.Key_C):
             pin.keyPressEvent(QKeyEvent(QEvent.KeyPress, key, Qt.NoModifier))
-        pin.keyPressEvent(
-            QKeyEvent(QEvent.KeyPress, Qt.Key_C, Qt.ControlModifier))
-        clipboard = QApplication.clipboard()
-        assert not clipboard.pixmap().isNull(), "Ctrl+C 应把钉住的图放进剪贴板"
+
+        # Ctrl+C：验证走的是带校验的写入器，且不抛异常。
+        # 真实写入断言在环境里会 flaky（剪贴板可能被第三方工具长期占用，
+        # 见 test_clipboard_write_verified 的说明），这里只盯接线本身。
+        calls = []
+
+        class SpyClipboard:
+            @staticmethod
+            def set_pixmap(px):
+                calls.append(px)
+                return True
+
+        real_clipboard = pin_window.clipboard
+        pin_window.clipboard = SpyClipboard
+        try:
+            pin.keyPressEvent(
+                QKeyEvent(QEvent.KeyPress, Qt.Key_C, Qt.ControlModifier))
+        finally:
+            pin_window.clipboard = real_clipboard
+        assert calls and calls[0] is pixmap, "Ctrl+C 应调用校验写入器复制钉住的图"
     finally:
         pin.close()
     print("✅ 钉图窗口按键测试通过\n")
@@ -795,6 +1042,133 @@ def test_ocr_notice_not_translated():
     print("✅ OCR提示文本不送翻译测试通过\n")
 
 
+def test_clipboard_write_verified():
+    """
+    剪贴板写入必须校验生效并重试，且复制路径真的走这条校验通道
+
+    Windows 上剪贴板被别的进程占用时 setText/setPixmap 会**静默失败**
+    （既不抛异常也不返回错误），历史实现是"设完就记已复制"，用户看到的
+    现象是点了复制却粘贴不出东西（钉图的 Ctrl+C 就为此连挂过三次）。
+
+    校验信号用 ownsClipboard()（实测 0ms、被占用时也照常应答），不能用
+    读回比对：text()/pixmap() 在剪贴板被占用时走 OleGetClipboard 吃满
+    OLE 超时，实测一次 0.5~3.9 秒，放在主线程等于自造卡死。
+    """
+    print("=== 测试剪贴板写入校验与重试 ===")
+    from managers import clipboard as clipboard_mod
+
+    class FakePixmap:
+        def __init__(self, null):
+            self._null = null
+
+        def isNull(self):
+            return self._null
+
+    class FakeClipboard:
+        """前 fail_times 次写入不生效，模拟写入瞬间剪贴板被别的程序占用"""
+
+        def __init__(self, fail_times):
+            self.fail_times = fail_times
+            self.writes = 0
+            self._owns = False
+
+        def setText(self, text):
+            self.writes += 1
+            self._owns = self.writes > self.fail_times
+
+        def setPixmap(self, pixmap):
+            self.writes += 1
+            self._owns = self.writes > self.fail_times
+
+        def ownsClipboard(self):
+            return self._owns
+
+    class FakeApp:
+        current = None
+
+        @staticmethod
+        def clipboard():
+            return FakeApp.current
+
+    real_app = clipboard_mod.QApplication
+    real_delay = clipboard_mod._DELAY
+    clipboard_mod.QApplication = FakeApp
+    clipboard_mod._DELAY = 0          # 只验证重试次数，不真的等
+    try:
+        # ① 一次成功：不重试
+        FakeApp.current = FakeClipboard(fail_times=0)
+        assert clipboard_mod.set_text('译文') is True
+        assert FakeApp.current.writes == 1
+
+        # ② 连失败两次后成功：重试到位（老实现会静默丢掉这次复制）
+        FakeApp.current = FakeClipboard(fail_times=2)
+        assert clipboard_mod.set_text('译文') is True
+        assert FakeApp.current.writes == 3
+
+        # ③ 一直被占用：返回 False，调用方才能不谎报"已复制"
+        FakeApp.current = FakeClipboard(fail_times=99)
+        assert clipboard_mod.set_text('译文') is False
+        assert FakeApp.current.writes == clipboard_mod._ATTEMPTS
+
+        # ④ 图片写入同一套校验（钉图 Ctrl+C 走的就是它）
+        FakeApp.current = FakeClipboard(fail_times=1)
+        assert clipboard_mod.set_pixmap(FakePixmap(False)) is True
+        assert FakeApp.current.writes == 2
+        FakeApp.current = FakeClipboard(fail_times=99)
+        assert clipboard_mod.set_pixmap(FakePixmap(False)) is False
+
+        # ⑤ 空文本/空图根本不碰剪贴板，也不当作"写成功"
+        FakeApp.current = FakeClipboard(fail_times=0)
+        assert clipboard_mod.set_text('') is False
+        assert clipboard_mod.set_pixmap(FakePixmap(True)) is False
+        assert FakeApp.current.writes == 0
+    finally:
+        clipboard_mod.QApplication = real_app
+        clipboard_mod._DELAY = real_delay
+
+    # ⑥ 端到端接线：复制入口确实走校验写入器（而不是又回到裸 setText）。
+    #    用桩断言、环境无关，必须先于真实冒烟执行——真实剪贴板可能被
+    #    第三方程序长期占用，若先冒烟会导致接线断言被静默跳过
+    from managers import result_render
+    from managers import screenshot as screenshot_mod
+
+    # 构造 QWidget 前必须先有 QApplication，且引用要一直持有（见 _ensure_qt_app）
+    _ensure_qt_app()
+    widget = screenshot_mod.ScreenshotWidget()
+    widget._result = {'original_text': 'Hello', 'translated_text': '你好',
+                      'block_texts': []}
+    widget._mode = result_render.MODE_TRANSLATED
+
+    copied = []
+
+    class SpyClipboard:
+        @staticmethod
+        def set_text(text):
+            copied.append(text)
+            return False
+
+    real_screenshot_clipboard = screenshot_mod.clipboard
+    screenshot_mod.clipboard = SpyClipboard
+    try:
+        widget._copy_result()
+    finally:
+        screenshot_mod.clipboard = real_screenshot_clipboard
+    assert copied == ['你好'], f"复制未经过校验写入器: {copied}"
+
+    # ⑦ 真实剪贴板冒烟：写入后 ownsClipboard 必须立刻为 True。
+    #    ownsClipboard 探测不打开剪贴板，第三方工具长期占住剪贴板时
+    #    （剪贴板监视器挂着 OpenClipboard），写入会真实失败——此时如实
+    #    跳过而不是误报；机制本身由 ①~⑤ 的桩验证与 ⑥ 的接线验证守住。
+    from PyQt5.QtWidgets import QApplication
+    _ensure_qt_app()
+    clipboard = QApplication.clipboard()
+    if not clipboard_mod.set_text('对齐冒烟测试'):
+        _skip("真实剪贴板当前被其他程序占用（长期 OpenClipboard 持有），无法做写入冒烟")
+        return
+    assert clipboard.ownsClipboard(), "写入成功后 ownsClipboard 应为 True"
+    print("✅ 剪贴板写入校验与重试测试通过\n")
+
+
 def test_tray_debounce():
     """托盘单击/双击防抖：双击只开设置，第二击迟到也不误触发截图"""
     print("=== 测试托盘防抖 ===")
@@ -843,6 +1217,593 @@ def test_tray_debounce():
     print("✅ 托盘防抖测试通过\n")
 
 
+def test_config_defaults_in_memory():
+    """默认配置只驻内存：没改过设置就不该在磁盘上留下 config.ini"""
+    print("=== 测试默认配置只驻内存 ===")
+    import tempfile
+    from config import ConfigManager
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, 'config.ini')
+        manager = ConfigManager(path)
+        assert not os.path.exists(path), "默认配置不该落盘（会留下遗留文件）"
+
+        # 内存里的默认值必须完整可用
+        assert manager.get_api_type() == 'edge_free'
+        assert manager.get_global_hotkey() == 'alt+z'
+        assert manager.is_minimize_to_tray() is True
+        assert manager.get_ocr_type() == 'tesseract'
+        assert manager.get_ocr_option('tesseract_langs') == 'eng+chi_sim'
+        assert manager.get_overlay_option('snap_threshold') == '12'
+        assert manager.get_theme() == 'dark'
+
+        # 用户真的改了配置才写盘，重启后才能读回改动
+        manager.set_theme('light')
+        assert os.path.exists(path), "改动配置后应落盘"
+        with open(path, encoding='utf-8') as f:
+            content = f.read()
+        assert '[UI]' in content and 'theme = light' in content
+        assert ConfigManager(path).get_theme() == 'light'
+
+        # 文件存在但内容读坏了：就地修好，而不是每次启动都回退默认值
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write('这不是配置文件')
+        broken = ConfigManager(path)
+        assert broken.get_api_type() == 'edge_free'
+        with open(path, encoding='utf-8') as f:
+            assert '[Translation]' in f.read(), "坏配置未被修复"
+    print("✅ 默认配置只驻内存测试通过\n")
+
+
+def test_hotkey_parse():
+    """快捷键串解析：必须“修饰键+主键”，否则会把该键从所有程序里抢走"""
+    print("=== 测试快捷键解析 ===")
+    from managers.hotkey_native import (
+        MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, MOD_WIN, parse_hotkey)
+
+    assert parse_hotkey('alt+f4') == (MOD_ALT | MOD_NOREPEAT, 0x73), "F 键解析不符"
+    mods, vk = parse_hotkey('alt+z')
+    assert mods == MOD_ALT | MOD_NOREPEAT and vk is not None, f"单修饰键解析不符: {mods:#x}"
+    assert parse_hotkey('Ctrl + Shift + a')[0] == MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT
+    assert parse_hotkey('win+alt+space')[1] == 0x20
+    assert parse_hotkey('ctrl+alt+shift+win+z')[0] == (
+        MOD_CONTROL | MOD_ALT | MOD_SHIFT | MOD_WIN | MOD_NOREPEAT)
+
+    for bad in ('z', 'alt+a+b', 'alt+', '', None, 123, 'alt+不存在的键'):
+        assert parse_hotkey(bad) is None, f"{bad!r} 不该被解析成合法快捷键"
+    print("✅ 快捷键解析测试通过\n")
+
+
+def test_hotkey_backend_fallback_and_watchdog():
+    """原生注册失败要回退键盘钩子；钩子后端的线程/注册丢失要能自愈"""
+    print("=== 测试快捷键后端回退与自愈 ===")
+    import ctypes
+    from ctypes import wintypes
+
+    import managers.hotkey as hotkey_mod
+    from managers.hotkey import HotkeyManager
+    from managers.hotkey_native import (
+        HOTKEY_ID, WM_HOTKEY, NativeHotkeyBackend)
+    from PyQt5.QtWidgets import QApplication
+
+    class FakeScreenshot:
+        def start_screenshot(self):
+            pass
+
+    class FakeUser32:
+        """只记录调用：RegisterHotKey 的返回值控制注册成败"""
+        def __init__(self, ok):
+            self.ok = ok
+            self.registered = []
+            self.unregistered = []
+
+        def RegisterHotKey(self, hwnd, hotkey_id, modifiers, vk):
+            self.registered.append((hotkey_id, modifiers, vk))
+            return 1 if self.ok else 0
+
+        def GetLastError(self):
+            # 模拟“已被其它程序占用”
+            return 0 if self.ok else 1400
+
+        def UnregisterHotKey(self, hwnd, hotkey_id):
+            self.unregistered.append(hotkey_id)
+            return 1
+
+    class FakeThread:
+        def __init__(self, alive):
+            self._alive = alive
+
+        def is_alive(self):
+            return self._alive
+
+    class FakeListener:
+        def __init__(self, alive=True):
+            self.listening_thread = FakeThread(alive)
+            self.processing_thread = FakeThread(alive)
+
+    class FakeKeyboard:
+        """只实现被测代码用到的 keyboard 接口"""
+        def __init__(self):
+            self._listener = FakeListener(True)
+            self._hotkeys = {}
+            self._pressed_events = {56: 'alt'}
+            self._logically_pressed_keys = {56: 'alt'}
+            self.added = []
+
+        def add_hotkey(self, hotkey, callback, args=()):
+            handle = object()
+            self._hotkeys[handle] = self._hotkeys[hotkey] = handle
+            self.added.append(hotkey)
+            return handle
+
+        def remove_hotkey(self, handle):
+            self._hotkeys = {k: v for k, v in self._hotkeys.items() if v is not handle}
+
+    app = QApplication.instance() or QApplication(sys.argv)
+    saved_keyboard = hotkey_mod.keyboard
+    try:
+        # 1) 原生注册被占用（返回 0）→ 自动回退键盘钩子，而不是彻底失效
+        fake_keyboard = FakeKeyboard()
+        hotkey_mod.keyboard = fake_keyboard
+        manager = HotkeyManager(FakeScreenshot())
+        manager.hotkey = 'alt+z'
+        manager.is_running = True      # 看门狗只在运行态工作
+        manager.native_backend = NativeHotkeyBackend(FakeUser32(ok=False))
+        assert manager._register_hotkey() is True, "原生失败后应回退钩子后端"
+        assert manager._backend == 'keyboard'
+        assert '占用' in manager.native_backend.last_error, \
+            f"失败原因应是快捷键被占用，而非环境缺失: {manager.native_backend.last_error}"
+        assert fake_keyboard.added == ['alt+z']
+        # 占用场景要能告诉用户换个组合，而不是事后抱怨快捷键失效
+        hint = manager.native_conflict_hint()
+        assert '占用' in hint and 'alt+z' in hint, f"占用提示不完整: {hint!r}"
+        manager._backend = 'native'
+        assert manager.native_conflict_hint() == '', "原生注册成功时不该提示占用"
+        manager._backend = 'keyboard'
+
+        # 2) 注册表里已没有本快捷键 → 看门狗重新注册
+        fake_keyboard._hotkeys.clear()
+        manager._watchdog_tick()
+        assert fake_keyboard.added == ['alt+z', 'alt+z'], "注册丢失后未重新注册"
+
+        # 3) 监听线程已退出 → 换新监听器、清掉卡住的按键、重新注册
+        fake_keyboard._listener = FakeListener(alive=False)
+        manager._watchdog_tick()
+        assert fake_keyboard._pressed_events == {}, "残留按键会让快捷键永远匹配不上"
+        assert fake_keyboard._logically_pressed_keys == {}
+        assert fake_keyboard.added == ['alt+z'] * 3, "监听器重建后未重新注册"
+        assert fake_keyboard._listener.listening_thread.is_alive(), "监听器未被重建"
+
+        # 4) 原生后端：注册成功时收 WM_HOTKEY 并触发回调，其它消息不受影响
+        fake_user32 = FakeUser32(ok=True)
+        native = NativeHotkeyBackend(fake_user32)
+        fired = []
+        assert native.register('alt+z', lambda: fired.append(1)) is True
+        assert fake_user32.registered[0][1] & 0x0001, "Alt 修饰键未传给 RegisterHotKey"
+
+        msg = wintypes.MSG()
+        msg.message = WM_HOTKEY
+        msg.wParam = HOTKEY_ID
+        pointer = ctypes.cast(ctypes.pointer(msg), ctypes.c_void_p).value
+        assert native._filter.nativeEventFilter(b'windows_generic_MSG', pointer) == (True, 0)
+        assert fired == [1], "WM_HOTKEY 未触发回调"
+        msg.wParam = HOTKEY_ID + 1
+        assert native._filter.nativeEventFilter(b'windows_generic_MSG', pointer)[0] is False
+        assert native._filter.nativeEventFilter(b'windows_dispatcher_MSG', pointer)[0] is False
+
+        # 回调自己抛异常也不能逃出去（否则会打断 Qt 事件循环）
+        msg.wParam = HOTKEY_ID
+        native._callback = lambda: (_ for _ in ()).throw(RuntimeError('回调崩了'))
+        assert native._filter.nativeEventFilter(b'windows_generic_MSG', pointer) == (True, 0)
+
+        native.unregister()
+        assert native._registered is False and HOTKEY_ID in fake_user32.unregistered
+        assert app.installNativeEventFilter is not None
+
+        # 5) 仍被占用时：重试原生失败，但钩子绝不能丢（不能中途失去快捷键）
+        manager.native_backend = NativeHotkeyBackend(FakeUser32(ok=False))
+        assert manager._try_native_upgrade() is False
+        assert manager._backend == 'keyboard' and manager._hotkey_handle is not None
+        assert fake_keyboard._hotkeys != {}, "重试失败不该摘掉钩子"
+
+        # 6) 占用解除（抢快捷键的程序退出）→ 看门狗自动升级回原生后端
+        manager.native_backend = NativeHotkeyBackend(FakeUser32(ok=True))
+        manager._watchdog_tick()
+        assert manager._backend == 'native', "原生注册空出后没有升级回原生后端"
+        assert fake_keyboard._hotkeys == {}, "升级后钩子必须摘掉，否则一次按键触发两次"
+        assert manager.native_conflict_hint() == '', "切回原生后不该再提示兼容模式"
+        manager._watchdog_tick()      # 原生后端下再看一次：不该重复注册
+        assert manager._backend == 'native'
+    finally:
+        hotkey_mod.keyboard = saved_keyboard
+    print("✅ 快捷键后端回退与自愈测试通过\n")
+
+
+def test_hotkey_conflict_prompt_reasons():
+    """快捷键冲突/失效时，last_error 要给出用户能照着做的具体原因"""
+    print("=== 测试快捷键冲突提示文案 ===")
+    import managers.hotkey as hotkey_mod
+    from managers.hotkey import HotkeyManager
+    from managers.hotkey_native import NativeHotkeyBackend
+    from PyQt5.QtWidgets import QApplication
+
+    class FakeUser32:
+        def __init__(self, ok, last_error=0):
+            self.ok = ok
+            self._last_error = last_error
+
+        def RegisterHotKey(self, hwnd, hotkey_id, modifiers, vk):
+            return 1 if self.ok else 0
+
+        def GetLastError(self):
+            return self._last_error
+
+        def UnregisterHotKey(self, hwnd, hotkey_id):
+            return 1
+
+    class FakeKeyboard:
+        """钩子注册始终失败：只有两后端都挂才走冲突文案分支"""
+        _listener = None
+        _hotkeys = {}
+
+        def add_hotkey(self, hotkey, callback, args=None):
+            raise ValueError(f"未知按键: {hotkey}")
+
+        def remove_hotkey(self, handle):
+            pass
+
+    class FakeConfig:
+        def get_global_hotkey(self):
+            return 'alt+z'
+
+        def set_global_hotkey(self, hotkey):
+            pass
+
+    app = QApplication.instance() or QApplication(sys.argv)
+    saved_keyboard = hotkey_mod.keyboard
+    try:
+        hotkey_mod.keyboard = FakeKeyboard()
+
+        # 1) 被其它程序占用（错误码1400）且钩子也失败 → 提示“已被其它程序占用”
+        manager = HotkeyManager(config_manager=FakeConfig())
+        manager.native_backend = NativeHotkeyBackend(
+            FakeUser32(ok=False, last_error=1400))
+        assert manager.set_hotkey('ctrl+alt+z') is False
+        assert '占用' in manager.last_error, \
+            f"占用场景应提示被占用: {manager.last_error!r}"
+
+        # 2) 快捷键无法解析 → 提示需要“修饰键+主键”
+        manager.native_backend = NativeHotkeyBackend(FakeUser32(ok=True))
+        assert manager.set_hotkey('z') is False
+        assert '修饰键' in manager.last_error, \
+            f"非法格式应提示组合写法: {manager.last_error!r}"
+
+        # 3) 其它系统错误 → 带错误码的通用失败文案
+        manager.native_backend = NativeHotkeyBackend(
+            FakeUser32(ok=False, last_error=5))
+        assert manager.set_hotkey('ctrl+alt+z') is False
+        assert '错误码' in manager.last_error, \
+            f"未知失败应带错误码: {manager.last_error!r}"
+
+        # 4) conflict 属性只在占用时为 True
+        manager.native_backend = NativeHotkeyBackend(
+            FakeUser32(ok=False, last_error=1400))
+        manager.native_backend.register('alt+z', lambda: None)
+        assert manager.native_backend.conflict is True
+        manager.native_backend = NativeHotkeyBackend(
+            FakeUser32(ok=False, last_error=5))
+        manager.native_backend.register('alt+z', lambda: None)
+        assert manager.native_backend.conflict is False
+    finally:
+        hotkey_mod.keyboard = saved_keyboard
+    print("✅ 快捷键冲突提示文案测试通过\n")
+
+
+def test_hotkey_callback_isolation():
+    """按键回调绝不能抛异常也不能重入：钩子线程会因异常整个退出"""
+    print("=== 测试快捷键回调隔离与防抖 ===")
+    import managers.hotkey as hotkey_mod
+    from managers.hotkey import HotkeyManager
+
+    class FakeScreenshot:
+        def __init__(self, explode=False):
+            self.calls = 0
+            self.explode = explode
+
+        def start_screenshot(self):
+            self.calls += 1
+            if self.explode:
+                raise RuntimeError("截图流程崩了")
+
+    # 1) 截图流程抛异常也不能逃出回调（keyboard 的处理线程没有异常保护）
+    manager = HotkeyManager(FakeScreenshot(explode=True))
+    manager.hotkey = 'alt+z'
+    manager._on_hotkey_pressed()
+    assert manager.screenshot_manager.calls == 1
+
+    # 2) 线程调度器本身抛异常也要被吞掉
+    def _raise(*args, **kwargs):
+        raise RuntimeError("调度失败")
+
+    saved_dispatch = hotkey_mod.qt_dispatcher.dispatch_to_main_thread
+    try:
+        hotkey_mod.qt_dispatcher.dispatch_to_main_thread = _raise
+        manager._last_fire_ts = 0.0
+        manager._on_hotkey_pressed()
+    finally:
+        hotkey_mod.qt_dispatcher.dispatch_to_main_thread = saved_dispatch
+
+    # 3) 防抖：长按连发只触发一次，窗口过去后恢复
+    fake = FakeScreenshot()
+    manager = HotkeyManager(fake)
+    manager.hotkey = 'alt+z'
+    for _ in range(5):
+        manager._on_hotkey_pressed()
+    assert fake.calls == 1, f"防抖失效，连发了 {fake.calls} 次截图"
+    manager._last_fire_ts -= manager._DEBOUNCE_SECONDS + 0.01
+    manager._on_hotkey_pressed()
+    assert fake.calls == 2, "防抖窗口过后应恢复触发"
+    assert HotkeyManager._DEBOUNCE_SECONDS <= 0.2, \
+        "防抖窗口过长会把用户“关掉再按一次”的第二次按键吃掉（表现为快捷键没反应）"
+    print("✅ 快捷键回调隔离与防抖测试通过\n")
+
+
+def test_screenshot_stale_widget():
+    """残留/已销毁的遮罩引用不能让热键按下变成“没反应”"""
+    print("=== 测试遮罩残留引用自愈 ===")
+    import managers.screenshot as screenshot_mod
+    from managers.screenshot import ScreenshotManager
+
+    class FakeSignal:
+        def connect(self, *args, **kwargs):
+            pass
+
+    class FakeWidget:
+        """只实现 _run_screenshot 会用到的接口"""
+        def __init__(self, config_manager=None):
+            self.config_manager = config_manager
+            self.region_selected = FakeSignal()
+            self.retranslate_requested = FakeSignal()
+            self.retry_requested = FakeSignal()
+            self.screenshot_canceled = FakeSignal()
+            self.visible = True
+            self.shown = False
+            self.fullscreen_shown = False
+            self.closed = False
+
+        multi_screen = False          # 类属性：跨屏分支的用例直接改它
+
+        def isVisible(self):
+            return self.visible
+
+        def show(self):
+            self.shown = True
+
+        def showFullScreen(self):
+            self.shown = True
+            self.fullscreen_shown = True
+
+        def covers_multiple_screens(self):
+            return type(self).multi_screen
+
+        def activateWindow(self):
+            pass
+
+        def raise_(self):
+            pass
+
+        def setFocus(self):
+            pass
+
+        def close(self):
+            self.closed = True
+
+        def deleteLater(self):
+            pass
+
+    class DestroyedWidget(FakeWidget):
+        def isVisible(self):
+            raise RuntimeError('wrapped C/C++ object has been deleted')
+
+    saved_widget_cls = screenshot_mod.ScreenshotWidget
+    saved_get_app = screenshot_mod.get_qt_app
+    try:
+        screenshot_mod.ScreenshotWidget = FakeWidget
+        screenshot_mod.get_qt_app = lambda: object()
+
+        # 1) 残留引用（底层对象已销毁）→ 丢掉引用并正常开一次截图
+        manager = ScreenshotManager()
+        manager._screenshot_widget = DestroyedWidget()
+        manager._run_screenshot()
+        assert isinstance(manager._screenshot_widget, FakeWidget), "残留引用未被丢弃"
+        assert manager._screenshot_widget.shown, "按键被残留引用吞掉，没有开始新截图"
+
+        # 2) 正在显示的遮罩 → 仍然按“再按一次=取消”处理
+        manager2 = ScreenshotManager()
+        live = FakeWidget()
+        manager2._screenshot_widget = live
+        manager2._run_screenshot()
+        assert manager2._screenshot_widget is None and live.closed, "显示中的遮罩应被取消"
+
+        # 2b) 单屏用 showFullScreen（原行为），跨屏只能用 show：
+        # showFullScreen 只会把窗口铺满它所在的那一块屏，另一块屏会重新露出来
+        single = ScreenshotManager()
+        single._run_screenshot()
+        assert single._screenshot_widget.fullscreen_shown, "单屏时应走 showFullScreen"
+        multi = ScreenshotManager()
+        saved_multi_flag = FakeWidget.multi_screen
+        FakeWidget.multi_screen = True
+        try:
+            multi._run_screenshot()
+        finally:
+            FakeWidget.multi_screen = saved_multi_flag
+        assert multi._screenshot_widget.shown and not multi._screenshot_widget.fullscreen_shown, \
+            "跨屏时应按自己的几何 show()，否则只覆盖一块屏"
+
+        # 3) 已销毁的窗口也能安全释放（之前会抛 RuntimeError）
+        manager3 = ScreenshotManager()
+        manager3._screenshot_widget = DestroyedWidget()
+        manager3._release_screenshot_widget()
+        assert manager3._screenshot_widget is None
+    finally:
+        screenshot_mod.ScreenshotWidget = saved_widget_cls
+        screenshot_mod.get_qt_app = saved_get_app
+    print("✅ 遮罩残留引用自愈测试通过\n")
+
+
+def test_ocr_empty_result_shortcut():
+    """本地引擎判定没字时不该再跑一遍识别（实测每次白等约 0.6 秒）"""
+    print("=== 测试空识别结果不重复跑引擎 ===")
+    import managers.ocr as ocr_mod
+    from managers.ocr import NO_TEXT_NOTICE, OCRManager
+    from managers.provider_common import ProviderEmptyResultError
+
+    class EmptyLocalProvider:
+        name = 'probe_empty_local'
+        display_name = '空结果本地引擎'
+        config_fields = ()
+        deterministic_results = True
+        calls = []
+
+        def __init__(self, config_manager=None):
+            self.config_manager = config_manager
+
+        def recognize_blocks(self, image):
+            type(self).calls.append('blocks')
+            raise ProviderEmptyResultError("没有文字")
+
+        def recognize(self, image):
+            type(self).calls.append('text')
+            return '不该走到这里'
+
+    class EmptyCloudProvider(EmptyLocalProvider):
+        name = 'probe_empty_cloud'
+        display_name = '空结果云端引擎'
+        deterministic_results = False
+        calls = []
+
+    class FakeRegistry:
+        """假注册表：去掉 tesseract/mock 兜底，只留被测 provider"""
+        def __init__(self):
+            self.providers = {
+                'probe_empty_local': EmptyLocalProvider,
+                'probe_empty_cloud': EmptyCloudProvider,
+            }
+
+        def get(self, name):
+            return self.providers.get(name)
+
+        def names(self):
+            return list(self.providers)
+
+    saved_registry = ocr_mod.ocr_provider_registry
+    try:
+        ocr_mod.ocr_provider_registry = FakeRegistry()
+        manager = OCRManager(None)
+        manager._registry = ocr_mod.ocr_provider_registry
+
+        # 本地确定性引擎：块级识别就报“没字”，文本链路不该再跑
+        EmptyLocalProvider.calls = []
+        manager.ocr_type = 'probe_empty_local'
+        text, blocks = manager.perform_ocr_with_blocks(object())
+        assert text == NO_TEXT_NOTICE, f"空区域提示不符: {text!r}"
+        assert blocks == []
+        assert EmptyLocalProvider.calls == ['blocks'], \
+            f"确定性引擎空结果后仍在重复识别: {EmptyLocalProvider.calls}"
+
+        # 云端引擎：空结果可能只是限流/抖动，必须继续跑降级链路
+        EmptyCloudProvider.calls = []
+        manager.ocr_type = 'probe_empty_cloud'
+        manager.perform_ocr_with_blocks(object())
+        assert EmptyCloudProvider.calls == ['blocks', 'text'], \
+            f"云端引擎不该跳过降级链路: {EmptyCloudProvider.calls}"
+
+        # “空结果是否定案”的判定规则
+        manager.ocr_type = 'probe_empty_local'
+        manager._last_error = ProviderEmptyResultError('无文字')
+        assert manager._empty_result_is_final() is True
+        manager.ocr_type = 'probe_empty_cloud'
+        assert manager._empty_result_is_final() is False
+    finally:
+        ocr_mod.ocr_provider_registry = saved_registry
+    print("✅ 空识别结果不重复跑引擎测试通过\n")
+
+
+def test_translate_blocks_parallel():
+    """逐块兜底翻译要并发执行，且单块失败只影响该块"""
+    print("=== 测试逐块翻译并发执行 ===")
+    import threading
+    import time as _time
+
+    from managers.screenshot import ScreenshotManager
+
+    class FakeBlock:
+        def __init__(self, text):
+            self.text = text
+
+    class FakeTranslation:
+        def __init__(self, fail_text):
+            self.fail_text = fail_text
+            self.lock = threading.Lock()
+            self.active = 0
+            self.peak = 0
+
+        def perform_translation(self, text, force_refresh=False, target_lang=None):
+            with self.lock:
+                self.active += 1
+                self.peak = max(self.peak, self.active)
+            try:
+                _time.sleep(0.2)
+                if text == self.fail_text:
+                    raise RuntimeError("这一块翻译失败了")
+                return f"[译文]{text}"
+            finally:
+                with self.lock:
+                    self.active -= 1
+
+    blocks = [FakeBlock(f'line{i}') for i in range(6)]
+    fake = FakeTranslation(fail_text='line3')
+    manager = ScreenshotManager()
+    manager.translation_manager = fake
+
+    started = _time.perf_counter()
+    # whole 只有 1 行、块有 6 个 → 行数对不齐，进入逐块兜底路径
+    texts = manager._translate_blocks(
+        blocks, 'line0\nline1', 'zh', False, whole='[译文]一整段')
+    elapsed = _time.perf_counter() - started
+
+    assert len(texts) == 6, f"译文行数应与块数一致: {len(texts)}"
+    assert texts[0] == '[译文]line0' and texts[5] == '[译文]line5', f"顺序错乱: {texts}"
+    assert texts[3] == '', "单块失败应只影响该块"
+    assert fake.peak >= 2, f"逐块翻译没有并发: 峰值 {fake.peak}"
+    assert elapsed < 6 * 0.2 * 0.8, \
+        f"耗时 {elapsed:.2f}s，串行才需要 {6 * 0.2:.2f}s"
+    print(f"✅ 逐块翻译并发测试通过（峰值 {fake.peak} 并发，{elapsed:.2f}s）\n")
+
+
+def test_translation_warm_up():
+    """启动预热：只对免费接口发真实请求，付费接口不替用户花额度"""
+    print("=== 测试翻译链路预热 ===")
+    from managers.translation import TranslationManager
+
+    manager = TranslationManager(None)      # 默认 edge_free（免费接口）
+    calls = []
+
+    def fake_perform(text, force_refresh=False, target_lang=None):
+        calls.append((text, force_refresh))
+        return '[译文]Hello'
+
+    manager.perform_translation = fake_perform
+    assert manager.warm_up() is True
+    assert calls == [('Hello', True)], f"预热应跳过缓存真发一次请求: {calls}"
+
+    manager.api_type = 'llm'               # 付费接口不预热
+    calls.clear()
+    assert manager.warm_up() is False
+    assert calls == [], "付费接口不该在启动时发起请求"
+    print("✅ 翻译链路预热测试通过\n")
+
+
 def main():
     """主测试函数"""
     print("开始功能测试...\n")
@@ -851,6 +1812,9 @@ def main():
         test_retry_handler()
         test_cache_manager()
         test_screenshot_widget()
+        test_screenshot_overlay_freezes_screen()
+        test_screenshot_overlay_multi_screen()
+        test_screenshot_snap_screen_seam()
         test_result_render_layout()
         test_cover_pad_adaptive()
         test_inplace_cover_pixel_alignment()
@@ -865,6 +1829,16 @@ def main():
         test_qt_dispatcher()
         test_ocr_notice_not_translated()
         test_tray_debounce()
+        test_clipboard_write_verified()
+        test_config_defaults_in_memory()
+        test_hotkey_parse()
+        test_hotkey_backend_fallback_and_watchdog()
+        test_hotkey_conflict_prompt_reasons()
+        test_hotkey_callback_isolation()
+        test_screenshot_stale_widget()
+        test_ocr_empty_result_shortcut()
+        test_translate_blocks_parallel()
+        test_translation_warm_up()
 
         print("🎉 所有测试通过！新功能工作正常。")
 

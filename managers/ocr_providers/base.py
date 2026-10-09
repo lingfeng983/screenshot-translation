@@ -23,6 +23,11 @@ class OCRProvider(BaseProvider):
 
     _config_section = 'OCR'
 
+    # 同一张图重试必然得到相同结果（本地离线引擎）。为 True 时，上层会把
+    # "引擎跑通了但没识别到文字"当作最终答案，不再白跑一遍兜底识别；
+    # 云端引擎偶发空结果可能只是限流/抖动，保持降级链路。
+    deterministic_results = False
+
     def recognize_blocks(self, image):
         """
         行级块识别（就地覆盖原文所需的坐标来源）

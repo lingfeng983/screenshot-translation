@@ -158,17 +158,3 @@ def get_visible_window_rects(exclude_hwnd=0, screen_size=None):
     except Exception as e:
         logger.warning(f"枚举窗口失败，磁吸退化: {e}")
         return []
-
-
-def get_current_window_handle():
-    """
-    获取当前进程主窗口句柄（用于枚举时排除自身窗口）
-
-    Returns:
-        int: hwnd；获取失败返回0
-    """
-    try:
-        import ctypes
-        return ctypes.windll.kernel32.GetConsoleWindow() or 0
-    except Exception:
-        return 0

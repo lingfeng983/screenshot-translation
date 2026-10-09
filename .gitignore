@@ -1,6 +1,9 @@
 # ===== 密钥与本地配置 =====
 # config.ini 含明文API密钥，绝不入库；使用 config.example.ini 作为模板
 config.ini
+# Gitee 发版令牌（publish_release.py 读取）
+.gitee_token
+release-notes-*.md
 
 # ===== 运行时产物 =====
 *.log

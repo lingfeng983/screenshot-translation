@@ -72,6 +72,38 @@ class TranslationManager(ProviderChainManager):
         logger.info(f"翻译管理器初始化完成，当前API: {self.api_type}，"
                     f"可用提供者: {provider_registry.names()}")
 
+    # 启动预热用的短文本与可预热的接口
+    _WARMUP_TEXT = 'Hello'
+    # 只有免密钥的免费接口才预热：付费接口（LLM/百度/有道）每次调用都算额度，
+    # 不能在用户还没截图时就替用户花钱
+    _WARMUP_PROVIDERS = ('edge_free', 'google_free')
+
+    def warm_up(self):
+        """
+        预热翻译链路（供启动后在后台线程调用）
+
+        首个请求要花 0.2~0.3 秒在 DNS 解析与 TLS 握手上，而本应用的使用
+        节奏是“按下快捷键就要出结果”：启动后先用一次免费接口的短请求把
+        连接池与握手提前付掉，第一次截图就少等这一截。
+        任何失败都只记日志，不影响后续使用。
+
+        Returns:
+            bool: 预热请求是否成功；未预热（当前接口非免费接口）也返回 False
+        """
+        try:
+            if self.api_type not in self._WARMUP_PROVIDERS:
+                logger.debug(f"当前接口 {self.api_type} 不做启动预热")
+                return False
+            if self._resolve_provider(self.api_type) is None:
+                return False
+            result = self.perform_translation(self._WARMUP_TEXT, force_refresh=True)
+            warmed = not self._is_failure(result)
+            logger.info(f"翻译链路预热{'成功' if warmed else '失败'}: {str(result)[:40]}")
+            return warmed
+        except Exception as e:
+            logger.warning(f"翻译链路预热异常: {e}")
+            return False
+
     def _load_config(self):
         """加载配置"""
         try:

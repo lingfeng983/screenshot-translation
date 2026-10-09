@@ -54,7 +54,10 @@ class ConfigManager:
     def _load_config(self):
         """
         加载配置文件
-        如果配置文件不存在，创建默认配置
+
+        配置文件不存在时只把默认值装进内存，不落盘：用户什么都没改就丢一个
+        config.ini 出来属于“遗留文件”，而这套默认值本来也不需要持久化——
+        每个选项都有 fallback。真正改动配置（点保存、注册快捷键）时才写盘。
         """
         if os.path.exists(self.config_file):
             try:
@@ -76,13 +79,19 @@ class ConfigManager:
             except Exception as e:
                 logger.error(f"配置文件加载失败，回退默认配置: {e}")
                 self._set_defaults()
+                # 文件已存在但读坏了：用默认值把它修好，
+                # 否则每次启动都当成坏配置，用户此前的设置也再无机会恢复
+                self.save_config()
         else:
-            logger.info(f"配置文件不存在，创建默认配置: {self.config_file}")
+            logger.info(f"配置文件不存在，本次使用内存默认配置: {self.config_file}")
             self._set_defaults()
 
     def _set_defaults(self):
         """
-        设置默认配置值
+        设置默认配置值（只写内存，不落盘）
+
+        不在这里调 save_config：默认配置随用随有，写盘会让“从没改过设置”
+        的用户也留下一份 config.ini，且掩盖“配置是否被改过”这个信息。
         """
         # 翻译API配置
         if not self.config.has_section('Translation'):
@@ -118,9 +127,8 @@ class ConfigManager:
         self._set_ui_defaults()
         # 截图遮罩默认配置
         self._set_overlay_defaults()
-
-        # 保存默认配置
-        self.save_config()
+        # OCR 默认配置
+        self._set_ocr_defaults()
 
     def _set_ocr_defaults(self):
         """

@@ -6,12 +6,15 @@
 包括屏幕区域选择、半透明遮罩等
 """
 
+from concurrent import futures
+
 from PIL import ImageGrab
 from PyQt5.QtCore import Qt, QRect, QPoint, pyqtSignal
 from PyQt5.QtGui import QPainter, QPen, QColor, QCursor, QPixmap
 from PyQt5.QtWidgets import QApplication, QWidget
 
 # 导入必要的模块
+from . import clipboard
 from . import result_render
 from .ocr import is_ocr_notice
 from .overlay_toolbar import OverlayToolbar
@@ -23,6 +26,38 @@ from .thread_pool import thread_pool_manager
 import logging
 
 logger = logging.getLogger('screenshot-translation')
+
+
+def desktop_bounds():
+    """
+    取遮罩要覆盖的桌面范围与抓拍方式
+
+    有副屏时覆盖整个虚拟桌面（副屏在主屏左侧/上方时坐标可以为负），让整块桌面
+    一起被冻结。只有在各屏像素倍率一致时才整体覆盖：倍率不一致时单一缩放系数
+    无法把逻辑坐标换算成抓拍图里的像素，此时退回主屏（原行为）。
+
+    Returns:
+        tuple[QRect, bool] 或 None: (覆盖矩形（逻辑坐标）, 抓拍是否需要 all_screens)；
+            取不到屏幕信息时返回 None
+    """
+    try:
+        screens = QApplication.screens()
+        if not screens:
+            return None
+        primary_geo = QRect((QApplication.primaryScreen() or screens[0]).geometry())
+        scales = {round(float(s.devicePixelRatio() or 1.0), 3) for s in screens}
+        if len(scales) > 1:
+            logger.info(f"各显示器像素倍率不一致 {sorted(scales)}，遮罩只覆盖主屏")
+            return primary_geo, False
+        union = QRect(primary_geo)
+        for screen in screens:
+            union = union.united(screen.geometry())
+        logger.info(f"遮罩覆盖桌面 {union.width()}x{union.height()}"
+                    f"（原点 {union.x()},{union.y()}，共 {len(screens)} 块屏幕）")
+        return union, union != primary_geo
+    except Exception as e:
+        logger.warning(f"计算桌面范围失败，退回主屏: {e}")
+        return None
 
 
 class ScreenshotManager:
@@ -89,11 +124,17 @@ class ScreenshotManager:
                 logger.error("无法获取QApplication实例，截图流程终止")
                 return
 
-            # 已有遮罩时再次按热键视为取消：否则新遮罩会把带暗角的屏幕当作背景截取
+            # 已有遮罩时再次按热键视为取消：否则新遮罩会把带暗角的屏幕当作背景截取。
+            # 但引用也可能只是残留（此前关闭时没清掉，或是被外部销毁了），
+            # 这种情况下按键不能被吞掉，否则用户看到的就是"快捷键没反应"
             if self._screenshot_widget is not None:
-                logger.info("截图遮罩已显示，本次热键作为取消处理")
-                self._release_screenshot_widget()
-                return
+                if self._widget_is_live(self._screenshot_widget):
+                    logger.info("截图遮罩已显示，本次热键作为取消处理")
+                    self._release_screenshot_widget()
+                    return
+                logger.warning("发现残留的截图窗口引用，已丢弃并继续本次截图")
+                self._screenshot_widget = None
+                self._last_request = None
 
             # 创建截图窗口，保留强引用避免被GC回收；传入配置以读取遮罩参数
             self._screenshot_widget = ScreenshotWidget(
@@ -106,8 +147,12 @@ class ScreenshotManager:
             widget.retry_requested.connect(self._on_retry_requested)
             widget.screenshot_canceled.connect(self._release_screenshot_widget)
 
-            # 显示截图窗口
-            self._screenshot_widget.showFullScreen()
+            # 显示截图窗口：遮罩自己已经把几何设成整个桌面，跨屏时只能用 show()
+            # （showFullScreen 只会把窗口铺满它所在的那一块显示器）
+            if self._screenshot_widget.covers_multiple_screens():
+                self._screenshot_widget.show()
+            else:
+                self._screenshot_widget.showFullScreen()
             # 遮罩必须抢到键盘焦点，ESC/Enter 等按键才会送到 keyPressEvent，
             # 否则遮罩只能靠鼠标操作退出
             self._screenshot_widget.activateWindow()
@@ -121,16 +166,37 @@ class ScreenshotManager:
             import traceback
             traceback.print_exc()
 
+    @staticmethod
+    def _widget_is_live(widget):
+        """
+        遮罩窗口是否仍然有效（未被销毁且正在显示）
+
+        Args:
+            widget: 截图窗口实例
+
+        Returns:
+            bool: 底层 C++ 对象已销毁或窗口不可见时返回 False
+        """
+        try:
+            return bool(widget.isVisible())
+        except RuntimeError:
+            # 已销毁的包装对象：访问任何属性都会抛 RuntimeError
+            return False
+
     def _release_screenshot_widget(self):
-        """关闭并释放截图窗口引用"""
+        """关闭并释放截图窗口引用（窗口已被销毁时可安全调用）"""
         widget = self._screenshot_widget
         self._screenshot_widget = None
         self._last_request = None
         if widget is not None:
-            widget.close()
-            widget.deleteLater()
+            try:
+                widget.close()
+                widget.deleteLater()
+            except RuntimeError:
+                logger.debug("截图窗口已被销毁，跳过关闭")
 
     _MAX_BLOCK_REQUESTS = 8   # 逐块翻译的请求数上限，超过则退回整段翻译
+    _BLOCK_TRANSLATE_WORKERS = 4  # 逐块兜底翻译的并发数（上限受块数约束）
 
     def _on_region_selected(self, image, region):
         """
@@ -307,8 +373,41 @@ class ScreenshotManager:
             return []
 
         logger.info(f"译文行数 {len(lines)} 与块数 {len(blocks)} 不符，改为逐块翻译")
-        return [self._translate_all(block.text, target_lang, force_refresh)
-                for block in blocks]
+        return self._translate_blocks_parallel(blocks, target_lang, force_refresh)
+
+    def _translate_blocks_parallel(self, blocks, target_lang, force_refresh):
+        """
+        逐块翻译并发执行（返回值与 blocks 等长，顺序不变）
+
+        块与块之间没有依赖，串行发 8 个请求实测要 2.1 秒，并发后压到
+        0.8 秒左右；请求共用同一个 requests.Session，连接池可复用。
+        这里自建临时线程池而不用全局池：本方法本身就跑在全局池的工作线程里，
+        从池里再提交并等待会把自己的 worker 占死。
+
+        Args:
+            blocks (list[TextBlock]): 行块列表
+            target_lang (str 或 None): 目标语言
+            force_refresh (bool): 是否跳过翻译缓存
+
+        Returns:
+            list[str]: 与 blocks 等长的译文；单块失败时为对应的空串
+        """
+        if not blocks:
+            return []
+
+        def translate(block):
+            """单块翻译：失败只影响这一块，不拖垮整次结果"""
+            try:
+                return self._translate_all(block.text, target_lang, force_refresh)
+            except Exception as e:
+                logger.warning(f"行块翻译失败: {e}")
+                return ''
+
+        workers = min(len(blocks), self._BLOCK_TRANSLATE_WORKERS)
+        if workers <= 1:
+            return [translate(block) for block in blocks]
+        with futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            return list(pool.map(translate, blocks))
 
     def _effective_lang(self, target_lang):
         """请求未指定语言时回填全局配置，供工具条正确显示当前语言"""
@@ -376,10 +475,26 @@ class ScreenshotWidget(QWidget):
         self.is_selecting = False
         # 全屏截图背景，初始化失败时保持为None，供后续判空
         self.full_screen = None
+        # 冻结整屏的位图（抓拍失败时为None）；遮罩全程画它，不再透出实时桌面
+        self._frozen_pixmap = None
 
-        # 磁吸状态：启动时枚举一次可见窗口矩形，拖拽期间不重复枚举
+        # 覆盖范围与坐标基准：默认整个虚拟桌面（所有显示器，副屏在主屏左侧/
+        # 上方时桌面原点为负）。先给出兜底值：即使探测抛异常也不会因缺属性报错
+        self.screen_width = 0
+        self.screen_height = 0
+        self._grab_scale = 1.0
+        self._desktop_rect = QRect(0, 0, 0, 0)
+        self._screen_rects = []
+        self._cover_all_screens = False
+        self._resolve_desktop()
+
+        # 磁吸状态：启动时枚举一次可见窗口矩形，拖拽期间不重复枚举。
+        # Win32 给的是虚拟桌面坐标，遮罩局部坐标要减掉桌面原点。
         from .window_enum import get_visible_window_rects
-        self._snap_window_rects = get_visible_window_rects()
+        origin_x, origin_y = self._desktop_rect.x(), self._desktop_rect.y()
+        self._snap_window_rects = [
+            (l - origin_x, t - origin_y, r - origin_x, b - origin_y)
+            for l, t, r, b in get_visible_window_rects()]
         self._active_snap_lines = None  # 当前激活的参考线
 
         # 结果态：识别/翻译完成后就地覆盖展示
@@ -398,39 +513,42 @@ class ScreenshotWidget(QWidget):
         # 每次确认选区递增，用于丢弃上一次选区的迟到结果
         self._request_id = 0
 
-        # 获取屏幕尺寸
-        # 先给出兜底值：即使下面的初始化抛异常，paintEvent 也不会因缺属性而报错
-        self.screen_width = 0
-        self.screen_height = 0
-        # 全屏截图相对逻辑坐标的像素倍率（高分屏 > 1）
-        self._grab_scale = 1.0
-
         try:
-            # 使用QApplication.screens()代替过时的desktop()
-            screens = QApplication.screens()
-            if screens:
-                primary_screen = screens[0]
-                self.screen_width = primary_screen.geometry().width()
-                self.screen_height = primary_screen.geometry().height()
-            else:
-                # 兼容回退到desktop()
-                screen = QApplication.desktop()
-                self.screen_width = screen.width()
-                self.screen_height = screen.height()
+            # 遮罩铺满整个桌面：跨屏窗口不能用 showFullScreen（它只会占住一块屏），
+            # 所以几何在这里定好，显示由调用方 show()
+            self.setGeometry(self._desktop_rect)
 
-            # 设置窗口大小
-            self.setGeometry(0, 0, self.screen_width, self.screen_height)
-
-            # 截取全屏作为背景
-            self.full_screen = ImageGrab.grab(bbox=(0, 0, self.screen_width, self.screen_height))
+            # 截取桌面作为背景。
+            # 这里不能传 bbox：Pillow 的 bbox 是“屏幕坐标”，传入后会被减去
+            # 虚拟桌面原点（all_screens=True 时原点是 SM_XVIRTUALSCREEN，副屏在
+            # 主屏左侧时是负数），bbox=(0,0,宽,高) 会裁到主屏内容再补黑边。
+            # all_screens=True 不传 bbox 得到的就是整张虚拟桌面，与覆盖范围一致。
+            self.full_screen = ImageGrab.grab(
+                all_screens=self._cover_all_screens)
             # 高分屏下 ImageGrab 拿到的是物理像素，记下倍率供裁剪换算
             if self.full_screen and self.screen_width:
                 self._grab_scale = self.full_screen.width / self.screen_width
+                scale_y = self.full_screen.height / max(1, self.screen_height)
+                if abs(scale_y - self._grab_scale) > 0.02:
+                    # 横纵倍率对不上：抓拍范围与遮罩范围不一致，裁剪框会整体偏移，
+                    # 记下来便于排查（不中断截图）
+                    logger.warning(f"抓拍倍率横纵不一致（{self._grab_scale:.3f} / "
+                                   f"{scale_y:.3f}），截图坐标可能偏移："
+                                   f"图 {self.full_screen.size}，"
+                                   f"桌面 {self.screen_width}x{self.screen_height}")
+            # 冻结整屏：遮罩显示期间一直画这张抓拍图。透明窗口若靠“挖空选区”
+            # 露出实时桌面，选区里自刷新的内容（视频、时钟、进度条）会继续动，
+            # 用户框到的画面与最终识别到的画面也可能不是同一帧。
+            self._frozen_pixmap = result_render.pil_to_qpixmap(
+                self.full_screen, dpr=self._grab_scale) if self.full_screen else None
 
             # 设置光标
             self.setCursor(QCursor(Qt.CrossCursor))
 
-            logger.info(f"截图窗口初始化，大小: {self.screen_width}x{self.screen_height}")
+            logger.info(f"截图窗口初始化，大小: {self.screen_width}x{self.screen_height}"
+                        f"（桌面原点 {self._desktop_rect.x()},{self._desktop_rect.y()}，"
+                        f"抓拍倍率 {self._grab_scale:.3f}，"
+                        f"冻结整屏: {'成功' if self._frozen_pixmap else '失败'}）")
         except Exception as e:
             logger.error(f"初始化截图窗口失败: {e}")
             import traceback
@@ -458,6 +576,50 @@ class ScreenshotWidget(QWidget):
         except Exception:
             return default
 
+    def _resolve_desktop(self):
+        """
+        确定遮罩覆盖的桌面范围与各显示器在局部坐标里的位置
+
+        局部坐标 = 虚拟桌面坐标 - 桌面原点：副屏在主屏左侧/上方时桌面原点为负，
+        遮罩自己的坐标系从这个原点开始，Win32 拿到的矩形要减去它才能对上。
+        """
+        try:
+            bounds = desktop_bounds()
+            if bounds is not None:
+                self._desktop_rect, self._cover_all_screens = bounds
+            self._screen_rects = [
+                QRect(s.geometry()).translated(-self._desktop_rect.x(),
+                                                -self._desktop_rect.y())
+                for s in QApplication.screens()]
+        except Exception as e:
+            logger.warning(f"确定桌面范围失败: {e}")
+
+        if self._desktop_rect.isEmpty():
+            # 探测失败：退回过时的 desktop()，至少保证遮罩有正确的尺寸
+            try:
+                screen = QApplication.desktop()
+                self._desktop_rect = QRect(0, 0, screen.width(), screen.height())
+            except Exception as e:
+                logger.warning(f"取桌面尺寸失败: {e}")
+        if not self._screen_rects:
+            self._screen_rects = [QRect(0, 0, self._desktop_rect.width(),
+                                        self._desktop_rect.height())]
+
+        self.screen_width = self._desktop_rect.width()
+        self.screen_height = self._desktop_rect.height()
+
+    def covers_multiple_screens(self):
+        """
+        遮罩是否覆盖了多块显示器
+
+        跨屏窗口只能用 show()：showFullScreen() 会把窗口铺满它所在的那一块屏，
+        等于把另一块屏重新露出来（又会开始刷新）。
+
+        Returns:
+            bool: 覆盖的显示器是否多于一块
+        """
+        return len(self._screen_rects) > 1
+
     # 遮罩主题色（与 managers/styles.py 的深色蓝主题一致）
     _ACCENT = QColor("#3b82f6")               # 强调蓝：选区边框
     _BUBBLE_BG = QColor(30, 36, 48, 235)      # 气泡底：主题面板色
@@ -474,6 +636,10 @@ class ScreenshotWidget(QWidget):
         """
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing, True)
+
+        # 底层先铺冻结的整屏抓拍：遮罩必须是一张静止画面，否则背后自刷新的内容
+        # 会在选区里继续动（“界面没锁住”）。
+        self._draw_frozen_screen(painter)
 
         # 柔和暗角（未选择时也铺一层，提示处于截图模式）
         dim_color = QColor(0, 0, 0, self._dim_opacity)
@@ -499,12 +665,12 @@ class ScreenshotWidget(QWidget):
         self._active_snap_lines = guides if guides else None
         rect = snapped
 
-        # 1) 挖空选区：显示真实屏幕（100%亮度，无窗口级压暗）
-        painter.setCompositionMode(QPainter.CompositionMode_Clear)
-        painter.fillRect(rect, Qt.transparent)
+        # 1) 亮出选区：从同一张冻结图里按选区重绘（100%亮度，无窗口级压暗）。
+        #    这里不能再用 CompositionMode_Clear 挖空——挖空露出的是实时桌面，
+        #    等于把冻结的整屏又开了一个“会动的窗口”。
+        self._draw_frozen_region(painter, rect)
 
-        # 2) 回到正常合成模式绘制装饰
-        painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
+        # 2) 绘制装饰
         painter.setBrush(Qt.NoBrush)
 
         # 3) 外发光：宽而淡的蓝色描边
@@ -526,6 +692,33 @@ class ScreenshotWidget(QWidget):
         # 7) 尺寸气泡
         self._draw_size_bubble(painter, rect)
 
+    def _draw_frozen_screen(self, painter):
+        """把冻结的整屏抓拍铺满遮罩（抓拍缺失时留空，退回透出实时桌面）"""
+        if self._frozen_pixmap is None:
+            return
+        # 位图带 devicePixelRatio，按逻辑坐标 1:1 贴回，不做重采样
+        painter.drawPixmap(0, 0, self._frozen_pixmap)
+
+    def _draw_frozen_region(self, painter, rect):
+        """
+        按选区裁剪重绘冻结图：选区保持原屏亮度，且与暗角是同一帧静止画面
+
+        Args:
+            painter (QPainter): 当前绘制器
+            rect (QRect): 选区（逻辑坐标）
+        """
+        if self._frozen_pixmap is None:
+            # 抓拍失败（ImageGrab 不可用）：只能退回挖空，至少能让用户看清选区
+            painter.save()
+            painter.setCompositionMode(QPainter.CompositionMode_Clear)
+            painter.fillRect(rect, Qt.transparent)
+            painter.restore()
+            return
+        painter.save()
+        painter.setClipRect(rect)
+        painter.drawPixmap(0, 0, self._frozen_pixmap)
+        painter.restore()
+
     def _draw_hint(self, painter):
         """未开始选择时的操作提示条（顶部居中）"""
         text = "拖拽选择要翻译的区域 · 右键或ESC取消"
@@ -533,10 +726,11 @@ class ScreenshotWidget(QWidget):
         font.setPointSize(10)
         painter.setFont(font)
         metrics = painter.fontMetrics()
+        area = self._hint_area()
         tw = metrics.boundingRect(text).width() + 28
         th = metrics.height() + 10
-        bx = (self.screen_width - tw) // 2
-        by = max(int(self.screen_height * 0.06), 12)
+        bx = area.center().x() - tw // 2
+        by = area.top() + max(int(area.height() * 0.06), 12)
         bubble = QRect(bx, by, tw, th)
 
         painter.setPen(Qt.NoPen)
@@ -544,6 +738,22 @@ class ScreenshotWidget(QWidget):
         painter.drawRoundedRect(bubble, th // 2, th // 2)
         painter.setPen(QPen(self._BUBBLE_TEXT))
         painter.drawText(bubble, Qt.AlignCenter, text)
+
+    def _hint_area(self):
+        """
+        操作提示条所在的那一块显示器
+
+        多屏时居中在整个桌面会让气泡跨在屏幕接缝上，放在鼠标当前所在的那块屏
+        更自然。
+
+        Returns:
+            QRect: 鼠标所在显示器的遮罩局部矩形（找不到时用整个桌面）
+        """
+        pos = QCursor.pos() - self._desktop_rect.topLeft()
+        for rect in self._screen_rects:
+            if rect.contains(pos):
+                return rect
+        return QRect(0, 0, self.screen_width, self.screen_height)
 
     def _draw_corner_marks(self, painter, rect):
         """选区四角的白色L形标记"""
@@ -587,9 +797,13 @@ class ScreenshotWidget(QWidget):
         Returns:
             tuple[QRect, list[tuple[str, int]]]: 吸附后选区与激活的参考线列表
         """
-        # 收集候选边缘线：屏幕边缘 + 可见窗口四边（垂直线与水平线分别归集）
+        # 收集候选边缘线：桌面外沿与每块显示器的边界 + 可见窗口四边
+        # （垂直线与水平线分别归集）；多屏时接缝也是常用的对齐线
         xs = {0, self.screen_width}          # 垂直线
         ys = {0, self.screen_height}         # 水平线
+        for screen_rect in self._screen_rects:
+            xs.update((screen_rect.left(), screen_rect.right() + 1))
+            ys.update((screen_rect.top(), screen_rect.bottom() + 1))
         for l, t, r, b in self._snap_window_rects:
             if l > 0:
                 xs.add(l)
@@ -771,11 +985,8 @@ class ScreenshotWidget(QWidget):
         if self._crop_pixmap is not None:
             painter.drawPixmap(rect.topLeft(), self._crop_pixmap)
         else:
-            # 结果未回投（加载/失败）时挖空选区，让真实屏幕保持原亮度
-            painter.save()
-            painter.setCompositionMode(QPainter.CompositionMode_Clear)
-            painter.fillRect(rect, Qt.transparent)
-            painter.restore()
+            # 结果未回投（加载/失败）时亮出选区原图：同一张冻结画面，避免透出实时桌面
+            self._draw_frozen_region(painter, rect)
 
         if self._loading:
             self._draw_border(painter, rect)
@@ -994,12 +1205,17 @@ class ScreenshotWidget(QWidget):
                               payload.get('translated_text', ''))
 
     def _copy_result(self):
-        """复制当前文本到剪贴板"""
+        """
+        复制当前文本到剪贴板
+
+        剪贴板被其他程序占用时写入会静默失败，故走带生效校验的重试写入；
+        只有确认写入成功才记"已复制"，失败由 clipboard 模块记警告日志。
+        """
         text = self._result_text()
         if not text:
             return
-        QApplication.clipboard().setText(text)
-        logger.info("已复制翻译结果到剪贴板")
+        if clipboard.set_text(text):
+            logger.info("已复制翻译结果到剪贴板")
 
     def _render_result_pixmap(self):
         """
@@ -1035,7 +1251,9 @@ class ScreenshotWidget(QWidget):
         if pixmap is None:
             return
         rect = self._result_rect or self.rect()
-        PinWindow(pixmap, top_left=rect.topLeft())
+        # 遮罩局部坐标 → 屏幕坐标：副屏在主屏左侧/上方时桌面原点为负，
+        # 不换算的话钉住的图会整体偏掉一个桌面原点
+        PinWindow(pixmap, top_left=rect.topLeft() + self._desktop_rect.topLeft())
         logger.info("结果已钉到屏幕")
 
     def _save_result(self):
@@ -1244,6 +1462,18 @@ class ScreenshotWidget(QWidget):
                     self.end.setX(self.end.x() + delta)
 
                 self.update()
+
+    def closeEvent(self, event):
+        """
+        遮罩关闭：整屏与选区冻结图是整个遮罩最大的两块内存，立刻放掉
+
+        Args:
+            event (QCloseEvent): Qt 关闭事件对象
+        """
+        self._frozen_pixmap = None
+        self._crop_pixmap = None
+        self.full_screen = None
+        super().closeEvent(event)
 
     def _cancel_screenshot(self):
         """

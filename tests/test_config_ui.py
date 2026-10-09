@@ -51,14 +51,22 @@ def main():
     app = QApplication.instance() or QApplication(sys.argv)
 
     # ---- 备份配置，测试后还原 ----
-    shutil.copy('config.ini', 'config.ini.bak')
+    # 默认配置已改成只存内存、不改设置就不落盘，因此这里可能本来就没有 config.ini
+    had_config = os.path.exists('config.ini')
+    if had_config:
+        shutil.copy('config.ini', 'config.ini.bak')
 
     failures = []
     try:
         _run_tests(app, failures)
     finally:
-        shutil.move('config.ini.bak', 'config.ini')
-        print("\nconfig.ini 已还原")
+        if had_config:
+            shutil.move('config.ini.bak', 'config.ini')
+            print("\nconfig.ini 已还原")
+        elif os.path.exists('config.ini'):
+            # 保存流程会真的写出配置：本来没有配置文件时把它删掉，保持工作区干净
+            os.remove('config.ini')
+            print("\n本次测试生成的 config.ini 已清理")
 
     if failures:
         print(f"\n❌ {len(failures)} 项失败:")
@@ -402,9 +410,27 @@ def _run_tests(app, failures):
             widget._hover_paragraph = None
             assert widget._card_info() is None, "无行级译文缺失时不该再压卡片"
 
-            widget._copy_result()
-            clipboard = QApplication.clipboard().text()
-            assert '第一行译文' in clipboard, f"剪贴板内容不符: {clipboard}"
+            # 复制走带校验的写入器（managers.clipboard）。不直接断言剪贴板
+            # 内容：环境里剪贴板可能被第三方程序长期占用而写入失败（那类
+            # 失败由 managers/clipboard.py 记警告日志），这里只盯接线与内容。
+            import managers.screenshot as screenshot_mod
+
+            copied = []
+
+            class SpyClipboard:
+                @staticmethod
+                def set_text(text):
+                    copied.append(text)
+                    return True
+
+            real_clipboard = screenshot_mod.clipboard
+            screenshot_mod.clipboard = SpyClipboard
+            try:
+                widget._copy_result()
+            finally:
+                screenshot_mod.clipboard = real_clipboard
+            assert copied and '第一行译文' in copied[0], \
+                f"复制未经过校验写入器或内容不符: {copied}"
 
             # 行级译文缺失时降级为整段卡片
             degraded = dict(payload)

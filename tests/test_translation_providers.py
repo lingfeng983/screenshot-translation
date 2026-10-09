@@ -8,8 +8,29 @@
 
 import sys
 import os
+import tempfile
 # 项目根目录加入 sys.path（tests/ 的上一级）
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+def _isolate_translation_cache():
+    """
+    把全局翻译缓存改到临时目录
+
+    用例里的 fake provider 会真的走 perform_translation，而它写的是全局
+    cache_manager；不隔离就会把项目里的 translation_cache.json 灌满
+    "hello <时间戳>" 这类测试文本，每次跑测试都多一堆遗留内容。
+    """
+    from managers.cache_manager import cache_manager
+    tmp_dir = tempfile.TemporaryDirectory()
+    cache_manager.cache_file = os.path.join(tmp_dir.name, 'cache.json')
+    cache_manager._cache.clear()
+    cache_manager._pending_writes = 0
+    return tmp_dir
+
+
+# 模块导入即隔离（pytest 与脚本模式都生效），引用要到进程结束才释放
+_CACHE_TMP_DIR = _isolate_translation_cache()
 
 
 def test_provider_registry():

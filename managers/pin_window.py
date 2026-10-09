@@ -11,6 +11,12 @@ from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QKeySequence, QPainter
 from PyQt5.QtWidgets import QWidget
 
+from . import clipboard
+
+import logging
+
+logger = logging.getLogger('screenshot-translation')
+
 # 钉住的窗口没有 Qt 父级，需要模块级引用防止被 Python GC 回收
 _pins = set()
 
@@ -111,7 +117,7 @@ class PinWindow(QWidget):
         elif event.matches(QKeySequence.Copy):
             # 注意用 QKeySequence.Copy：QKeyEvent 上没有 Copy 属性，
             # 写 event.Copy 会在任意按键时抛 AttributeError
-            from PyQt5.QtWidgets import QApplication
-            QApplication.clipboard().setPixmap(self._source)
+            if clipboard.set_pixmap(self._source):
+                logger.info("已复制钉住的图片到剪贴板")
         else:
             super().keyPressEvent(event)

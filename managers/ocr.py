@@ -23,11 +23,14 @@ ocr_retry_handler = RetryHandler(max_attempts=2, base_delay=0.5)
 # 识别结果错误标记，与翻译的 [翻译失败] 风格一致
 _OCR_FAIL_PREFIX = '[OCR识别失败'
 
+# 引擎都跑通、但这张图里确实没文字时的可行动提示
+NO_TEXT_NOTICE = "未识别到文字，请重新框选包含文字的区域"
+
 # OCR 降级提示文本（mock 引擎的输出与“图里没字”的可行动提示）。
 # 这类文本是给用户看的提示，不是原文，不应再送翻译 API。
 OCR_NOTICE_TEXTS = (
     "[OCR识别不可用：请检查OCR引擎配置（Tesseract未安装或密钥未填写）]",
-    "未识别到文字，请重新框选包含文字的区域",
+    NO_TEXT_NOTICE,
 )
 
 
@@ -164,7 +167,7 @@ class OCRManager(ProviderChainManager):
                 # 引擎都跑通了、只是这张图里没文字：给可行动的提示，
                 # 否则用户看到"OCR识别不可用，请检查配置"会以为配置坏了
                 logger.info("所有OCR引擎都未识别到文字")
-                return "未识别到文字，请重新框选包含文字的区域"
+                return NO_TEXT_NOTICE
             mock_cls = ocr_provider_registry.get('mock')
             if mock_cls is not None:
                 logger.warning("所有OCR引擎均失败，降级为模拟OCR")
@@ -188,12 +191,31 @@ class OCRManager(ProviderChainManager):
         Returns:
             tuple[str, list[TextBlock]]: (整段文本, 行块列表)
         """
+        self._last_error = None
         blocks = self._perform_ocr_blocks(image)
         if blocks:
             text = '\n'.join(block.text for block in blocks)
             if text.strip():
                 return text, blocks
+        # 本地引擎已经判定“这张图没字”时别再跑一遍文本链路：同一张图重试
+        # 结果必然一样，而 Tesseract 一次识别实测约 0.6 秒（模型加载占大头），
+        # 白等这一秒只会让“框了个空区域”的反馈慢一倍
+        if self._empty_result_is_final():
+            logger.info("当前引擎未识别到文字且结果确定，跳过重复识别")
+            return NO_TEXT_NOTICE, []
         return self.perform_ocr(image), []
+
+    def _empty_result_is_final(self):
+        """
+        本次空结果是否已经是最终答案
+
+        Returns:
+            bool: 当前引擎是本地确定性引擎，且刚刚的块级识别就报的“没字”
+        """
+        if not isinstance(self._last_error, ProviderEmptyResultError):
+            return False
+        provider_cls = self._resolve_provider(self.ocr_type)
+        return bool(getattr(provider_cls, 'deterministic_results', False))
 
     def _perform_ocr_blocks(self, image):
         """
@@ -232,8 +254,15 @@ class OCRManager(ProviderChainManager):
             return self._get_provider(provider_cls)
 
         def call(provider):
-            return provider.recognize_blocks(image)
+            try:
+                return provider.recognize_blocks(image)
+            except Exception as e:
+                # 与 _recognize_via 同样记下真实异常：上层要靠它区分
+                # “引擎跑通了但图里没字”与“引擎本身不可用”
+                self._last_error = e
+                raise
 
+        self._last_error = None
         result = self._run_provider(factory, call, lambda err: None)
         return result if isinstance(result, list) else []
 
