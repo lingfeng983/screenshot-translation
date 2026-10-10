@@ -105,6 +105,9 @@ class OverlayToolbar(QWidget):
                 self.lang_combo.setCurrentIndex(index)
         # 连接放在初始选择之后，避免创建工具条时就触发重译
         self.lang_combo.currentIndexChanged.connect(self._on_lang_changed)
+        # 下拉是独立顶层窗口，选完可能不把键盘焦点还给遮罩：那样 ESC/T/R/Ctrl+C
+        # 全部失灵，只能鼠标点回去
+        self.lang_combo.activated.connect(self._reactivate_host)
         layout.addWidget(self.lang_combo)
         self._trimmable.append(self.lang_combo)
 
@@ -151,6 +154,12 @@ class OverlayToolbar(QWidget):
     def _on_lang_changed(self, _index):
         """语言下拉变化：把新的目标语言代码通知宿主"""
         self.language_changed.emit(self.lang_combo.currentData())
+
+    def _reactivate_host(self, *_args):
+        """选完语言后把键盘焦点交还遮罩窗口，让快捷键继续可用"""
+        host = self.window()
+        if host is not None:
+            host.activateWindow()
 
     def set_mode(self, mode_key, emit=True):
         """

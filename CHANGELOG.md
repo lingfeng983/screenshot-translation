@@ -2,6 +2,44 @@
 
 所有显著改动记录于此。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [Unreleased]
+
+### 修复
+- **译文模式用错了字号**：`painter.setFont(font)` 原先只写在双语分支里（画完原文行
+  之后才复位），纯译文一次都没调用；折行与行高按 `fit_text` 缩排后的字号算，落笔却
+  用画布当前字体，字号一大就只剩每行的上半截（`managers/result_render.py`，回归测试
+  `test_translated_mode_paints_with_fitted_font`）
+- **磁吸把物理坐标当逻辑坐标用**：`GetWindowRect` 给的是物理像素绝对坐标，而吸附线、
+  屏幕边界全是 Qt 逻辑坐标，以前只减了逻辑桌面原点。150% 屏上吸附位置整体偏掉三分之一，
+  窗口右边/下边还会被 `r < screen_width` 判成"超出屏幕"而永久丢弃（那条边根本吸不上）。
+  改为按抓拍倍率换算后再减原点（`managers/screenshot.py` 的 `_window_rects_local`）
+- **钉住的图比原选区大**：结果图按物理像素合成，`QPixmap.width()` 也是物理像素，
+  钉窗却用它直接 `resize`（逻辑坐标）——高分屏上钉出来大一半，滚轮缩放同样偏。现在
+  结果图声明 `devicePixelRatio`，钉窗按"物理像素 ÷ 倍率"定基准尺寸
+  （`managers/screenshot.py`、`managers/pin_window.py`）
+- **等结果期间的误触会白跑一趟**：结果没回来前 `_result` 还是 None，小拖拽走的是
+  "取消截图"分支——遮罩一关就把在途请求一起取消，用户白等几秒网络。现在加载中的
+  误触保持加载画面不动（`_confirm_selection`），同时删掉那个永远进不去的双击确认
+  （第一次单击的 release 已经确认过了，双击到达时 `is_selecting` 早就是 False）
+- **后台任务提交失败时遮罩卡在"识别并翻译中"**：`thread_pool_manager.submit()` 返回
+  None 表示没有任何 worker 会来回投结果，三个调用点都没接。现在统一走
+  `_submit_or_fail`，当场给出"请按 R 重试"的可重试提示
+- **方向键微调可以把选区整个推出屏幕**：鼠标拖拽有天然边界，键盘没有；越界后按 Enter
+  只能裁出一个空选区。微调后按桌面尺寸夹回端点
+- **横纵倍率不等时选区内容与暗角错位**：`_draw_frozen_region` 无论何种倍率都 1:1 贴图，
+  与 `_draw_frozen_screen` 的分支不一致；改为同样按遮罩整幅贴回
+- **线程池记账漏摘 future**：`add` 与 `add_done_callback` 之间任务跑完时，回调先 discard、
+  随后 add 把一个已结束的 future 永久留在 `_pending`，退出等待每次都要带着它们。提交与
+  记账挪进同一把锁
+- **工具条选完语言后快捷键全灭**：下拉是独立顶层窗口，可能不把键盘焦点还给遮罩，
+  ESC/T/R/Ctrl+C 就此失灵；`activated` 之后显式 `activateWindow()` 归位
+- 窗口磁吸枚举里 `_collect_host` 没有逐窗兜异常，一个窗口查不到属性会让整轮枚举一起
+  失败（`managers/window_enum.py`）
+
+### 测试
+- 新增七组回归：译文绘制字号、磁吸坐标换算、结果图像素倍率与钉窗尺寸、加载期误触
+  不关遮罩、方向键微调越界、后台任务提交失败的提示、线程池记账不泄漏
+
 ## [v1.4.0] — 2026-10-11
 
 ### 新增

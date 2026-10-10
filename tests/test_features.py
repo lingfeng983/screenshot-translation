@@ -226,6 +226,280 @@ def test_screenshot_snap_screen_seam():
     print("✅ 跨屏接缝磁吸测试通过\n")
 
 
+def test_translated_mode_paints_with_fitted_font():
+    """
+    纯译文模式也要用 fit_text 选出来的字号绘制
+
+    以前 painter.setFont(font) 只写在双语分支里（画完原文行之后才复位），
+    译文模式一行 setFont 都没有：折行和行高按缩排字号算，落笔却用画布当前
+    字体，字号一大就只看得见每行的上半截。
+    """
+    print("=== 测试译文模式字号 ===")
+    from PIL import Image
+    from PyQt5.QtCore import QPoint
+    from PyQt5.QtGui import QFont
+
+    import managers.result_render as rr
+    from managers.text_block import TextBlock
+
+    _ensure_qt_app()
+    painter_font = QFont()
+    painter_font.setPixelSize(999)          # 故意给一个绝不可能用于排版的字号
+    painter = _RecordingPainter(painter_font)
+    image = Image.new('RGB', (240, 90), 'white')
+    block = TextBlock('原文行', 10, 12, 200, 60)
+
+    rr.paint_blocks(painter, image, [block], ['译文内容' * 12],
+                    QPoint(0, 0), rr.MODE_TRANSLATED, scale=1.0)
+
+    assert painter.texts, "译文一行都没画出来"
+    sizes = set(painter.text_font_sizes)
+    assert 999 not in sizes, f"译文沿用了画布字体: {sizes}"
+    layout_font = list(rr._LAYOUT_CACHE.values())[0][2]
+    assert sizes == {layout_font.pixelSize()}, \
+        f"绘制字号与排版字号不一致: {sizes} != {layout_font.pixelSize()}"
+    print("✅ 译文模式字号测试通过\n")
+
+
+def test_snap_window_rects_converted_to_logical():
+    """
+    磁吸的窗口矩形要按抓取倍率换算到遮罩逻辑坐标
+
+    GetWindowRect 给的是物理像素绝对坐标，而吸附线、屏幕边界全是逻辑坐标。
+    混用的后果有两层：吸附位置整体偏掉（倍率-1）倍，且高分屏下窗口右边/下边
+    会被 `r < screen_width` 当成"超出屏幕"直接丢掉，那条边永远吸不上。
+    """
+    print("=== 测试磁吸坐标换算 ===")
+    from types import SimpleNamespace
+
+    from PyQt5.QtCore import QRect
+
+    from managers.screenshot import ScreenshotWidget
+
+    _ensure_qt_app()
+    stub = SimpleNamespace(_grab_scale=1.5, _grab_scale_y=1.5,
+                           _desktop_rect=QRect(-100, -50, 2000, 1200))
+    local = ScreenshotWidget._window_rects_local(stub, [(300, 300, 900, 600)])
+    # 先除倍率换逻辑，再减遮罩自身的逻辑原点（原点为负时是加）
+    assert local == [(300, 250, 700, 450)], f"换算结果不对: {local}"
+
+    widget = ScreenshotWidget()
+    try:
+        widget._grab_scale = widget._grab_scale_y = 1.5
+        widget._desktop_rect = QRect(0, 0, 1920, 1080)
+        widget.screen_width, widget.screen_height = 1920, 1080
+        widget._screen_rects = [QRect(0, 0, 1920, 1080)]
+        widget._snap_threshold = 12
+        # 物理坐标 2700 = 逻辑 1800：不换算时它是 2700，会被当成屏幕外而丢弃
+        widget._snap_window_rects = widget._window_rects_local(
+            [(150, 150, 2700, 900)])
+
+        rect, guides = widget._snap_rect(QRect(1795, 200, 100, 60))
+        assert rect.left() == 1800, f"没吸到换算后的窗口左边缘: {rect}"
+        rect, guides = widget._snap_rect(QRect(1795, 200, 6, 60))
+        assert ('x2', 1800) in [
+            g for g in guides if g[0] == 'x2'] or rect.right() + 1 == 1800, \
+            f"窗口右边缘（逻辑 1800）没能吸附: {rect} {guides}"
+    finally:
+        widget.close()
+    print("✅ 磁吸坐标换算测试通过\n")
+
+
+def test_result_pixmap_declares_device_pixel_ratio():
+    """
+    结果图要声明像素倍率，钉屏窗口才按逻辑尺寸摆放
+
+    合成图是按物理像素画的，而窗口 resize 吃的是逻辑坐标：倍率不带上，
+    150% 屏上钉住的图就比原选区大一半。
+    """
+    print("=== 测试结果图像素倍率 ===")
+    from PIL import Image
+
+    from managers.screenshot import ScreenshotWidget
+
+    _ensure_qt_app()
+    widget = ScreenshotWidget()
+    try:
+        widget._scale = widget._scale_y = 1.5
+        image = Image.new('RGB', (300, 150), 'white')
+        widget._result = {'image': image, 'blocks': [], 'block_texts': []}
+        pixmap = widget._render_result_pixmap()
+        assert pixmap is not None, "结果图合成失败"
+        assert abs(pixmap.devicePixelRatio() - 1.5) < 1e-6, \
+            f"结果图未声明倍率: {pixmap.devicePixelRatio()}"
+        assert (pixmap.width(), pixmap.height()) == (300, 150), \
+            "结果图要保持物理像素，尺寸差只由倍率声明"
+
+        window = _quiet_pin_window(pixmap)
+        try:
+            assert (window.width(), window.height()) == (200, 100), \
+                f"钉窗按物理像素摆大了: {window.width()}x{window.height()}"
+        finally:
+            window.close()
+    finally:
+        widget.close()
+    print("✅ 结果图像素倍率测试通过\n")
+
+
+def _quiet_pin_window(pixmap):
+    """
+    构造钉屏窗口但不真的显示（测试只关心尺寸，不该闪出一个置顶窗口）
+
+    show/raise_/activateWindow 都继承自 QWidget 而不是 PinWindow 自己的属性，
+    所以还原方式是 delattr 把类属性摘掉、让它回落到 QWidget 的实现。
+    """
+    from managers.pin_window import PinWindow
+
+    names = ('show', 'raise_', 'activateWindow')
+    for name in names:
+        assert name not in PinWindow.__dict__, f"{name} 已是 PinWindow 自有实现"
+        setattr(PinWindow, name, lambda self, *args: None)
+    try:
+        return PinWindow(pixmap)
+    finally:
+        for name in names:
+            delattr(PinWindow, name)
+
+
+def test_stray_drag_during_loading_keeps_overlay():
+    """
+    等结果期间的误触小拖拽不能把遮罩关掉
+
+    结果回来前 `_result` 还是 None，小拖拽走的是"取消截图"分支：遮罩一关，
+    在途请求的取消令牌被触发，用户白等几秒网络还回不到屏幕上。
+    """
+    print("=== 测试加载期误触不关遮罩 ===")
+    from PyQt5.QtCore import QPoint, QRect
+
+    from managers.screenshot import ScreenshotWidget
+
+    _ensure_qt_app()
+    widget = ScreenshotWidget()
+    canceled = []
+    try:
+        widget.screenshot_canceled.connect(lambda: canceled.append(1))
+        widget._loading = True
+        widget._result = None
+        widget._error = None
+        widget._result_rect = QRect(100, 100, 200, 80)
+        widget.begin = QPoint(100, 100)
+        widget.end = QPoint(103, 102)
+
+        widget._confirm_selection()
+
+        assert not canceled, "加载中的误触把截图流程取消了"
+        assert widget._loading is True, "加载状态被误触清掉了"
+    finally:
+        widget.close()
+    print("✅ 加载期误触不关遮罩测试通过\n")
+
+
+def test_arrow_nudge_stays_on_desktop():
+    """
+    方向键微调要把选区夹在桌面内
+
+    鼠标拖拽天然出不了屏幕，方向键没有这个约束：连着按能把整个选区推出
+    上边界，之后按 Enter 只能拿到一个越界（甚至空）的裁剪框。
+    """
+    print("=== 测试方向键微调越界 ===")
+    from PyQt5.QtCore import QPoint, Qt
+    from PyQt5.QtGui import QKeyEvent
+
+    from managers.screenshot import ScreenshotWidget
+
+    def press(widget, key):
+        widget.keyPressEvent(QKeyEvent(QKeyEvent.KeyPress, key, Qt.NoModifier))
+
+    _ensure_qt_app()
+    widget = ScreenshotWidget()
+    try:
+        widget.screen_width, widget.screen_height = 800, 600
+        widget.is_selecting = True
+        widget.begin = QPoint(2, 300)
+        widget.end = QPoint(60, 340)
+
+        for _ in range(6):
+            press(widget, Qt.Key_Left)
+        assert widget.begin.x() >= 0 and widget.end.x() >= 0, \
+            f"选区被推出左边界: {widget.begin} {widget.end}"
+
+        widget.begin = QPoint(2, 570)
+        widget.end = QPoint(60, 595)
+        for _ in range(20):
+            press(widget, Qt.Key_Down)
+        assert widget.begin.y() <= widget.screen_height, \
+            f"选区被推出下边界: {widget.begin}"
+        assert widget.end.y() <= widget.screen_height, \
+            f"选区被推出下边界: {widget.end}"
+    finally:
+        widget.close()
+    print("✅ 方向键微调越界测试通过\n")
+
+
+def test_submit_failure_shows_retryable_message():
+    """
+    线程池拒收任务时要立刻给出可重试提示
+
+    submit 返回 None 表示没有任何 worker 会来回投结果：不接住的话遮罩停在
+    "识别并翻译中"直到用户 ESC，看起来就像程序卡死。
+    """
+    print("=== 测试后台任务提交失败 ===")
+    import managers.screenshot as ss
+
+    class _Pool:
+        def submit(self, func, *args):
+            return None
+
+    class _Widget:
+        def __init__(self):
+            self.failures = []
+
+        def show_failure(self, message):
+            self.failures.append(message)
+
+    widget = _Widget()
+    pool = getattr(ss, 'thread_pool_manager')
+    ss.thread_pool_manager = _Pool()
+    try:
+        ok = ss.ScreenshotManager._submit_or_fail(None, widget, lambda: None)
+    finally:
+        ss.thread_pool_manager = pool
+    assert ok is False, "提交失败却被当成成功"
+    assert widget.failures and 'R' in widget.failures[0], \
+        f"没有给出可重试提示: {widget.failures}"
+    print("✅ 后台任务提交失败测试通过\n")
+
+
+def test_thread_pool_pending_bookkeeping_no_leak():
+    """
+    已完成的任务不能留在 _pending 里
+
+    add 与 add_done_callback 之间有个窗口：任务在这两步中间跑完时回调先
+    discard、随后 add 又把 future 塞回集合，收尾等待就会每次都带着一堆
+    早已结束的任务（退出时的等待与内存都受影响）。
+    """
+    print("=== 测试线程池记账 ===")
+    import time
+
+    from managers.thread_pool import ThreadPoolManager
+
+    pool = ThreadPoolManager(max_workers=2)
+    assert pool.initialize() is True
+    try:
+        for _ in range(20):
+            future = pool.submit(lambda: 1)
+            assert future is not None
+            assert future.result(timeout=5) == 1
+        deadline = time.monotonic() + 2.0
+        while pool._pending and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert not pool._pending, f"已完成任务仍被记账: {len(pool._pending)}"
+        assert pool.wait_pending(timeout=0.1) == 0
+    finally:
+        pool.shutdown(wait=False, timeout=0.1)
+    print("✅ 线程池记账测试通过\n")
+
+
 def _make_color_marker(color, geometry):
     """造一块纯色置顶不透明窗口：用来在抓拍图里定位坐标"""
     from PyQt5.QtCore import Qt
@@ -392,6 +666,7 @@ class _RecordingPainter:
         self._font = font
         self.rects = []
         self.texts = []
+        self.text_font_sizes = []
 
     def font(self):
         return self._font
@@ -412,6 +687,7 @@ class _RecordingPainter:
     def drawText(self, rect, flags, text):
         QRect = _rect_class()
         self.texts.append((QRect(rect), text))
+        self.text_font_sizes.append(self._font.pixelSize())
 
 
 def test_cover_pad_adaptive():

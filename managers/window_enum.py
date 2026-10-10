@@ -115,12 +115,17 @@ def get_visible_window_rects(exclude_hwnd=0, screen_size=None):
         host_hwnds = []
 
         def _collect_host(hwnd, _lp):
-            ex = user32.GetWindowLongW(hwnd, _GWL_EXSTYLE)
-            if (ex & _WS_EX_TOOLWINDOW) and user32.IsWindowVisible(hwnd):
-                r = wintypes.RECT()
-                if user32.GetWindowRect(hwnd, ctypes.byref(r)):
-                    if r.right - r.left >= 100 and r.bottom - r.top >= 100:
-                        host_hwnds.append(hwnd)
+            # 与顶层枚举同构：单个窗口查不到属性就跳过，不能让一次
+            # GetWindowLongW 失败把整轮磁吸枚举带崩
+            try:
+                ex = user32.GetWindowLongW(hwnd, _GWL_EXSTYLE)
+                if (ex & _WS_EX_TOOLWINDOW) and user32.IsWindowVisible(hwnd):
+                    r = wintypes.RECT()
+                    if user32.GetWindowRect(hwnd, ctypes.byref(r)):
+                        if r.right - r.left >= 100 and r.bottom - r.top >= 100:
+                            host_hwnds.append(hwnd)
+            except Exception:
+                pass
             return True
 
         _cb2 = _CB(_collect_host)

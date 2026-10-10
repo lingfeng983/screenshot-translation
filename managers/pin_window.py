@@ -7,7 +7,7 @@
 滚轮缩放、双击或 ESC 关闭。有道截图翻译的"钉住"即此行为。
 """
 
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import QSize, Qt
 from PyQt5.QtGui import QKeySequence, QPainter
 from PyQt5.QtWidgets import QWidget
 
@@ -45,7 +45,12 @@ class PinWindow(QWidget):
 
         _pins.add(self)
 
-        self.resize(self._source.width(), self._source.height())
+        # QPixmap.width() 给的是物理像素，窗口的 resize/move 用的是逻辑坐标：
+        # 不除 devicePixelRatio 的话高分屏上钉出来的图会比原选区大 (倍率-1) 倍
+        dpr = self._source.devicePixelRatio() or 1.0
+        self._base_size = QSize(max(1, round(self._source.width() / dpr)),
+                                max(1, round(self._source.height() / dpr)))
+        self.resize(self._base_size)
         if top_left is not None:
             self.move(top_left)
         else:
@@ -106,8 +111,8 @@ class PinWindow(QWidget):
             return
         center = self.mapToGlobal(self.rect().center())
         self._scale = target
-        self.resize(int(self._source.width() * target),
-                    int(self._source.height() * target))
+        self.resize(int(self._base_size.width() * target),
+                    int(self._base_size.height() * target))
         self.move(center - self.rect().center())
 
     def keyPressEvent(self, event):

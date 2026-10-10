@@ -88,13 +88,16 @@ class ThreadPoolManager:
                     return None
 
         try:
-            future = executor.submit(func, *args, **kwargs)
+            # 记账与提交放在同一把锁里：任务可能在 add_done_callback 之前就跑完，
+            # 那样回调先 discard、随后 add 会把一个已完成的 future 永久留在集合里
+            with self.lock:
+                future = executor.submit(func, *args, **kwargs)
+                self._pending.add(future)
         except Exception as e:
             logger.exception(f"提交任务到线程池失败: {e}")
             return None
 
-        # 记账要在 future 完成的瞬间摘掉：否则 _pending 只会越积越大
-        self._pending.add(future)
+        # 回调在 add 之后注册：future 已结束时会立即执行，等于当场摘掉记账
         future.add_done_callback(self._pending.discard)
         logger.debug(f"任务已提交到线程池: {getattr(func, '__name__', repr(func))}")
         return future

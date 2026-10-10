@@ -279,6 +279,27 @@ class ScreenshotManager:
     _MAX_BLOCK_REQUESTS = 8   # 逐块翻译的请求数上限，超过则退回整段翻译
     _BLOCK_TRANSLATE_WORKERS = 4  # 逐块兜底翻译的并发数（上限受块数约束）
 
+    def _submit_or_fail(self, widget, func, *args):
+        """
+        提交后台任务，线程池拒收时当场给出可重试提示
+
+        submit 返回 None 意味着没有任何线程会来回投结果：不处理的话遮罩
+        永远停在"识别并翻译中"，用户只能 ESC 重来。
+
+        Args:
+            widget: 当前遮罩窗口
+            func (Callable): 池线程里跑的函数
+            *args: 传给 func 的参数
+
+        Returns:
+            bool: 是否提交成功
+        """
+        if thread_pool_manager.submit(func, *args) is not None:
+            return True
+        logger.warning("后台任务提交失败（线程池不可用或已关闭）")
+        widget.show_failure('后台任务无法启动，请按 R 重试')
+        return False
+
     def _on_region_selected(self, image, region):
         """
         遮罩选区确定：后台识别与翻译，结果回投到遮罩内展示
@@ -293,9 +314,9 @@ class ScreenshotManager:
             return
         self._last_request = (image, region)
         target_lang = widget.current_target_lang()
-        thread_pool_manager.submit(
-            self._process_region, widget, image, region, target_lang, False,
-            widget.current_request_id(), self._new_request_token())
+        self._submit_or_fail(
+            widget, self._process_region, widget, image, region, target_lang,
+            False, widget.current_request_id(), self._new_request_token())
 
     def _on_retry_requested(self):
         """失败后按 R 重试：重走完整链路并跳过翻译缓存"""
@@ -305,8 +326,8 @@ class ScreenshotManager:
         image, region = self._last_request
         logger.info("按用户请求重试识别与翻译")
         widget.set_result_busy(True)
-        thread_pool_manager.submit(
-            self._process_region, widget, image, region,
+        self._submit_or_fail(
+            widget, self._process_region, widget, image, region,
             widget.current_target_lang(), True, widget.current_request_id(),
             self._new_request_token())
 
@@ -323,9 +344,9 @@ class ScreenshotManager:
             return
         payload = widget.current_payload()
         widget.set_result_busy(True)
-        thread_pool_manager.submit(
-            self._retranslate, widget, payload, target_lang, force_refresh,
-            self._new_request_token())
+        self._submit_or_fail(
+            widget, self._retranslate, widget, payload, target_lang,
+            force_refresh, self._new_request_token())
 
     def _retranslate(self, widget, payload, target_lang, force_refresh, token=None):
         """在池线程重走翻译链路，完成后回主线程更新结果"""
@@ -631,12 +652,9 @@ class ScreenshotWidget(QWidget):
         self._resolve_desktop()
 
         # 磁吸状态：启动时枚举一次可见窗口矩形，拖拽期间不重复枚举。
-        # Win32 给的是虚拟桌面坐标，遮罩局部坐标要减掉桌面原点。
         from .window_enum import get_visible_window_rects
-        origin_x, origin_y = self._desktop_rect.x(), self._desktop_rect.y()
-        self._snap_window_rects = [
-            (l - origin_x, t - origin_y, r - origin_x, b - origin_y)
-            for l, t, r, b in get_visible_window_rects()]
+        self._snap_window_rects = self._window_rects_local(
+            get_visible_window_rects())
         self._active_snap_lines = None  # 当前激活的参考线
 
         # 结果态：识别/翻译完成后就地覆盖展示
@@ -878,7 +896,11 @@ class ScreenshotWidget(QWidget):
             return
         painter.save()
         painter.setClipRect(rect)
-        painter.drawPixmap(0, 0, self._frozen_pixmap)
+        if abs(self._grab_scale_y - self._grab_scale) < 0.001:
+            painter.drawPixmap(0, 0, self._frozen_pixmap)
+        else:
+            # 横纵倍率不等时 1:1 贴图会让选区内容与暗角错位，按遮罩整幅贴回
+            painter.drawPixmap(self.rect(), self._frozen_pixmap)
         painter.restore()
 
     def _draw_hint(self, painter):
@@ -948,6 +970,32 @@ class ScreenshotWidget(QWidget):
                 painter.drawLine(pos, 0, pos, self.screen_height)
             else:
                 painter.drawLine(0, pos, self.screen_width, pos)
+
+    def _window_rects_local(self, rects):
+        """
+        把 Win32 窗口矩形换算成遮罩局部逻辑坐标
+
+        GetWindowRect 给的是物理像素的虚拟桌面绝对坐标，而遮罩的选区、屏幕
+        边界与吸附线全是 Qt 的逻辑坐标；混用的话高分屏下吸附线会整体偏掉
+        (倍率-1) 倍，右边/下边的窗口边缘还会被 screen_width 判成"超出屏幕"
+        而丢弃。先按抓取倍率换算，再减掉遮罩自身的逻辑原点。
+
+        Args:
+            rects (list[tuple[int, int, int, int]]): 物理像素的
+                (left, top, right, bottom)
+
+        Returns:
+            list[tuple[int, int, int, int]]: 遮罩局部逻辑坐标矩形
+        """
+        scale_x = self._grab_scale or 1.0
+        scale_y = self._grab_scale_y or 1.0
+        origin_x, origin_y = self._desktop_rect.x(), self._desktop_rect.y()
+        return [
+            (int(round(l / scale_x)) - origin_x,
+             int(round(t / scale_y)) - origin_y,
+             int(round(r / scale_x)) - origin_x,
+             int(round(b / scale_y)) - origin_y)
+            for l, t, r, b in rects]
 
     def _snap_rect(self, rect):
         """
@@ -1428,6 +1476,10 @@ class ScreenshotWidget(QWidget):
 
         pixmap = QPixmap(image.width, image.height)
         pixmap.fill(Qt.transparent)
+        # 结果图是物理像素，钉屏窗口按 pixmap 的"逻辑尺寸"摆放：不声明倍率的话
+        # 高分屏上钉出来的图会比原选区大 (倍率-1) 倍
+        if self._scale > 1.0:
+            pixmap.setDevicePixelRatio(self._scale)
         painter = QPainter(pixmap)
         if not painter.isActive():
             logger.error("结果图画布创建失败，放弃本次导出")
@@ -1578,6 +1630,12 @@ class ScreenshotWidget(QWidget):
                     f"width={rect.width()}, height={rect.height()}")
 
         if rect.width() <= 10 or rect.height() <= 10:
+            if self._loading:
+                # 等结果期间的误触小拖拽：遮罩关掉等于把在途请求一起丢掉，
+                # 用户看到的就是一片空白 + 白等几秒，这里保持加载画面不动
+                self.setCursor(QCursor(Qt.ArrowCursor))
+                self.update()
+                return
             if self._result is not None:
                 # 结果态下的误触小拖拽：回到原结果展示
                 self._show_toolbar()
@@ -1632,15 +1690,6 @@ class ScreenshotWidget(QWidget):
         self.region_selected.emit(screenshot, QRect(rect))
         self.update()
 
-    def mouseDoubleClickEvent(self, event):
-        """
-        鼠标双击事件
-        双击确认选择
-        """
-        if event.button() == Qt.LeftButton and self.is_selecting:
-            self.is_selecting = False
-            self._confirm_selection()
-
     def keyPressEvent(self, event):
         """
         键盘按下事件
@@ -1679,6 +1728,8 @@ class ScreenshotWidget(QWidget):
                     self.begin.setX(self.begin.x() + delta)
                     self.end.setX(self.end.x() + delta)
 
+                # 连着按方向键能把整个选区推出屏幕外（越界后既看不见也裁不出像素）
+                self._clamp_selection_points()
                 self.update()
 
     def closeEvent(self, event):
@@ -1702,6 +1753,12 @@ class ScreenshotWidget(QWidget):
         self.screenshot_canceled.emit()
         # 关闭窗口
         self.close()
+
+    def _clamp_selection_points(self):
+        """把选区两端点夹回桌面内（方向键微调没有鼠标拖拽那样的天然边界）"""
+        for point in (self.begin, self.end):
+            point.setX(max(0, min(point.x(), self.screen_width)))
+            point.setY(max(0, min(point.y(), self.screen_height)))
 
     def _get_rect(self):
         """

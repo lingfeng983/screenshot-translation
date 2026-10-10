@@ -625,6 +625,9 @@ def paint_blocks(painter, image, blocks, texts, origin, mode, scale=1.0,
         painter.setBrush(bg)
         painter.drawRect(target)
 
+        # 译文模式没有原文行要画，字体也必须换成 fit_text 缩排用的那个：
+        # 行高、折行宽度全按它算，沿用画布当前字体会把译文画成另一个字号
+        painter.setFont(font)
         painter.setPen(QPen(fg))
         y = target.top()
         if source_height:
