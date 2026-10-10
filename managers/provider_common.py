@@ -15,14 +15,55 @@ Provider 公共基础设施
 - 识别/翻译失败抛异常，由管理器统一重试并按降级链兜底
 """
 
+import configparser
 import hashlib
 import importlib
 import logging
 import pkgutil
+import re
 
 from .retry_handler import NonRetryableError, default_retry_handler
 
 logger = logging.getLogger('screenshot-translation')
+
+# 带查询串的 URL：签名参数与 access_token 都在这里
+_URL_WITH_QUERY = re.compile(r'(https?://[^\s?]+)\?[^\s"\']*')
+
+
+def redact_url_query(text):
+    """
+    抹掉文本里 URL 的查询部分
+
+    requests 的异常字符串带着完整请求 URL，而百度/有道这类接口的凭证就放在
+    query 里：一次网络抖动就足以把 client_secret、access_token 或 sign 写进
+    本地日志（还会留在代理的访问日志里）。
+
+    Args:
+        text (str): 任意文本
+
+    Returns:
+        str: 查询串替换后的文本
+    """
+    if not text:
+        return text
+    return _URL_WITH_QUERY.sub(r'\1?<查询参数已隐藏>', text)
+
+
+def describe_error(error, limit=300):
+    """
+    把异常压成一行可展示/可日志的安全文本
+
+    Args:
+        error: 异常对象或 None
+        limit (int): 最大长度
+
+    Returns:
+        str: 脱敏并截断后的描述
+    """
+    if error is None:
+        return '未知错误'
+    text = str(error).replace('\n', ' ').strip()
+    return redact_url_query(text)[:limit]
 
 
 class ProviderConfigError(NonRetryableError):
@@ -31,6 +72,14 @@ class ProviderConfigError(NonRetryableError):
 
 class ProviderUnsupportedError(NonRetryableError):
     """能力不支持类错误（如引擎不提供行级坐标）：重试无用，直接降级"""
+
+
+class ProviderTimeoutError(NonRetryableError):
+    """
+    超时类错误：再跑一次只会再等一个超时
+
+    重试的代价是“用户再等满一次时限”，比降级换引擎更糟，所以按非重试处理。
+    """
 
 
 class ProviderEmptyResultError(NonRetryableError):
@@ -195,7 +244,10 @@ class BaseProvider:
         try:
             return self.config_manager.config.get(
                 section, option, fallback=fallback)
-        except Exception:
+        except (configparser.Error, ValueError) as e:
+            # 只兜“缺段/缺项/类型不对”这类可预期错误，并且留下痕迹：
+            # 静默返回 fallback 会让用户填好的密钥悄悄变成空串
+            logger.warning(f"读取配置 [{section}] {option} 失败，按默认值处理: {e}")
             return fallback
 
     def _require_value(self, value, error_hint):
@@ -313,7 +365,8 @@ class ProviderChainManager:
             provider = provider_factory()
         except Exception as e:
             # provider构造失败（如引擎缺失）也要走降级而不是崩溃
-            logger.error(f"{self._failure_prefix[1:]}provider初始化失败: {e}")
+            logger.error(f"{self._failure_prefix[1:]}provider初始化失败: "
+                         f"{describe_error(e)}")
             return failure_text(e)
 
         def attempt():
@@ -323,7 +376,8 @@ class ProviderChainManager:
             return handler.execute_with_retry(
                 attempt, fallback_result=lambda: failure_text(None))
         except Exception as e:
-            logger.error(f"provider {getattr(provider, 'name', '?')} 执行异常: {e}")
+            logger.error(f"provider {getattr(provider, 'name', '?')} 执行异常: "
+                         f"{describe_error(e)}")
             return failure_text(e)
 
     @classmethod

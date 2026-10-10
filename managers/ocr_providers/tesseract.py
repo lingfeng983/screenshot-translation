@@ -13,9 +13,11 @@ import logging
 import os
 import subprocess
 import sys
+import threading
 
 from .. import app_paths
-from ..provider_common import ProviderConfigError, ProviderEmptyResultError
+from ..provider_common import (
+    ProviderConfigError, ProviderEmptyResultError, ProviderTimeoutError)
 from ..text_block import TextBlock
 from .base import OCRProvider
 
@@ -29,6 +31,16 @@ _TARGET_HEIGHT = 64        # 小图放大到约这个高度，Tesseract 对 12px
 _MIN_SCALE_HEIGHT = 40     # 选区高度低于此值时启用自适应放大（2~4倍）
 _AUTOCONTRAST_CUTOFF = 1   # autocontrast 裁掉两侧1%的极值噪声
 _PAD = 12                  # 二值化后四周留白，避免字符贴边被截断
+
+# 单次识别的硬时限（秒）：识别跑在固定大小的线程池里，一次挂死就永久占住
+# 一个 worker，几次之后整个截图翻译就会停摆；pytesseract 超时后会 kill
+# 子进程，所以设时限同时也在回收进程
+_TESSERACT_TIMEOUT = 60
+
+# pytesseract 的引擎路径与训练数据目录是进程级全局态（模块变量 + 环境变量），
+# 并发构造 provider 或重载配置时必须串行改写，否则正在运行的子进程会读到
+# 换了一半的配置
+_engine_lock = threading.Lock()
 
 try:
     import pytesseract
@@ -103,22 +115,50 @@ def _find_tesseract_cmd():
     return None
 
 
-def _find_tessdata_path():
+def _tessdata_has(path, langs):
+    """
+    判断目录里指定语言的训练数据是否齐备
+
+    Args:
+        path (str): tessdata 目录
+        langs (list[str]): 语言代码
+
+    Returns:
+        bool: 每个语言都有对应 .traineddata
+    """
+    if not path or not os.path.isdir(path):
+        return False
+    return all(os.path.isfile(os.path.join(path, f'{lang}.traineddata'))
+               for lang in langs)
+
+
+def _find_tessdata_path(exe=None, langs=None):
     """
     查找可用的 tessdata 训练数据目录
 
+    先看所选 exe 的同级 tessdata：可执行文件与训练数据必须成对，便携版
+    配上系统安装的语言包（版本或语言集不同）只会得到一句
+    "Error opening data file"，现场根本诊断不出来。
+
+    Args:
+        exe (str 或 None): 已确定的 tesseract.exe 路径
+        langs (list[str] 或 None): 需要的语言，默认 eng 与 chi_sim
+
     Returns:
-        str: 首个包含 eng 与 chi_sim 训练数据的目录；均未命中时返回首个候选路径
+        str: 首个语言齐备的目录；都不齐备时返回首个存在的候选
     """
-    paths = app_paths.tessdata_candidates()
-    for path in paths:
-        if os.path.exists(path) and os.path.isdir(path):
-            if (os.path.exists(os.path.join(path, 'eng.traineddata'))
-                    and os.path.exists(os.path.join(path, 'chi_sim.traineddata'))):
-                return path
-            logger.warning(f"tessdata目录存在但缺少训练数据文件: {path}")
-    logger.info("未找到有效的tessdata目录，使用默认路径")
-    return paths[0]
+    langs = langs or ['eng', 'chi_sim']
+    candidates = ([os.path.join(os.path.dirname(exe), 'tessdata')] if exe else [])
+    candidates += app_paths.tessdata_candidates()
+    existing = [p for p in candidates if p and os.path.isdir(p)]
+    for path in existing:
+        if _tessdata_has(path, langs):
+            return path
+    if existing:
+        logger.warning(f"候选 tessdata 目录缺 {','.join(langs)} 训练数据: {existing}")
+        return existing[0]
+    logger.warning("未找到任何 tessdata 目录，使用默认路径")
+    return candidates[0] if candidates else ''
 
 
 class TesseractProvider(OCRProvider):
@@ -140,32 +180,97 @@ class TesseractProvider(OCRProvider):
             config_manager: 配置管理器实例
         """
         super().__init__(config_manager)
+        self._engine_ok = False
 
         if pytesseract_available:
-            exe = _find_tesseract_cmd()
-            if exe:
-                pytesseract.pytesseract.tesseract_cmd = exe
-                logger.info(f"使用的tesseract路径: {exe}")
-            else:
-                logger.info("未找到内置tesseract，将依赖系统PATH中的tesseract")
+            with _engine_lock:
+                exe = _find_tesseract_cmd()
+                if exe:
+                    pytesseract.pytesseract.tesseract_cmd = exe
+                    logger.info(f"使用的tesseract路径: {exe}")
+                else:
+                    logger.info("未找到内置tesseract，将依赖系统PATH中的tesseract")
+
+                # 通过环境变量传递训练数据目录：pytesseract会按空白切分config字符串，
+                # 用 --tessdata-dir 传含空格或引号的路径会被截断
+                self.tessdata_path = _find_tessdata_path(exe, self._lang_list())
+                os.environ['TESSDATA_PREFIX'] = self.tessdata_path
+                logger.info(f"使用的tessdata路径: {self.tessdata_path}")
+                self.exe_path = exe
+
             self._check_engine()
 
-        # 通过环境变量传递训练数据目录：pytesseract会按空白切分config字符串，
-        # 用 --tessdata-dir 传含空格或引号的路径会被截断
-        self.tessdata_path = _find_tessdata_path()
-        os.environ['TESSDATA_PREFIX'] = self.tessdata_path
-        logger.info(f"使用的tessdata路径: {self.tessdata_path}")
+    def _lang_list(self):
+        """
+        配置里的识别语言拆成列表（tessdata 完整性检查按单个语言判断）
+
+        Returns:
+            list[str]: 语言代码，默认 eng 与 chi_sim
+        """
+        langs = [l.strip() for l in self._get_langs().split('+') if l.strip()]
+        return langs or ['eng', 'chi_sim']
+
+    def _probe(self, args, timeout=10):
+        """
+        跑一次 tesseract 的辅助命令（带硬时限，超时 kill）
+
+        不走 pytesseract 的 get_tesseract_version/get_languages：它们内部
+        是裸 Popen + communicate()，没有 timeout，引擎卡住时探测本身先挂死。
+
+        Args:
+            args (list[str]): 命令参数
+            timeout (int): 时限（秒）
+
+        Returns:
+            tuple: (CompletedProcess 或 None, 异常或 None)
+        """
+        cmd = [self.exe_path or 'tesseract'] + list(args)
+        try:
+            return subprocess.run(cmd, capture_output=True, timeout=timeout,
+                                  creationflags=_no_window_flags()), None
+        except Exception as e:      # OSError/TimeoutExpired 等，调用方按不可用处理
+            return None, e
 
     def _check_engine(self):
-        """检查Tesseract引擎可用性，不可用时输出安装指引"""
-        try:
-            version = pytesseract.get_tesseract_version()
-            logger.info(f"Tesseract OCR版本: {version}")
-        except Exception as e:
-            logger.warning(f"Tesseract OCR检查失败: {e}")
-            logger.warning("请确保已安装Tesseract OCR并添加到系统PATH")
-            logger.warning(
-                "Windows下载地址: https://github.com/UB-Mannheim/tesseract/wiki")
+        """
+        探测引擎与语言包是否真能用，结果记入 _engine_ok
+
+        以前只打一行 warning 就当没事，用户要等到识别失败才发现组件没装好，
+        提示还指向 GitHub 而不是本项目的下载链路；现在识别入口按结果直接抛
+        带指引的非重试错误。
+        """
+        out, err = self._probe(['--version'])
+        if err is not None or out is None or out.returncode != 0:
+            self._engine_ok = False
+            detail = err if err is not None else (out.stderr or b'').decode(
+                errors='replace').strip() if out else '无输出'
+            logger.warning(f"Tesseract 引擎不可用: {detail}")
+            return
+
+        missing = [l for l in self._lang_list()
+                   if not _tessdata_has(self.tessdata_path, [l])]
+        if missing:
+            self._engine_ok = False
+            logger.warning(f"tessdata 缺少语言包 {missing}（目录 {self.tessdata_path}）")
+            return
+
+        version = (out.stdout or b'').decode(errors='replace').strip()
+        self._engine_ok = True
+        logger.info(f"Tesseract OCR版本: {version.splitlines()[0] if version else '?'}")
+
+    def _require_engine(self):
+        """
+        引擎/语言包不可用时抛出带安装指引的非重试错误
+
+        Raises:
+            ProviderConfigError: 本地组件缺失
+        """
+        if self._engine_ok:
+            return
+        raise ProviderConfigError(
+            "本地 Tesseract 不可用（缺少引擎或语言包）。请用安装包重新安装并勾选"
+            f"“下载 OCR 离线识别组件”，组件目录 {app_paths.ocr_resources_dir()}；"
+            "或改用在线 OCR")
 
     def _get_langs(self):
         """
@@ -176,6 +281,38 @@ class TesseractProvider(OCRProvider):
         """
         langs = self._get_option('tesseract_langs', fallback='eng+chi_sim').strip()
         return langs or 'eng+chi_sim'
+
+    def _run(self, fn, image, **kwargs):
+        """
+        带硬时限地调用 pytesseract 的识别接口
+
+        不传 timeout 时一次卡住就是永久占住线程池的一个 worker（几次之后
+        截图翻译整体停摆）。pytesseract 超时会先 kill 子进程再抛
+        RuntimeError，这里换成非重试的 ProviderTimeoutError：同一张图再跑
+        一次只会再等满一个时限，不如立刻降级。
+
+        Args:
+            fn: pytesseract.image_to_string / image_to_data
+            image (PIL.Image.Image): 预处理后的图像
+            **kwargs: 透传给 pytesseract 的参数
+
+        Returns:
+            识别结果（str 或 dict）
+
+        Raises:
+            ProviderTimeoutError: 超过 _TESSERACT_TIMEOUT 秒
+        """
+        kwargs.setdefault('timeout', _TESSERACT_TIMEOUT)
+        message = (f"Tesseract 识别超过 {_TESSERACT_TIMEOUT} 秒已中止，"
+                   f"选区可能过大；可缩小选区或改用在线 OCR")
+        try:
+            return fn(image, **kwargs)
+        except RuntimeError as e:
+            if 'timeout' in str(e).lower():
+                raise ProviderTimeoutError(message) from e
+            raise
+        except subprocess.TimeoutExpired as e:
+            raise ProviderTimeoutError(message) from e
 
     def recognize(self, image):
         """
@@ -192,13 +329,15 @@ class TesseractProvider(OCRProvider):
         """
         if not pytesseract_available:
             raise ProviderConfigError("pytesseract未安装，无法使用Tesseract识别")
+        self._require_engine()
 
         logger.info("开始Tesseract OCR识别")
         processed = self._preprocess_image(image)
 
         # tessdata目录通过TESSDATA_PREFIX环境变量指定（见__init__说明）
         custom_config = f"--psm 6 -l {self._get_langs()}"
-        text = pytesseract.image_to_string(processed, config=custom_config)
+        text = self._run(pytesseract.image_to_string, processed,
+                         config=custom_config)
 
         cleaned = self.clean_text(text)
         logger.info(f"Tesseract识别完成，识别到 {len(cleaned)} 个字符")
@@ -222,11 +361,13 @@ class TesseractProvider(OCRProvider):
         """
         if not pytesseract_available:
             raise ProviderConfigError("pytesseract未安装，无法使用Tesseract识别")
+        self._require_engine()
 
         processed, scale, pad = self._preprocess_with_geometry(image)
         custom_config = f"--psm 6 -l {self._get_langs()}"
-        data = pytesseract.image_to_data(
-            processed, config=custom_config, output_type=pytesseract.Output.DICT)
+        data = self._run(pytesseract.image_to_data, processed,
+                         config=custom_config,
+                         output_type=pytesseract.Output.DICT)
 
         lines = {}
         for i in range(len(data.get('text', []))):
@@ -271,13 +412,16 @@ class TesseractProvider(OCRProvider):
         """
         if not pytesseract_available:
             return ['eng', 'chi_sim']
-        try:
-            languages = pytesseract.get_languages()
-            logger.info(f"可用的OCR语言: {languages}")
-            return languages
-        except Exception as e:
-            logger.warning(f"获取可用语言失败: {e}")
+        out, err = self._probe(['--list-langs'])
+        if err is not None or out is None or out.returncode != 0:
+            logger.warning(f"获取可用语言失败: {err or '引擎返回非零'}")
             return ['eng', 'chi_sim']
+        # 首行是 "List of available languages in "...""，其余每行一个语言
+        languages = [l.strip() for l in
+                     (out.stdout or b'').decode(errors='replace').splitlines()[1:]
+                     if l.strip()]
+        logger.info(f"可用的OCR语言: {languages}")
+        return languages or ['eng', 'chi_sim']
 
     @staticmethod
     def _scale_factor(height):

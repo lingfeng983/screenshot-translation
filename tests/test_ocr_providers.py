@@ -260,7 +260,7 @@ def test_block_coords_round_trip():
         Output = FakeOutput
 
         @staticmethod
-        def image_to_data(processed, config=None, output_type=None):
+        def image_to_data(processed, config=None, output_type=None, timeout=None):
             assert processed.size == (width * factor + 2 * _PAD,
                                       height * factor + 2 * _PAD), \
                 f"预处理尺寸异常: {processed.size}"
@@ -283,6 +283,8 @@ def test_block_coords_round_trip():
     # 跳过 __init__（它要探测引擎路径、跑子进程并扫盘找 tessdata）
     provider = TesseractProvider.__new__(TesseractProvider)
     provider.config_manager = None
+    # 引擎探测也是 __init__ 做的：识别入口会先校验 _engine_ok，测试里直接声明可用
+    provider._engine_ok = True
 
     saved = (tess_mod.pytesseract, tess_mod.pytesseract_available)
     tess_mod.pytesseract = FakePytesseract

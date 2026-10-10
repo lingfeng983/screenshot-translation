@@ -10,16 +10,42 @@
 """
 
 import base64
+import contextlib
+import io
 import json
 import logging
+import threading
 import time
 
 import requests
 
 from .base import OCRProvider
+from ..provider_common import ProviderConfigError
 from ..text_block import TextBlock
 
 logger = logging.getLogger('screenshot-translation')
+
+# 令牌类错误：清掉缓存重新取一次令牌即可恢复
+_TOKEN_ERROR_CODES = {216002, 216003, 216004, 216005, 216006}
+# 服务侧偶发（繁忙/内部错误）：交给重试层退避后再来
+_TRANSIENT_ERROR_CODES = {17, 18, 216300, 216301, 216302, 216303}
+# 百度接口对图片的硬限制：超了重试也不会变，只能改图或不重试
+_MAX_EDGE = 4096
+_MIN_EDGE = 15
+_MAX_BYTES = 4 * 1024 * 1024
+
+
+def _safe_error_text(value):
+    """
+    把接口错误体压成一行可日志化的文本（不含请求URL）
+
+    Args:
+        value: 响应 JSON 或异常对象
+
+    Returns:
+        str: 截断后的描述
+    """
+    return str(value).replace('\n', ' ')[:200]
 
 
 class BaiduOCRProvider(OCRProvider):
@@ -50,16 +76,27 @@ class BaiduOCRProvider(OCRProvider):
         # access_token 缓存：避免每次识别都请求一次令牌
         self._access_token = None
         self._token_expire_at = 0
+        # 并发首识别时只让一个线程去取令牌，否则同一份密钥会打两次令牌接口
+        self._token_lock = threading.Lock()
+
+    def close(self):
+        """释放连接池（管理器重建/重载配置时调用）"""
+        with contextlib.suppress(Exception):
+            self.session.close()
 
     def _get_access_token(self):
         """
         获取（带缓存的）access_token
 
+        凭证走 form body 而不是 URL query：异常文本里带着完整 URL，
+        一次网络抖动就能把 client_secret 写进本地日志与代理访问日志。
+
         Returns:
             str: 有效的access_token
 
         Raises:
-            Exception: 密钥未设置或令牌获取失败
+            ProviderConfigError: 密钥未设置
+            Exception: 令牌获取失败（可重试）
         """
         api_key = self._require_option(
             'baidu_ocr_api_key', "百度云OCR密钥未设置（需在配置中填入API Key与Secret Key）")
@@ -67,29 +104,35 @@ class BaiduOCRProvider(OCRProvider):
             'baidu_ocr_secret_key', "百度云OCR密钥未设置（需在配置中填入API Key与Secret Key）")
 
         # 令牌有效期一般为30天，提前10分钟刷新
-        if self._access_token and time.time() < self._token_expire_at:
-            return self._access_token
+        with self._token_lock:
+            if self._access_token and time.time() < self._token_expire_at:
+                return self._access_token
 
-        try:
-            response = self.session.post(
-                self.TOKEN_URL,
-                params={
-                    'grant_type': 'client_credentials',
-                    'client_id': api_key,
-                    'client_secret': secret_key,
-                },
-                timeout=self.timeout,
-            )
-            response.raise_for_status()
-            data = response.json()
-            token = data.get('access_token')
-            if not token:
-                raise Exception(f"获取access_token失败: {str(data)[:200]}")
-            self._access_token = token
-            self._token_expire_at = time.time() + float(data.get('expires_in', 2592000)) - 600
-            return token
-        except requests.RequestException as e:
-            raise Exception(f"获取access_token网络错误: {e}") from e
+            try:
+                response = self.session.post(
+                    self.TOKEN_URL,
+                    data={
+                        'grant_type': 'client_credentials',
+                        'client_id': api_key,
+                        'client_secret': secret_key,
+                    },
+                    timeout=self.timeout,
+                )
+                response.raise_for_status()
+                data = response.json()
+                token = data.get('access_token')
+                if not token:
+                    # error_description 里可能重复带上密钥，只留错误码/描述前 200 字
+                    raise ProviderConfigError(
+                        f"获取access_token失败: {_safe_error_text(data)}")
+                self._access_token = token
+                self._token_expire_at = (time.time()
+                                         + float(data.get('expires_in', 2592000)) - 600)
+                return token
+            except ProviderConfigError:
+                raise
+            except (requests.RequestException, json.JSONDecodeError) as e:
+                raise Exception(f"获取access_token网络错误: {type(e).__name__}") from e
 
     def recognize(self, image):
         """
@@ -104,7 +147,7 @@ class BaiduOCRProvider(OCRProvider):
         Raises:
             Exception: 密钥未设置或识别失败
         """
-        result = self._post_image(self.OCR_URL, image)
+        result, _restore = self._post_image(self.OCR_URL, image)
         words = result.get('words_result') or []
         text = '\n'.join(w.get('words', '') for w in words)
         logger.info(f"百度云OCR识别完成，{len(words)} 行文本")
@@ -125,7 +168,7 @@ class BaiduOCRProvider(OCRProvider):
         Raises:
             Exception: 密钥未设置或未识别到文本
         """
-        result = self._post_image(self.GENERAL_URL, image)
+        result, restore = self._post_image(self.GENERAL_URL, image)
         items = result.get('words_result') or []
         blocks = []
         for item in items:
@@ -133,13 +176,47 @@ class BaiduOCRProvider(OCRProvider):
             loc = item.get('location') or {}
             if not text or not loc:
                 continue
+            # restore：图被压过就送出去了，坐标要乘回原图尺度
             blocks.append(TextBlock(
-                text, loc.get('left', 0), loc.get('top', 0),
-                loc.get('width', 0), loc.get('height', 0)))
+                text, loc.get('left', 0) * restore, loc.get('top', 0) * restore,
+                loc.get('width', 0) * restore, loc.get('height', 0) * restore))
         logger.info(f"百度云OCR块级识别完成，{len(blocks)} 行")
         if not blocks:
             raise Exception("百度云OCR未识别到任何文本")
         return blocks
+
+    def _encode_image(self, image):
+        """
+        PNG 编码并压进百度接口的图片硬限制
+
+        超限的选区送上去只会得到一句业务错误（以前还被当成可重试错误再打
+        两次），所以在本地先缩到能过。
+
+        Args:
+            image (PIL.Image.Image): 待送图
+
+        Returns:
+            tuple: (base64 字符串, 坐标回乘系数)。系数 = 原图宽 / 实际送出的图宽，
+                调用方拿接口返回的坐标必须乘回，否则就地覆盖会整体错位
+        """
+        restore = 1.0
+        for _ in range(5):
+            buffer = io.BytesIO()
+            image.save(buffer, format='PNG')
+            raw = buffer.getvalue()
+            if (len(raw) <= _MAX_BYTES and max(image.size) <= _MAX_EDGE
+                    and min(image.size) >= _MIN_EDGE):
+                return base64.b64encode(raw).decode('utf-8'), restore
+
+            width, height = image.size
+            scale = 0.7 if max(image.size) > _MAX_EDGE else 0.6
+            new_size = (max(_MIN_EDGE, int(width * scale)),
+                        max(_MIN_EDGE, int(height * scale)))
+            logger.info(f"图片超出百度OCR限制（{len(raw)} 字节, {image.size}），"
+                        f"缩到 {new_size}")
+            image = image.resize(new_size)
+            restore *= width / max(1, new_size[0])
+        raise ProviderConfigError("选区过大，压缩后仍不满足百度OCR的图片限制，请缩小选区")
 
     def _post_image(self, url, image):
         """
@@ -150,38 +227,48 @@ class BaiduOCRProvider(OCRProvider):
             image (PIL.Image.Image): 待识别的图像
 
         Returns:
-            dict: 接口响应
+            tuple: (响应 dict, 坐标回乘系数)
 
         Raises:
-            Exception: 密钥未设置、网络错误或业务错误
+            ProviderConfigError: 密钥/额度/参数类确定性错误（重试无意义）
+            Exception: 网络或服务侧偶发错误（交给重试层）
         """
-        token = self._get_access_token()
+        image_b64, restore = self._encode_image(image)
 
-        # 图像编码为base64（PNG无损，避免JPEG压缩损失小字清晰度）
-        from io import BytesIO
-        buffer = BytesIO()
-        image.save(buffer, format='PNG')
-        image_b64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
+        for attempt in (0, 1):
+            if attempt:
+                # 令牌类错误：清缓存重新取一次再打
+                self._access_token = None
+            token = self._get_access_token()
+            try:
+                response = self.session.post(
+                    url,
+                    # access_token 放 body：放 query 时异常文本里的完整 URL
+                    # 会把令牌带进本地日志与代理日志
+                    data={'image': image_b64, 'access_token': token},
+                    headers={'Content-Type': 'application/x-www-form-urlencoded'},
+                    timeout=self.timeout,
+                )
+                response.raise_for_status()
+                result = response.json()
+            except (requests.RequestException, json.JSONDecodeError) as e:
+                # 只留异常类型：URL 与响应体可能含令牌或整页 HTML
+                raise Exception(f"百度云OCR请求失败: {type(e).__name__}") from e
 
-        try:
-            response = self.session.post(
-                url,
-                params={'access_token': token},
-                headers={'Content-Type': 'application/x-www-form-urlencoded'},
-                data=f'image={image_b64}',
-                timeout=self.timeout,
-            )
-            response.raise_for_status()
-            result = response.json()
+            if 'error_code' not in result:
+                return result, restore
 
-            # 百度对业务错误返回HTTP 200 + error_code
-            if 'error_code' in result:
-                raise Exception(
-                    f"百度云OCR错误: {result.get('error_code')} {result.get('error_msg', '')}")
-            return result
+            code = str(result.get('error_code'))
+            message = (f"百度云OCR错误 {code}: "
+                       f"{_safe_error_text(result.get('error_msg', ''))}")
+            if code in _TOKEN_ERROR_CODES and not attempt:
+                continue
+            if code in _TRANSIENT_ERROR_CODES:
+                raise Exception(message)
+            # 认证、额度、参数、图片规格类：同一张图再打一次也是同样结果
+            raise ProviderConfigError(message)
 
-        except (requests.RequestException, json.JSONDecodeError) as e:
-            raise Exception(f"百度云OCR请求失败: {e}") from e
+        raise ProviderConfigError("百度云OCR令牌刷新后仍失败")
 
 
 def register(registry):

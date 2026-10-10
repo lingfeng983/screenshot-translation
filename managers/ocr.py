@@ -9,10 +9,12 @@ OCR管理器
 """
 
 import logging
+import threading
 
 from .error_handler import error_handler
 from .ocr_providers import ocr_provider_registry
-from .provider_common import ProviderChainManager, ProviderEmptyResultError
+from .provider_common import (
+    ProviderChainManager, ProviderEmptyResultError, describe_error)
 from .retry_handler import RetryHandler
 
 logger = logging.getLogger('screenshot-translation')
@@ -83,8 +85,11 @@ class OCRManager(ProviderChainManager):
         self.config_manager = config_manager
         self.ocr_type = 'tesseract'  # 默认本地Tesseract
         self._providers = {}
+        self._provider_lock = threading.Lock()
         # 最近一次识别失败的异常：用于区分“引擎坏了”与“图里没字”
         self._last_error = None
+        # 抛出该异常的 provider 类：降级链里最后动手的可能不是配置的引擎
+        self._last_error_provider = None
         self._load_config()
 
         logger.info(f"OCR管理器初始化完成，当前引擎: {self.ocr_type}，"
@@ -96,6 +101,8 @@ class OCRManager(ProviderChainManager):
 
         Tesseract 构造时要探测引擎路径、跑一次 `tesseract --version` 子进程并
         扫盘定位 tessdata，若每次识别都新建实例，一次翻译就白白多起一个进程。
+        构造过程还会改写进程级全局态（pytesseract 的引擎路径、
+        TESSDATA_PREFIX），所以同一次构造必须在锁内完成。
 
         Args:
             provider_cls: OCR provider 类
@@ -103,11 +110,12 @@ class OCRManager(ProviderChainManager):
         Returns:
             provider 实例（首次调用时构造）
         """
-        provider = self._providers.get(provider_cls)
-        if provider is None:
-            provider = provider_cls(config_manager=self.config_manager)
-            self._providers[provider_cls] = provider
-        return provider
+        with self._provider_lock:
+            provider = self._providers.get(provider_cls)
+            if provider is None:
+                provider = provider_cls(config_manager=self.config_manager)
+                self._providers[provider_cls] = provider
+            return provider
 
     def _load_config(self):
         """加载OCR引擎配置"""
@@ -209,12 +217,16 @@ class OCRManager(ProviderChainManager):
         """
         本次空结果是否已经是最终答案
 
+        判据必须是“实际动手的那个引擎”，不是配置里的那个：配了云端引擎、
+        块级链路里退到本地 Tesseract 后才报“没字”，此时答案同样确定；
+        反过来只看配置引擎会把云端偶发空结果当定案。
+
         Returns:
-            bool: 当前引擎是本地确定性引擎，且刚刚的块级识别就报的“没字”
+            bool: 最后尝试的引擎是本地确定性引擎，且刚刚报的就是“没字”
         """
         if not isinstance(self._last_error, ProviderEmptyResultError):
             return False
-        provider_cls = self._resolve_provider(self.ocr_type)
+        provider_cls = self._last_error_provider or self._resolve_provider(self.ocr_type)
         return bool(getattr(provider_cls, 'deterministic_results', False))
 
     def _perform_ocr_blocks(self, image):
@@ -260,9 +272,11 @@ class OCRManager(ProviderChainManager):
                 # 与 _recognize_via 同样记下真实异常：上层要靠它区分
                 # “引擎跑通了但图里没字”与“引擎本身不可用”
                 self._last_error = e
+                self._last_error_provider = provider_cls
                 raise
 
         self._last_error = None
+        self._last_error_provider = None
         result = self._run_provider(factory, call, lambda err: None)
         return result if isinstance(result, list) else []
 
@@ -289,11 +303,12 @@ class OCRManager(ProviderChainManager):
                 # 在这里记真实异常：重试器降级时只把 None 交给 failure_text，
                 # 异常类型拿不到，而上层要靠它区分“引擎坏了”与“图里没字”
                 self._last_error = e
+                self._last_error_provider = provider_cls
                 raise
 
         def failure_text(err):
             if err is not None:
-                return f"{_OCR_FAIL_PREFIX}: {err}]"
+                return f"{_OCR_FAIL_PREFIX}: {describe_error(err)}]"
             return f"{_OCR_FAIL_PREFIX}: {provider_cls.display_name}]"
 
         self._last_error = None

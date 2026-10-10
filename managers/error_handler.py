@@ -10,6 +10,7 @@ import logging
 
 from PyQt5.QtWidgets import QMessageBox
 
+from .provider_common import describe_error
 from .qt_dispatcher import qt_dispatcher
 
 # 日志配置统一由入口 main.py 完成，此处只获取 logger
@@ -96,8 +97,8 @@ class ErrorHandler:
         """
         ErrorHandler.handle_error(error, "翻译", show_message)
 
-        # 翻译失败时返回错误信息
-        return f"[翻译失败: {str(error)}]"
+        # 翻译失败时返回错误信息（异常里可能带签名参数的 URL，必须脱敏）
+        return f"[翻译失败: {describe_error(error)}]"
 
     @staticmethod
     def handle_screenshot_error(error, show_message=True):

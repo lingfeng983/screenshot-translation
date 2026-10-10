@@ -22,6 +22,29 @@ from PyQt5.QtWidgets import (
 # 配置日志（全局唯一入口，其他模块只使用 logging.getLogger）
 # 日志路径按运行形态定位：源码→项目根，exe→~/.screenshot-translation（可写）
 from managers import app_paths, result_render, styles
+from managers.provider_common import redact_url_query
+
+
+class _UrlQueryRedactor(logging.Filter):
+    """
+    把日志里 URL 的查询串抹掉
+
+    requests 与各家 provider 的异常字符串带着完整请求 URL，而签名参数、
+    access_token 这类凭证就写在 query 里；靠每个打印点自觉脱敏迟早会漏，
+    所以在日志出口统一拦截。
+    """
+
+    def filter(self, record):
+        try:
+            record.msg = redact_url_query(record.getMessage())
+            record.args = ()
+        except Exception:
+            # 兜底：脱敏本身出错时宁可写原文也不要丢日志
+            pass
+        return True
+
+
+_REDACTOR = _UrlQueryRedactor()
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -32,6 +55,8 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
+for _handler in logging.getLogger().handlers:
+    _handler.addFilter(_REDACTOR)
 logger = logging.getLogger('screenshot-translation')
 
 # 导入管理器
