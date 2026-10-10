@@ -7,8 +7,9 @@
 
 import logging
 import random
+import threading
 import time
-from typing import Callable, Any
+from typing import Callable, Any, Optional
 
 logger = logging.getLogger('screenshot-translation')
 
@@ -20,6 +21,15 @@ class NonRetryableError(Exception):
     鉴权未填、密钥为空、引擎不支持某种能力：重试多少次结果都一样，
     只会白等退避时间（默认两次退避合计约 3 秒），因此直接放弃。
     """
+
+
+class ChainExpiredError(Exception):
+    """降级链的整体时限用尽：不再发起任何请求，也不再把退避时间睡完"""
+
+
+class TranslationCancelledError(Exception):
+    """用户已经关掉遮罩/重画选区：在飞的请求没有意义，立刻收手"""
+
 
 class RetryHandler:
     """
@@ -45,8 +55,10 @@ class RetryHandler:
         logger.debug(f"重试处理器初始化: 最大尝试{max_attempts}次，基础延迟{base_delay}秒")
 
     def execute_with_retry(self, func: Callable, *args,
-                          fallback_result: Any = None,
-                          **kwargs) -> Any:
+                           fallback_result: Any = None,
+                           deadline: Optional[float] = None,
+                           cancel_event: Optional[threading.Event] = None,
+                           **kwargs) -> Any:
         """
         执行带重试的操作
 
@@ -55,6 +67,9 @@ class RetryHandler:
             *args: 函数参数
             fallback_result (Any): 重试失败后的降级结果；
                 传入可调用对象时按惰性求值处理，仅在所有重试失败后才调用
+            deadline (float 或 None): time.monotonic() 口径的截止时间戳；
+                到点后立即放弃剩余尝试与退避等待
+            cancel_event (threading.Event 或 None): 置位后同样立即放弃
             **kwargs: 函数关键字参数
 
         Returns:
@@ -66,6 +81,12 @@ class RetryHandler:
         last_exception = None
 
         for attempt in range(self.max_attempts):
+            stopped = self._stop_reason(deadline, cancel_event)
+            if stopped is not None:
+                logger.warning(f"第{attempt + 1}次尝试前中止重试: {stopped}")
+                last_exception = stopped
+                break
+
             try:
                 logger.debug(f"第{attempt + 1}次尝试执行 {func.__name__}")
                 result = func(*args, **kwargs)
@@ -83,12 +104,15 @@ class RetryHandler:
                 last_exception = e
                 logger.warning(f"第{attempt + 1}次尝试失败: {e}")
 
-                if attempt < self.max_attempts - 1:
-                    delay = self._calculate_delay(attempt)
-                    logger.info(f"等待{delay:.2f}秒后进行第{attempt + 2}次重试...")
-                    time.sleep(delay)
-                else:
+                if attempt >= self.max_attempts - 1:
                     logger.error(f"所有{self.max_attempts}次重试都失败了")
+                    break
+
+                delay = self._calculate_delay(attempt)
+                logger.info(f"等待{delay:.2f}秒后进行第{attempt + 2}次重试...")
+                if not self._sleep(delay, deadline, cancel_event):
+                    logger.warning("退避等待被时限/取消打断，放弃剩余重试")
+                    break
 
         # 所有重试都失败，返回降级结果
         if fallback_result is not None:
@@ -98,6 +122,38 @@ class RetryHandler:
         else:
             # 重新抛出最后一个异常
             raise last_exception
+
+    @staticmethod
+    def _stop_reason(deadline, cancel_event):
+        """
+        当前是否已经不该再发起请求
+
+        Returns:
+            异常对象（该停下）或 None（可以继续）
+        """
+        if cancel_event is not None and cancel_event.is_set():
+            return TranslationCancelledError("请求已被取消")
+        if deadline is not None and time.monotonic() >= deadline:
+            return ChainExpiredError("降级链整体时限已用尽")
+        return None
+
+    @staticmethod
+    def _sleep(delay, deadline, cancel_event):
+        """
+        可中断的退避等待：时限用尽或取消置位时提前返回
+
+        Returns:
+            bool: 是否完整睡完（False 表示被提前打断）
+        """
+        if deadline is not None:
+            delay = min(delay, max(deadline - time.monotonic(), 0.0))
+        if delay <= 0:
+            return False
+        if cancel_event is not None:
+            # Event.wait 返回“是否被置位”：置位说明用户已经不等了
+            return not cancel_event.wait(delay)
+        time.sleep(delay)
+        return True
 
     def _calculate_delay(self, attempt: int) -> float:
         """

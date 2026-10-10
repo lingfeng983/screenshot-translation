@@ -72,6 +72,8 @@ def test_edge_free_provider():
     fake_response.json.return_value = [
         {'translations': [{'text': '你好世界', 'to': 'zh-Hans'}]}
     ]
+    # 状态码必须是真整数：分发层按状态码判断可重试性，Mock 比较会 TypeError
+    fake_response.status_code = 200
     fake_response.raise_for_status = mock.Mock()
 
     session = mock.Mock()
@@ -202,10 +204,11 @@ def test_primary_retry_policy():
 
     # 直接走单provider链路，避开免费接口兜底的真实网络请求
     started = time.monotonic()
-    result = manager._translate_via(FakeRetryableProvider, "hello")
+    result, serving = manager._translate_via(FakeRetryableProvider, "hello")
     elapsed = time.monotonic() - started
 
     assert result.startswith('[翻译失败'), f"故障应转为失败文本: {result}"
+    assert serving is None, "失败的provider不应被记为实际服务方"
     assert calls['n'] == translation_retry_handler.max_attempts, (
         f"主API应重试 {translation_retry_handler.max_attempts} 次，实际 {calls['n']} 次"
         f"（通用策略是 {default_retry_handler.max_attempts} 次）")

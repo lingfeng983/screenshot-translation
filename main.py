@@ -403,6 +403,11 @@ class MainApp:
                 logger.debug("关闭线程池")
                 thread_pool_manager.shutdown(wait=False, cancel_futures=True)
 
+                # 释放翻译链路的连接池（复用同一个 Session，退出时不留 socket）
+                if self.translation_manager:
+                    logger.debug("关闭翻译连接池")
+                    self.translation_manager.close()
+
                 # 清理Qt应用
                 if self.app:
                     logger.debug("退出Qt应用")

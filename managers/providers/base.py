@@ -61,6 +61,9 @@ class TranslationProvider(BaseProvider):
         """
         通用分块翻译模板：切分长文本、逐块调用、按行拼接
 
+        块与块之间检查降级链的时限：整段文本被截成几十块时，逐块请求
+        本身就能跑到分钟级，不检查的话后面的降级引擎和用户取消都失效。
+
         Args:
             text (str): 原始文本
             translate_chunk: 接收单块文本的翻译函数
@@ -71,6 +74,7 @@ class TranslationProvider(BaseProvider):
         """
         results = []
         for chunk in self._chunk_text(text, max_length=max_length):
+            self.check_deadline()
             results.append(translate_chunk(chunk))
         return '\n'.join(results)
 

@@ -21,13 +21,19 @@ import importlib
 import logging
 import pkgutil
 import re
+import time
 
-from .retry_handler import NonRetryableError, default_retry_handler
+from .retry_handler import (
+    ChainExpiredError, NonRetryableError, default_retry_handler)
 
 logger = logging.getLogger('screenshot-translation')
 
 # 带查询串的 URL：签名参数与 access_token 都在这里
 _URL_WITH_QUERY = re.compile(r'(https?://[^\s?]+)\?[^\s"\']*')
+
+# 值得再试一次的 HTTP 状态码：瞬时故障（限流、超时、网关抖动）
+# 其余 4xx 是“请求本身有问题”（密钥无效、额度用尽、参数非法），重试必然重犯
+_RETRYABLE_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504, 507, 509})
 
 
 def redact_url_query(text):
@@ -89,6 +95,96 @@ class ProviderEmptyResultError(NonRetryableError):
     仅用于结果可复现的引擎：同一张图重试必然得到同样结果，等退避只是
     拖长反馈。云端引擎偶发返回空结果可能是限流/抖动，仍保留重试。
     """
+
+
+class ProviderRejectedError(NonRetryableError):
+    """
+    接口明确拒绝本次请求（4xx，除 429/408 这类瞬时码）
+
+    密钥无效、签名过期、额度用尽、参数非法：重试只会再被拒一次，还会把
+    整条降级链的时限吃光，因此直接降级到下一个引擎。
+    """
+
+
+class ProviderUnavailableError(Exception):
+    """
+    接口暂时不可用（5xx / 429 / 网络层失败）：同一引擎再试一次可能就好了
+
+    与 ProviderRejectedError 的区分就是为了保住重试的价值：只有值得重试
+    的错误才占用退避时间。
+    """
+
+
+def raise_for_status(response, prefix='接口'):
+    """
+    按状态码抛可重试/不可重试异常（替代 requests 的 raise_for_status）
+
+    Args:
+        response: requests.Response
+        prefix (str): 日志与错误文案里的接口名
+
+    Raises:
+        ProviderRejectedError: 4xx 明确拒绝
+        ProviderUnavailableError: 5xx / 429 等瞬时故障
+    """
+    status = getattr(response, 'status_code', 0)
+    if 200 <= status < 300:
+        return
+    body = ''
+    try:
+        body = (response.text or '')[:200]
+    except Exception:
+        pass
+    message = f"{prefix}返回 HTTP {status}: {describe_error(body, limit=200)}"
+    if status in _RETRYABLE_STATUS:
+        raise ProviderUnavailableError(message)
+    if 400 <= status < 500:
+        raise ProviderRejectedError(message)
+    raise ProviderUnavailableError(message)
+
+
+def wrap_request_error(error, prefix='接口'):
+    """
+    把 requests 的传输层异常归一为可重试的 ProviderUnavailableError
+
+    连接重置、DNS 抖动、读超时都属于“再试一次有可能成”，同时错误文本
+    要脱敏：requests 的异常串里带着完整请求 URL（含签名与令牌）。
+
+    Args:
+        error: 原始异常
+        prefix (str): 接口名
+
+    Returns:
+        ProviderUnavailableError: 归一后的异常（cause 已挂好，调用方 raise 即可）
+    """
+    wrapped = ProviderUnavailableError(
+        f"{prefix}请求失败: {describe_error(error)}")
+    wrapped.__cause__ = error
+    return wrapped
+
+
+def raise_business_error(prefix, code, message, retryable_codes=()):
+    """
+    接口用业务错误码（HTTP 200 + error_code）表达失败时按码分类抛出
+
+    各家翻译接口的额度用尽、签名错误、语种不支持都混在这一类返回里。
+    只有明确属于“瞬时”的码（频率超限、服务升级中）才值得重试；其余一律
+    立即降级，否则一次密钥填错就要等完整条链的退避。
+
+    Args:
+        prefix (str): 接口名，用于错误文案
+        code: 接口返回的错误码（按字符串比较）
+        message (str): 接口返回的错误描述
+        retryable_codes (iterable): 允许重试的码集合
+
+    Raises:
+        ProviderUnavailableError: code 在 retryable_codes 里
+        ProviderRejectedError: 其余所有码
+    """
+    text = f"{prefix}返回错误 {code}: {message}"
+    if str(code) in {str(c) for c in retryable_codes}:
+        raise ProviderUnavailableError(text)
+    raise ProviderRejectedError(text)
 
 
 class ProviderRegistry:
@@ -209,6 +305,11 @@ class BaseProvider:
     # (字段名, UI显示名, 是否密码框)；字段名同时是对应配置段中的选项名
     config_fields = ()
 
+    # 单次请求的读超时上限（秒）：接口真挂了要的是尽快降级，而不是干等
+    _READ_TIMEOUT = 10
+    # 单次请求的连接超时上限（秒）：连不上基本就是网络/域名问题，等更久无意义
+    _CONNECT_TIMEOUT = 5
+
     def __init__(self, config_manager=None, session=None, timeout=30):
         """
         初始化provider
@@ -216,14 +317,70 @@ class BaseProvider:
         Args:
             config_manager: 配置管理器实例
             session: requests.Session，复用连接；不传则自建
-            timeout (int): 请求超时秒数
+            timeout: 请求超时秒数，或 (连接, 读取) 二元组
         """
         self.config_manager = config_manager
-        self.session = session
         self.timeout = timeout
+        # 自己造的 session 才归自己关：共享 session 属于管理器
+        self._owns_session = session is None
+        self.session = session
         if self.session is None:
             import requests
             self.session = requests.Session()
+        # 本次调用的截止时间戳（time.monotonic 口径），由管理器设置；
+        # None 表示不限。分块翻译逐块检查它，避免长文本把降级链拖成几分钟
+        self.deadline = None
+
+    def close(self):
+        """释放自有连接（共享 session 由管理器统一关闭，不在这里动）"""
+        if self._owns_session and self.session is not None:
+            try:
+                self.session.close()
+            except Exception as e:
+                logger.debug(f"关闭provider连接失败: {e}")
+            self._owns_session = False
+
+    def request_timeout(self, deadline=None):
+        """
+        本次请求实际使用的 (连接, 读取) 超时
+
+        requests 的 timeout 是“每次 socket 操作”的上限而不是整个请求的
+        上限，所以慢接口可以靠不断续命地读下去。这里同时用降级链的剩余
+        预算夹住读取时间：预算只剩 2 秒时，不会再给 10 秒的读超时。
+
+        Args:
+            deadline (float 或 None): time.monotonic() 口径的截止时间
+
+        Returns:
+            tuple(float, float): (连接超时, 读取超时)
+        """
+        connect, read = self._CONNECT_TIMEOUT, self._READ_TIMEOUT
+        if isinstance(self.timeout, (tuple, list)) and len(self.timeout) == 2:
+            connect, read = float(self.timeout[0]), float(self.timeout[1])
+        elif self.timeout:
+            read = float(self.timeout)
+        if deadline is not None:
+            remaining = max(deadline - time.monotonic(), 0.0)
+            connect = min(connect, max(remaining, 0.1))
+            read = min(read, max(remaining, 0.1))
+        return connect, read
+
+    def check_deadline(self):
+        """
+        长文本分块请求之间的时限检查
+
+        一次识别可能截出几十行，逐块请求时每块都有各自的超时；不检查的话
+        光分块循环就能跑几分钟，后面的降级引擎和取消都失效。
+
+        Raises:
+            ChainExpiredError: 管理器设定的截止时间已过
+        """
+        if self.deadline is not None and time.monotonic() >= self.deadline:
+            raise ChainExpiredError("降级链整体时限已用尽")
+
+    def _http_timeout(self):
+        """按当前 deadline 夹取后的 (连接, 读取) 超时，供各 provider 直接传入 requests"""
+        return self.request_timeout(self.deadline)
 
     # ---- 配置读取 ----
 
@@ -345,16 +502,19 @@ class ProviderChainManager:
         """子类可覆盖以指定默认重试器"""
         return default_retry_handler
 
-    def _run_provider(self, provider_factory, call, failure_text, retry_handler=None):
+    def _run_provider(self, provider_factory, call, failure_text, retry_handler=None,
+                      deadline=None, cancel_event=None):
         """
         构造并执行单个provider，自带重试；任何异常都转为失败文本而非抛出，
         保证降级链能继续往下走
 
         Args:
             provider_factory: 零参工厂，返回provider实例
-            call: 接收provider实例的调用，返回结果
+            call: 接收 (provider实例, deadline) 的调用，返回结果
             failure_text: 接收异常(或None)的失败文本生成器
             retry_handler: 重试处理器，缺省用 _default_retry_handler()
+            deadline (float 或 None): 本次调用的截止时间戳；None表示不限
+            cancel_event (threading.Event 或 None): 置位后立刻放弃等待
 
         Returns:
             执行结果或失败文本
@@ -370,11 +530,12 @@ class ProviderChainManager:
             return failure_text(e)
 
         def attempt():
-            return call(provider)
+            return call(provider, deadline)
 
         try:
             return handler.execute_with_retry(
-                attempt, fallback_result=lambda: failure_text(None))
+                attempt, fallback_result=lambda: failure_text(None),
+                deadline=deadline, cancel_event=cancel_event)
         except Exception as e:
             logger.error(f"provider {getattr(provider, 'name', '?')} 执行异常: "
                          f"{describe_error(e)}")

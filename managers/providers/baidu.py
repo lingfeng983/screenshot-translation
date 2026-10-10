@@ -6,7 +6,11 @@
 
 import time
 
-from ..provider_common import make_md5_sign
+import requests
+
+from ..provider_common import (
+    ProviderUnavailableError, describe_error, make_md5_sign,
+    raise_business_error, raise_for_status, wrap_request_error)
 from .base import TranslationProvider
 
 
@@ -22,6 +26,9 @@ class BaiduProvider(TranslationProvider):
 
     # 百度目标语言代码映射
     _target_map = {'zh-TW': 'cht'}
+    # 只有这几个码是瞬时的（并发超限、服务升级/不可用），重试有意义；
+    # 其余（签名错、appid 无效、额度用尽、语种不支持）重试必然重犯
+    _transient_codes = ('54005', '54008', '58000', '58001', '58002')
 
     def translate(self, text, source='auto', target='zh'):
         """
@@ -56,23 +63,39 @@ class BaiduProvider(TranslationProvider):
                 'salt': salt,
                 'sign': make_md5_sign(app_id, chunk, salt, api_key),
             }
-            # 重试由上层统一处理，这里只发起单次请求
-            response = self.session.get(url, params=params, timeout=self.timeout)
-            response.raise_for_status()
+            # 凭证走表单体而不是 URL query：签名与 appid 一旦进了 query,
+            # 就会跟着 requests 的异常文本落到本地日志和各级代理日志里
+            try:
+                response = self.session.post(
+                    url, data=params, timeout=self._http_timeout())
+            except requests.RequestException as e:
+                raise wrap_request_error(e, '百度翻译') from e
 
-            result = response.json()
+            raise_for_status(response, '百度翻译')
+            result = self._parse_json(response)
             # 百度对业务错误同样返回HTTP 200，需显式校验error_code
             if result.get('error_code'):
-                raise Exception(
-                    f"百度翻译返回错误: {result.get('error_code')} {result.get('error_msg', '')}")
+                raise_business_error('百度翻译', result.get('error_code'),
+                                     result.get('error_msg', ''),
+                                     self._transient_codes)
 
             chunk_result = ''.join(
                 item.get('dst', '') for item in result.get('trans_result', []))
             if not chunk_result:
-                raise Exception(f"百度翻译返回空结果: {result}")
+                raise ProviderUnavailableError(f"百度翻译返回空结果: {str(result)[:200]}")
             return chunk_result
 
         return self._translate_chunks(text, translate_chunk, max_length=3000)
+
+    @staticmethod
+    def _parse_json(response):
+        """解析响应JSON：非JSON（如网关返回HTML）按可重试处理"""
+        try:
+            return response.json()
+        except ValueError as e:
+            raise ProviderUnavailableError(
+                f"百度翻译响应不是合法JSON: {describe_error(response.text, limit=120)}"
+            ) from e
 
 
 def register(registry):

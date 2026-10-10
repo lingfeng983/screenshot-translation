@@ -1062,7 +1062,8 @@ def test_ocr_notice_not_translated():
             self.calls = []
 
         def perform_translation(self, text, force_refresh=False,
-                                target_lang=None):
+                                target_lang=None, cancel_event=None,
+                                deadline=None):
             self.calls.append(text)
             return f"[译文]{text}"
 
@@ -1080,7 +1081,8 @@ def test_ocr_notice_not_translated():
     from PIL import Image
 
     class FakeOCR:
-        def perform_ocr_with_blocks(self, image):
+        def perform_ocr_with_blocks(self, image, deadline=None,
+                                    cancel_event=None):
             return "未识别到文字，请重新框选包含文字的区域", []
 
     sm.ocr_manager = FakeOCR()
@@ -1810,7 +1812,8 @@ def test_translate_blocks_parallel():
             self.active = 0
             self.peak = 0
 
-        def perform_translation(self, text, force_refresh=False, target_lang=None):
+        def perform_translation(self, text, force_refresh=False, target_lang=None,
+                                cancel_event=None, deadline=None):
             with self.lock:
                 self.active += 1
                 self.peak = max(self.peak, self.active)
@@ -1851,7 +1854,8 @@ def test_translation_warm_up():
     manager = TranslationManager(None)      # 默认 edge_free（免费接口）
     calls = []
 
-    def fake_perform(text, force_refresh=False, target_lang=None):
+    def fake_perform(text, force_refresh=False, target_lang=None,
+                     cancel_event=None, deadline=None):
         calls.append((text, force_refresh))
         return '[译文]Hello'
 

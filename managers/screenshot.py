@@ -8,6 +8,9 @@
 
 from concurrent import futures
 
+import threading
+import time
+
 from PIL import ImageGrab
 from PyQt5.QtCore import Qt, QRect, QPoint, pyqtSignal
 from PyQt5.QtGui import QPainter, QPen, QColor, QCursor, QPixmap
@@ -26,6 +29,33 @@ from .thread_pool import thread_pool_manager
 import logging
 
 logger = logging.getLogger('screenshot-translation')
+
+
+class _RequestToken:
+    """
+    一次“选区 → 识别 → 翻译”请求的取消信号与整体时限
+
+    后台任务跑完之前用户可能已经关掉遮罩或重画了选区：结果会被序号校验丢弃，
+    但网络请求还在继续烧连接与额度，线程池 worker 也被占着。时限则是因为
+    OCR 与翻译各有自己的重试与降级链，两段各自“合理”加起来就能到分钟级。
+    """
+
+    def __init__(self, budget_seconds):
+        """
+        Args:
+            budget_seconds (float): 本次请求的总时限（秒）
+        """
+        self.cancel_event = threading.Event()
+        self.deadline = time.monotonic() + budget_seconds
+
+    def cancel(self):
+        """标记本次请求不再需要"""
+        self.cancel_event.set()
+
+    @property
+    def cancelled(self):
+        """本次请求是否已被取消"""
+        return self.cancel_event.is_set()
 
 
 def desktop_bounds():
@@ -66,6 +96,9 @@ class ScreenshotManager:
     负责处理截图相关功能
     """
 
+    # 一次“识别+翻译”的总时限（秒）：OCR 与翻译链共用，超了就丢弃后续尝试
+    _REQUEST_BUDGET = 40.0
+
     def __init__(self):
         """
         初始化截图管理器
@@ -77,6 +110,43 @@ class ScreenshotManager:
         self._screenshot_widget = None
         # 最近一次选区，供失败后原地重试
         self._last_request = None
+        # 在途请求的取消令牌：新请求与遮罩关闭都要让旧的立刻收手
+        self._inflight = []
+        self._token_lock = threading.Lock()
+
+    # ---- 在途请求的取消与时限 ----
+
+    def _new_request_token(self):
+        """
+        开始一次新的在途请求，并把此前所有请求标记为取消
+
+        旧请求的结果本来就会因选区序号对不上被丢弃，让它跑完只是白占线程池
+        与网络额度；关遮罩后再按一次快捷键尤其如此。
+
+        Returns:
+            _RequestToken: 本次请求的令牌
+        """
+        token = _RequestToken(self._REQUEST_BUDGET)
+        with self._token_lock:
+            for pending in self._inflight:
+                pending.cancel()
+            self._inflight = [token]
+        return token
+
+    def _finish_request(self, token):
+        """请求跑完（成功或失败）后摘掉令牌，不再对它发取消"""
+        if token is None:
+            return
+        with self._token_lock:
+            self._inflight = [pending for pending in self._inflight
+                              if pending is not token]
+
+    def _cancel_inflight(self):
+        """遮罩关闭：在途的识别与翻译立刻收手"""
+        with self._token_lock:
+            pending, self._inflight = self._inflight, []
+        for token in pending:
+            token.cancel()
 
     def set_config_manager(self, config_manager):
         """
@@ -185,6 +255,8 @@ class ScreenshotManager:
 
     def _release_screenshot_widget(self):
         """关闭并释放截图窗口引用（窗口已被销毁时可安全调用）"""
+        # 遮罩都没了，在途的识别与翻译再无去处，立刻让它们收手
+        self._cancel_inflight()
         widget = self._screenshot_widget
         self._screenshot_widget = None
         self._last_request = None
@@ -214,7 +286,7 @@ class ScreenshotManager:
         target_lang = widget.current_target_lang()
         thread_pool_manager.submit(
             self._process_region, widget, image, region, target_lang, False,
-            widget.current_request_id())
+            widget.current_request_id(), self._new_request_token())
 
     def _on_retry_requested(self):
         """失败后按 R 重试：重走完整链路并跳过翻译缓存"""
@@ -226,7 +298,8 @@ class ScreenshotManager:
         widget.set_result_busy(True)
         thread_pool_manager.submit(
             self._process_region, widget, image, region,
-            widget.current_target_lang(), True, widget.current_request_id())
+            widget.current_target_lang(), True, widget.current_request_id(),
+            self._new_request_token())
 
     def _request_retranslate(self, target_lang, force_refresh):
         """
@@ -242,23 +315,29 @@ class ScreenshotManager:
         payload = widget.current_payload()
         widget.set_result_busy(True)
         thread_pool_manager.submit(
-            self._retranslate, widget, payload, target_lang, force_refresh)
+            self._retranslate, widget, payload, target_lang, force_refresh,
+            self._new_request_token())
 
-    def _retranslate(self, widget, payload, target_lang, force_refresh):
+    def _retranslate(self, widget, payload, target_lang, force_refresh, token=None):
         """在池线程重走翻译链路，完成后回主线程更新结果"""
         updated = dict(payload)
         updated['target_lang'] = self._effective_lang(target_lang)
         try:
             updated['translated_text'] = self._translate_all(
-                payload['original_text'], target_lang, force_refresh)
+                payload['original_text'], target_lang, force_refresh, token)
             # 把整段译文传给行级对齐：重译（跳过缓存）时不再重复请求同一段文本
             updated['block_texts'] = self._translate_blocks(
                 payload['blocks'], payload['original_text'], target_lang,
-                force_refresh, whole=updated['translated_text'])
+                force_refresh, whole=updated['translated_text'], token=token)
             updated['error'] = None
         except Exception as e:
             logger.error(f"重新翻译失败: {e}")
             updated['error'] = str(e)
+        finally:
+            self._finish_request(token)
+        if token is not None and token.cancelled:
+            logger.info("请求已被取消，不回投重译结果")
+            return
         qt_dispatcher.dispatch_to_main_thread(self._apply_result, widget, updated)
 
     def _apply_result(self, widget, payload):
@@ -275,7 +354,7 @@ class ScreenshotManager:
             widget.show_result(payload)
 
     def _process_region(self, widget, image, region, target_lang, force_refresh,
-                        request_id=None):
+                        request_id=None, token=None):
         """
         在池线程完成识别与翻译，任何异常都转成失败提示回投主线程
 
@@ -286,6 +365,7 @@ class ScreenshotManager:
             target_lang (str 或 None): 目标语言，None 用全局配置
             force_refresh (bool): 是否跳过翻译缓存
             request_id (int 或 None): 发起请求时的选区序号
+            token (_RequestToken 或 None): 本次请求的取消/时限令牌
         """
         payload = {
             'original_text': '', 'translated_text': '', 'blocks': [],
@@ -295,7 +375,7 @@ class ScreenshotManager:
             'request_id': request_id, 'error': None,
         }
         try:
-            original_text, blocks = self._recognize(image)
+            original_text, blocks = self._recognize(image, token)
             payload['original_text'] = original_text
             payload['blocks'] = blocks
             # OCR 降级提示（图里没字/引擎不可用）是给用户看的话，不是原文：
@@ -304,47 +384,65 @@ class ScreenshotManager:
                 qt_dispatcher.dispatch_to_main_thread(
                     self._apply_result, widget, payload)
                 return
+            if token is not None and token.cancelled:
+                logger.info("遮罩已关闭，放弃本次识别结果的后半段流程")
+                return
             payload['translated_text'] = self._translate_all(
-                original_text, target_lang, force_refresh)
+                original_text, target_lang, force_refresh, token)
             payload['block_texts'] = self._translate_blocks(
                 blocks, original_text, target_lang, force_refresh,
-                whole=payload['translated_text'])
+                whole=payload['translated_text'], token=token)
         except Exception as e:
             from .error_handler import error_handler
             error_handler.handle_error(e, "截图处理")
             payload['error'] = str(e)
+        finally:
+            self._finish_request(token)
 
+        if token is not None and token.cancelled:
+            logger.info("请求已被取消，不回投结果")
+            return
         qt_dispatcher.dispatch_to_main_thread(self._apply_result, widget, payload)
 
-    def _recognize(self, image):
+    def _recognize(self, image, token=None):
         """
         识别选区：优先拿带坐标的行块
 
         Args:
             image (PIL.Image.Image): 选区图像
+            token (_RequestToken 或 None): 本次请求的取消/时限令牌
 
         Returns:
             tuple[str, list[TextBlock]]: (整段文本, 行块列表)
         """
         if self.ocr_manager is None:
             return '[未初始化OCR管理器]', []
-        text, blocks = self.ocr_manager.perform_ocr_with_blocks(image)
+        deadline = token.deadline if token is not None else None
+        cancel_event = token.cancel_event if token is not None else None
+        text, blocks = self.ocr_manager.perform_ocr_with_blocks(
+            image, deadline, cancel_event)
         logger.info(f"OCR完成：{len(text)} 字符，{len(blocks)} 行块")
         return text, blocks
 
-    def _translate_all(self, text, target_lang, force_refresh=False):
+    def _translate_all(self, text, target_lang, force_refresh=False, token=None):
         """翻译整段文本，失败时返回空串而不抛出"""
         if self.translation_manager is None or not (text or '').strip():
             return ''
         try:
+            kwargs = {}
+            if token is not None:
+                # 共用同一条链的时限与取消信号：逐块并发翻译时不会各等各的
+                kwargs['cancel_event'] = token.cancel_event
+                kwargs['deadline'] = token.deadline
             return self.translation_manager.perform_translation(
-                text, force_refresh=force_refresh, target_lang=target_lang)
+                text, force_refresh=force_refresh, target_lang=target_lang,
+                **kwargs)
         except Exception as e:
             logger.error(f"翻译失败: {e}")
             return ''
 
     def _translate_blocks(self, blocks, full_text, target_lang, force_refresh=False,
-                          whole=None):
+                          whole=None, token=None):
         """
         行级译文：整段一次请求后按行对齐，对不齐时逐块请求兜底
 
@@ -354,6 +452,7 @@ class ScreenshotManager:
             target_lang (str 或 None): 目标语言
             force_refresh (bool): 是否跳过翻译缓存
             whole (str 或 None): 已算好的整段译文；None 时自行请求
+            token (_RequestToken 或 None): 本次请求的取消/时限令牌
 
         Returns:
             list[str]: 与 blocks 等长的译文；拿不到对齐结果时返回[]
@@ -362,7 +461,7 @@ class ScreenshotManager:
             return []
 
         if whole is None:
-            whole = self._translate_all(full_text, target_lang, force_refresh)
+            whole = self._translate_all(full_text, target_lang, force_refresh, token)
         lines = [line.strip() for line in (whole or '').splitlines() if line.strip()]
         if len(lines) == len(blocks):
             return lines
@@ -373,9 +472,9 @@ class ScreenshotManager:
             return []
 
         logger.info(f"译文行数 {len(lines)} 与块数 {len(blocks)} 不符，改为逐块翻译")
-        return self._translate_blocks_parallel(blocks, target_lang, force_refresh)
+        return self._translate_blocks_parallel(blocks, target_lang, force_refresh, token)
 
-    def _translate_blocks_parallel(self, blocks, target_lang, force_refresh):
+    def _translate_blocks_parallel(self, blocks, target_lang, force_refresh, token=None):
         """
         逐块翻译并发执行（返回值与 blocks 等长，顺序不变）
 
@@ -388,6 +487,7 @@ class ScreenshotManager:
             blocks (list[TextBlock]): 行块列表
             target_lang (str 或 None): 目标语言
             force_refresh (bool): 是否跳过翻译缓存
+            token (_RequestToken 或 None): 本次请求的取消/时限令牌
 
         Returns:
             list[str]: 与 blocks 等长的译文；单块失败时为对应的空串
@@ -397,8 +497,10 @@ class ScreenshotManager:
 
         def translate(block):
             """单块翻译：失败只影响这一块，不拖垮整次结果"""
+            if token is not None and token.cancelled:
+                return ''
             try:
-                return self._translate_all(block.text, target_lang, force_refresh)
+                return self._translate_all(block.text, target_lang, force_refresh, token)
             except Exception as e:
                 logger.warning(f"行块翻译失败: {e}")
                 return ''

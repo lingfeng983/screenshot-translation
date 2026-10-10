@@ -4,6 +4,11 @@
 必应翻译提供者（Azure Translator，需要API密钥）
 """
 
+import requests
+
+from ..provider_common import (
+    ProviderUnavailableError, describe_error, raise_for_status,
+    wrap_request_error)
 from .base import TranslationProvider
 
 
@@ -41,20 +46,35 @@ class BingProvider(TranslationProvider):
         def translate_chunk(chunk):
             """翻译单个文本块"""
             data = [{'text': chunk}]
-            response = self.session.post(
-                url, headers=headers, params=params, json=data, timeout=self.timeout)
-            response.raise_for_status()
+            try:
+                response = self.session.post(
+                    url, headers=headers, params=params, json=data,
+                    timeout=self._http_timeout())
+            except requests.RequestException as e:
+                raise wrap_request_error(e, '必应翻译') from e
 
-            result = response.json()
+            raise_for_status(response, '必应翻译')
+            result = self._parse_json(response)
             # 必应业务错误可能返回 200 + dict（如 {"error": {...}}），需先校验结构
             if not result or not isinstance(result, list):
-                raise Exception(f"必应翻译返回结构异常: {result}")
+                raise ProviderUnavailableError(f"必应翻译返回结构异常: {str(result)[:200]}")
             translations = result[0].get('translations') if isinstance(result[0], dict) else None
             if not translations:
-                raise Exception(f"必应翻译返回空结果: {result}")
+                raise ProviderUnavailableError(
+                    f"必应翻译返回空结果: {str(result)[:200]}")
             return translations[0].get('text', '')
 
         return self._translate_chunks(text, translate_chunk)
+
+    @staticmethod
+    def _parse_json(response):
+        """解析响应JSON：非JSON（如网关返回HTML）按可重试处理"""
+        try:
+            return response.json()
+        except ValueError as e:
+            raise ProviderUnavailableError(
+                f"必应翻译响应不是合法JSON: {describe_error(response.text, limit=120)}"
+            ) from e
 
 
 def register(registry):

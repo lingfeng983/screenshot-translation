@@ -6,7 +6,11 @@
 
 import time
 
-from ..provider_common import make_md5_sign
+import requests
+
+from ..provider_common import (
+    ProviderUnavailableError, describe_error, make_md5_sign,
+    raise_business_error, raise_for_status, wrap_request_error)
 from .base import TranslationProvider
 
 
@@ -22,6 +26,9 @@ class YoudaoProvider(TranslationProvider):
 
     # 有道目标语言代码映射
     _target_map = {'zh': 'zh-CHS', 'zh-TW': 'zh-CHT'}
+    # 105=频率超限、200=译文为空：这两个重试有意义；其余（密钥无效、
+    # 未付费、账户欠费、文本过长）重试必然重犯
+    _transient_codes = ('105', '200')
 
     def translate(self, text, source='auto', target='zh'):
         """
@@ -56,22 +63,40 @@ class YoudaoProvider(TranslationProvider):
                 'salt': salt,
                 'sign': make_md5_sign(app_id, chunk, salt, api_key),
             }
-            # 重试由上层统一处理，这里只发起单次请求
-            response = self.session.get(url, params=params, timeout=self.timeout)
-            response.raise_for_status()
+            # 凭证走表单体：GET + query 会把 appKey 与 sign 暴露在
+            # 异常文本、日志和各级代理的访问日志里
+            try:
+                response = self.session.post(
+                    url, data=params, timeout=self._http_timeout())
+            except requests.RequestException as e:
+                raise wrap_request_error(e, '有道翻译') from e
 
-            result = response.json()
+            raise_for_status(response, '有道翻译')
+            result = self._parse_json(response)
             # 有道用errorCode标识业务错误，'0'表示成功
             error_code = str(result.get('errorCode', '0'))
             if error_code != '0':
-                raise Exception(f"有道翻译返回错误: {error_code}")
+                raise_business_error('有道翻译', error_code,
+                                     result.get('errorMsg', ''),
+                                     self._transient_codes)
 
             chunk_result = (result.get('translation') or [''])[0]
             if not chunk_result:
-                raise Exception(f"有道翻译返回空结果: {result}")
+                raise ProviderUnavailableError(
+                    f"有道翻译返回空结果: {str(result)[:200]}")
             return chunk_result
 
         return self._translate_chunks(text, translate_chunk, max_length=3000)
+
+    @staticmethod
+    def _parse_json(response):
+        """解析响应JSON：非JSON（如网关返回HTML）按可重试处理"""
+        try:
+            return response.json()
+        except ValueError as e:
+            raise ProviderUnavailableError(
+                f"有道翻译响应不是合法JSON: {describe_error(response.text, limit=120)}"
+            ) from e
 
 
 def register(registry):

@@ -10,6 +10,7 @@ OCR管理器
 
 import logging
 import threading
+import time
 
 from .error_handler import error_handler
 from .ocr_providers import ocr_provider_registry
@@ -141,7 +142,7 @@ class OCRManager(ProviderChainManager):
         self.ocr_type = ocr_type
         logger.info(f"OCR引擎已设置为: {ocr_type}")
 
-    def perform_ocr(self, image):
+    def perform_ocr(self, image, deadline=None, cancel_event=None):
         """
         对图像执行OCR识别（带重试与降级）
 
@@ -150,6 +151,8 @@ class OCRManager(ProviderChainManager):
 
         Args:
             image (PIL.Image.Image): 待识别的图像
+            deadline (float 或 None): 本次识别的整体截止时间戳
+            cancel_event (threading.Event 或 None): 置位后不再发起后续尝试
 
         Returns:
             str: 识别出的文本；全部失败时返回错误提示文本
@@ -158,19 +161,22 @@ class OCRManager(ProviderChainManager):
         if provider_cls is None:
             return f"{_OCR_FAIL_PREFIX}: 无可用OCR引擎]"
 
-        result = self._recognize_via(provider_cls, image)
+        result = self._recognize_via(provider_cls, image, deadline=deadline,
+                                     cancel_event=cancel_event)
 
         # 1) 当前引擎失败时，尝试本地Tesseract兜底
-        if self._is_failure(result):
+        if self._is_failure(result) and self._chain_open(deadline, cancel_event):
             fallback_cls = ocr_provider_registry.get('tesseract')
             if fallback_cls is not None and fallback_cls is not provider_cls:
                 logger.warning("当前OCR引擎失败，尝试本地Tesseract")
-                fallback_result = self._recognize_via(fallback_cls, image)
+                fallback_result = self._recognize_via(
+                    fallback_cls, image, deadline=deadline,
+                    cancel_event=cancel_event)
                 if not self._is_failure(fallback_result):
                     return fallback_result
 
         # 2) 最后兜底：模拟OCR，保证流程不中断
-        if self._is_failure(result):
+        if self._is_failure(result) and self._chain_open(deadline, cancel_event):
             if isinstance(self._last_error, ProviderEmptyResultError):
                 # 引擎都跑通了、只是这张图里没文字：给可行动的提示，
                 # 否则用户看到"OCR识别不可用，请检查配置"会以为配置坏了
@@ -179,13 +185,22 @@ class OCRManager(ProviderChainManager):
             mock_cls = ocr_provider_registry.get('mock')
             if mock_cls is not None:
                 logger.warning("所有OCR引擎均失败，降级为模拟OCR")
-                mock_result = self._recognize_via(mock_cls, image)
+                mock_result = self._recognize_via(
+                    mock_cls, image, deadline=deadline,
+                    cancel_event=cancel_event)
                 if not self._is_failure(mock_result):
                     return mock_result
 
         return result
 
-    def perform_ocr_with_blocks(self, image):
+    @staticmethod
+    def _chain_open(deadline, cancel_event):
+        """降级链是否还值得继续往下走（时间还在、用户也没取消）"""
+        if cancel_event is not None and cancel_event.is_set():
+            return False
+        return deadline is None or time.monotonic() < deadline
+
+    def perform_ocr_with_blocks(self, image, deadline=None, cancel_event=None):
         """
         一次识别同时拿到整段文本与带坐标的行块
 
@@ -195,12 +210,14 @@ class OCRManager(ProviderChainManager):
 
         Args:
             image (PIL.Image.Image): 待识别的图像
+            deadline (float 或 None): 本次识别的整体截止时间戳
+            cancel_event (threading.Event 或 None): 置位后不再发起后续尝试
 
         Returns:
             tuple[str, list[TextBlock]]: (整段文本, 行块列表)
         """
         self._last_error = None
-        blocks = self._perform_ocr_blocks(image)
+        blocks = self._perform_ocr_blocks(image, deadline, cancel_event)
         if blocks:
             text = '\n'.join(block.text for block in blocks)
             if text.strip():
@@ -211,7 +228,7 @@ class OCRManager(ProviderChainManager):
         if self._empty_result_is_final():
             logger.info("当前引擎未识别到文字且结果确定，跳过重复识别")
             return NO_TEXT_NOTICE, []
-        return self.perform_ocr(image), []
+        return self.perform_ocr(image, deadline, cancel_event), []
 
     def _empty_result_is_final(self):
         """
@@ -229,12 +246,14 @@ class OCRManager(ProviderChainManager):
         provider_cls = self._last_error_provider or self._resolve_provider(self.ocr_type)
         return bool(getattr(provider_cls, 'deterministic_results', False))
 
-    def _perform_ocr_blocks(self, image):
+    def _perform_ocr_blocks(self, image, deadline=None, cancel_event=None):
         """
         块级识别降级链：当前引擎 -> 本地Tesseract
 
         Args:
             image (PIL.Image.Image): 待识别的图像
+            deadline (float 或 None): 整条识别链共用的截止时间戳
+            cancel_event (threading.Event 或 None): 置位后不再发起后续尝试
 
         Returns:
             list[TextBlock]: 行块列表；无可用坐标时为空列表
@@ -243,21 +262,29 @@ class OCRManager(ProviderChainManager):
         if provider_cls is None:
             return []
 
-        blocks = self._recognize_blocks_via(provider_cls, image)
+        blocks = self._recognize_blocks_via(provider_cls, image, deadline,
+                                            cancel_event)
         if not blocks:
             fallback_cls = ocr_provider_registry.get('tesseract')
             if fallback_cls is not None and fallback_cls is not provider_cls:
+                if not self._chain_open(deadline, cancel_event):
+                    logger.warning("识别链时限已用尽，跳过本地Tesseract兜底")
+                    return []
                 logger.warning("当前OCR引擎拿不到块级坐标，尝试本地Tesseract")
-                blocks = self._recognize_blocks_via(fallback_cls, image)
+                blocks = self._recognize_blocks_via(
+                    fallback_cls, image, deadline, cancel_event)
         return blocks
 
-    def _recognize_blocks_via(self, provider_cls, image):
+    def _recognize_blocks_via(self, provider_cls, image, deadline=None,
+                              cancel_event=None):
         """
         通过指定provider做块级识别；任何失败返回空列表而不是抛异常
 
         Args:
             provider_cls: OCR provider类
             image (PIL.Image.Image): 待识别的图像
+            deadline (float 或 None): 整条识别链共用的截止时间戳
+            cancel_event (threading.Event 或 None): 置位后不再重试
 
         Returns:
             list[TextBlock]: 行块列表或空列表
@@ -265,7 +292,7 @@ class OCRManager(ProviderChainManager):
         def factory():
             return self._get_provider(provider_cls)
 
-        def call(provider):
+        def call(provider, deadline=None):
             try:
                 return provider.recognize_blocks(image)
             except Exception as e:
@@ -277,10 +304,13 @@ class OCRManager(ProviderChainManager):
 
         self._last_error = None
         self._last_error_provider = None
-        result = self._run_provider(factory, call, lambda err: None)
+        result = self._run_provider(factory, call, lambda err: None,
+                                    deadline=deadline,
+                                    cancel_event=cancel_event)
         return result if isinstance(result, list) else []
 
-    def _recognize_via(self, provider_cls, image, retry_handler=None):
+    def _recognize_via(self, provider_cls, image, retry_handler=None,
+                       deadline=None, cancel_event=None):
         """
         通过指定provider识别，自带重试；失败返回错误文本而非抛异常，
         保证降级链能继续往下走（由公共基类的 _run_provider 实现）
@@ -289,6 +319,8 @@ class OCRManager(ProviderChainManager):
             provider_cls: OCR provider类
             image (PIL.Image.Image): 待识别的图像
             retry_handler: 重试处理器，缺省用OCR重试器（见 _default_retry_handler）
+            deadline (float 或 None): 本次识别的整体截止时间戳
+            cancel_event (threading.Event 或 None): 置位后不再重试
 
         Returns:
             str: 识别出的文本，彻底失败时返回 [OCR识别失败...] 文本
@@ -296,7 +328,7 @@ class OCRManager(ProviderChainManager):
         def factory():
             return self._get_provider(provider_cls)
 
-        def call(provider):
+        def call(provider, deadline=None):
             try:
                 return provider.recognize(image)
             except Exception as e:
@@ -312,7 +344,8 @@ class OCRManager(ProviderChainManager):
             return f"{_OCR_FAIL_PREFIX}: {provider_cls.display_name}]"
 
         self._last_error = None
-        return self._run_provider(factory, call, failure_text, retry_handler)
+        return self._run_provider(factory, call, failure_text, retry_handler,
+                                  deadline=deadline, cancel_event=cancel_event)
 
     def get_available_languages(self):
         """

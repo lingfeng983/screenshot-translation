@@ -9,6 +9,7 @@
 """
 
 import logging
+import time
 
 import requests
 
@@ -38,6 +39,16 @@ class TranslationManager(ProviderChainManager):
     _default_provider_name = 'edge_free'
     _failure_prefix = '[翻译失败'
 
+    # 配置API全挂时依次尝试的免密钥接口（顺序即优先级）
+    _FREE_FALLBACKS = ('edge_free', 'google_free')
+    # 单次请求的 (连接, 读取) 超时：requests 的超时是按每次 socket 操作算的，
+    # 单个数字（原来 30 秒）配上重试与四级降级最坏能等到几分钟
+    _CONNECT_TIMEOUT = 5
+    _READ_TIMEOUT = 10
+    # 一次 perform_translation 的整体时限（含重试、退避与所有降级阶段）：
+    # 超过就把剩下的引擎全部跳过，直接给用户失败文本
+    _CHAIN_DEADLINE = 25.0
+
     def _default_retry_handler(self):
         """
         默认重试器：翻译链统一的轻量策略
@@ -61,9 +72,13 @@ class TranslationManager(ProviderChainManager):
         self.api_type = 'edge_free'     # 默认使用Edge免费翻译（微软翻译，国内可直连）
         self.fallback_api_type = ''     # 主API失败后的降级API（空为不降级）
         self.target_lang = 'zh'         # 目标语言
-        self.timeout = 30  # 30秒超时
+        # (连接, 读取) 分开限时：连不上很快放弃，读取给足慢接口的时间
+        self.timeout = (self._CONNECT_TIMEOUT, self._READ_TIMEOUT)
+        # 单次翻译（含降级与重试）的整体时限；调用方传入 deadline 时以它为准
+        self.chain_deadline = self._CHAIN_DEADLINE
         # 复用连接，避免每次请求重建 TCP+TLS
         self.session = requests.Session()
+        self._closed = False
 
         # 加载配置
         if config_manager:
@@ -143,7 +158,8 @@ class TranslationManager(ProviderChainManager):
         """获取支持的目标语言列表，供UI使用"""
         return TARGET_LANGUAGES
 
-    def perform_translation(self, text, force_refresh=False, target_lang=None):
+    def perform_translation(self, text, force_refresh=False, target_lang=None,
+                            cancel_event=None, deadline=None):
         """
         执行翻译（带缓存支持）
 
@@ -151,6 +167,10 @@ class TranslationManager(ProviderChainManager):
             text (str): 要翻译的文本
             force_refresh (bool): 为True时跳过缓存重新翻译（结果仍会写回缓存）
             target_lang (str): 本次翻译的目标语言；None时使用全局配置
+            cancel_event (threading.Event 或 None): 用户已经不等了（关遮罩、
+                重画选区）时置位，链路立刻收手，不再重试也不再往下降级
+            deadline (float 或 None): 整体截止时间戳；逐块并发翻译时由调用方
+                传入同一个时限，None时按本类的链时限自算
 
         Returns:
             str: 翻译后的文本
@@ -160,93 +180,186 @@ class TranslationManager(ProviderChainManager):
         if not text or not text.strip():
             return ""
 
+        if deadline is None:
+            deadline = time.monotonic() + self.chain_deadline
+
         logger.info(f"开始翻译，API类型: {self.api_type}，目标语言: {effective_target}，"
                     f"强制刷新: {force_refresh}")
 
         # 检查缓存（强制刷新时跳过）
         if not force_refresh:
             cached_result = self._get_cached(text, effective_target)
-            if cached_result:
+            if cached_result is not None:
                 logger.info("使用缓存的翻译结果")
                 return cached_result
 
         try:
-            result = self._dispatch_translation(text, effective_target)
+            result, serving_api = self._dispatch_with_serving(
+                text, effective_target, deadline=deadline,
+                cancel_event=cancel_event)
 
-            # 缓存结果
-            if result and not result.startswith('[翻译失败]'):
-                cache_manager.cache_translation(
-                    text, self._cache_key_api(effective_target), result)
+            # 缓存按“真正出译文的引擎”记账：记在配置引擎名下，兜底引擎的
+            # 译文就会顶着主引擎的名字被长期复用，换了密钥也看不出来
+            if result and not self._is_failure(result):
+                self._cache_result(
+                    text, serving_api or self.api_type, effective_target, result)
 
             return result
 
         except Exception as e:
-            logger.error(f"翻译失败: {e}")
-            import traceback
-            traceback.print_exc()
+            # 这段跑在线程池里：print_exc 只会打到 stderr（打包后连控制台
+            # 都没有），必须进日志才查得到
+            logger.exception(f"翻译失败: {e}")
             return error_handler.handle_translation_error(e)
 
-    def _cache_key_api(self, target_lang=None):
-        """缓存键使用的API标识，包含目标语言避免不同语言结果混淆"""
-        return f"{self.api_type}:{target_lang or self.target_lang}"
+    def close(self):
+        """释放复用的连接池（退出清理时调用，可重复调用）"""
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self.session.close()
+        except Exception as e:
+            logger.debug(f"关闭翻译连接池失败: {e}")
+
+    # ---- 缓存 ----
+
+    def _cache_names(self):
+        """
+        本次降级链可能出译文的引擎名（按优先级去重）
+
+        写入按实际服务的引擎命名，读取就得沿同一条链查一遍：否则主引擎
+        坏掉期间同一句话每次都 miss、每次都重跑整条链，纯属浪费。
+
+        Returns:
+            list[str]: 引擎名列表，顺序与降级链一致
+        """
+        names = []
+        for name in (self.api_type, self.fallback_api_type,
+                     *self._FREE_FALLBACKS):
+            if not name or name in names:
+                continue
+            if provider_registry.get(name) is None:
+                continue
+            names.append(name)
+        return names or [self.api_type]
+
+    @staticmethod
+    def _cache_key(api_name, target_lang):
+        """缓存键里的API标识：引擎名 + 目标语言，避免不同语言结果混淆"""
+        return f"{api_name}:{target_lang}"
 
     def _get_cached(self, text, target_lang=None):
-        """按当前API与目标语言查询缓存"""
+        """沿降级链的引擎名依次查缓存，返回第一个命中的译文"""
+        lang = target_lang or self.target_lang
         try:
-            return cache_manager.get_cached_translation(
-                text, self._cache_key_api(target_lang))
+            for name in self._cache_names():
+                cached = cache_manager.get_cached_translation(
+                    text, self._cache_key(name, lang))
+                if cached is not None:
+                    return cached
         except Exception as e:
             logger.warning(f"读取缓存失败: {e}")
-            return None
+        return None
 
-    def _dispatch_translation(self, text, target_lang=None):
+    def _cache_result(self, text, api_name, target_lang, result):
+        """把译文写回缓存；写失败只记日志，不影响本次结果"""
+        try:
+            cache_manager.cache_translation(
+                text, self._cache_key(api_name, target_lang), result)
+        except Exception as e:
+            logger.warning(f"写入缓存失败: {e}")
+
+    # ---- 降级链 ----
+
+    @staticmethod
+    def _chain_open(deadline, cancel_event):
+        """降级链是否还值得继续（时限未到，用户也没取消）"""
+        if cancel_event is not None and cancel_event.is_set():
+            return False
+        return deadline is None or time.monotonic() < deadline
+
+    def _dispatch_translation(self, text, target_lang=None, deadline=None,
+                              cancel_event=None):
         """
-        按当前API类型分发翻译，失败时按降级链依次尝试：
-        主API(带重试) -> 配置的降级API(轻量重试) -> Edge/谷歌免费翻译(兜底)
+        按当前API类型分发翻译，只关心译文文本
 
         Args:
             text (str): 要翻译的文本
             target_lang (str): 目标语言；None时使用全局配置
+            deadline (float 或 None): 整体截止时间戳；None时自行按链时限计算
+            cancel_event (threading.Event 或 None): 取消信号
 
         Returns:
             str: 翻译后的文本，全部失败时返回 [翻译失败] 前缀文本
         """
+        return self._dispatch_with_serving(
+            text, target_lang, deadline, cancel_event)[0]
+
+    def _dispatch_with_serving(self, text, target_lang=None, deadline=None,
+                               cancel_event=None):
+        """
+        分发翻译，失败时按降级链依次尝试：
+        主API(带重试) -> 配置的降级API(轻量重试) -> Edge/谷歌免费翻译(兜底)
+
+        整条链共用一个时限：四级降级 × 每级两次尝试 × 读超时，最坏能等到
+        几分钟，而用户的耐心是以秒计的；到点就直接返回失败文本。
+
+        Args:
+            text (str): 要翻译的文本
+            target_lang (str): 目标语言；None时使用全局配置
+            deadline (float 或 None): 整体截止时间戳；None时按链时限自算
+            cancel_event (threading.Event 或 None): 取消信号
+
+        Returns:
+            tuple(str, str 或 None): (译文或失败文本, 实际出译文的引擎名)
+        """
         effective_target = target_lang or self.target_lang
+        if deadline is None:
+            deadline = time.monotonic() + self.chain_deadline
 
         provider_cls = self._resolve_provider(self.api_type)
         if provider_cls is None:
-            return f"{self._failure_prefix}] {text}"
+            return f"{self._failure_prefix}] {text}", None
 
-        result = self._translate_via(
-            provider_cls, text, target_lang=effective_target)
+        result, served = self._translate_via(
+            provider_cls, text, target_lang=effective_target,
+            deadline=deadline, cancel_event=cancel_event)
+        if served is not None:
+            return result, served
 
         # 1) 主API彻底失败时，先尝试配置的降级API
-        if self._is_failure(result) and self.fallback_api_type:
+        if self.fallback_api_type and self._chain_open(deadline, cancel_event):
             fallback_cls = provider_registry.get(self.fallback_api_type)
             if fallback_cls is not None and fallback_cls is not provider_cls:
                 logger.warning(f"主API失败，尝试降级API: {self.fallback_api_type}")
-                fallback_result = self._translate_via(
+                result, served = self._translate_via(
                     fallback_cls, text, target_lang=effective_target,
-                    retry_handler=translation_retry_handler)
-                if not self._is_failure(fallback_result):
-                    return fallback_result
+                    retry_handler=translation_retry_handler,
+                    deadline=deadline, cancel_event=cancel_event)
+                if served is not None:
+                    return result, served
 
         # 2) 最后兜底：依次尝试免密钥的免费接口（Edge国内可直连，Google质量更好）
-        if self._is_failure(result):
-            for free_name in ('edge_free', 'google_free'):
-                free_cls = provider_registry.get(free_name)
-                if free_cls is None or free_cls is provider_cls:
-                    continue
-                logger.warning(f"所有配置API均失败，兜底尝试免费接口: {free_name}")
-                free_result = self._translate_via(
-                    free_cls, text, target_lang=effective_target,
-                    retry_handler=translation_retry_handler)
-                if not self._is_failure(free_result):
-                    return free_result
+        for free_name in self._FREE_FALLBACKS:
+            if not self._chain_open(deadline, cancel_event):
+                logger.warning("翻译链时限已用尽或被取消，跳过剩余兜底接口")
+                break
+            free_cls = provider_registry.get(free_name)
+            if free_cls is None or free_cls is provider_cls:
+                continue
+            logger.warning(f"所有配置API均失败，兜底尝试免费接口: {free_name}")
+            result, served = self._translate_via(
+                free_cls, text, target_lang=effective_target,
+                retry_handler=translation_retry_handler,
+                deadline=deadline, cancel_event=cancel_event)
+            if served is not None:
+                return result, served
 
-        return result
+        return result, None
 
-    def _translate_via(self, provider_cls, text, target_lang=None, retry_handler=None):
+    def _translate_via(self, provider_cls, text, target_lang=None,
+                       retry_handler=None, deadline=None, cancel_event=None):
         """
         通过指定provider翻译，自带重试；失败返回错误文本而非抛异常，
         保证降级链能继续往下走（由公共基类的 _run_provider 实现）
@@ -256,26 +369,34 @@ class TranslationManager(ProviderChainManager):
             text (str): 要翻译的文本
             target_lang (str): 目标语言；None时使用全局配置
             retry_handler: 重试处理器，缺省用主重试器（见 _default_retry_handler）
+            deadline (float 或 None): 整条链的截止时间戳，用于夹单次请求超时
+                与分块循环
+            cancel_event (threading.Event 或 None): 取消信号
 
         Returns:
-            str: 翻译后的文本，彻底失败时返回 [翻译失败] 前缀文本
+            tuple(str, str 或 None): (译文或失败文本, 成功时的引擎名)
         """
         effective_target = target_lang or self.target_lang
 
         def factory():
-            return provider_cls(
+            provider = provider_cls(
                 config_manager=self.config_manager,
                 session=self.session,
                 timeout=self.timeout,
             )
+            # 长文本会分块逐次请求，块循环靠这个时限提前收手
+            provider.deadline = deadline
+            return provider
 
-        def call(provider):
+        def call(provider, deadline=None):
             return provider.translate(text, source='auto', target=effective_target)
 
         def failure_text(err):
             return f"{self._failure_prefix}] {text}"
 
-        return self._run_provider(factory, call, failure_text, retry_handler)
+        result = self._run_provider(factory, call, failure_text, retry_handler,
+                                    deadline=deadline, cancel_event=cancel_event)
+        return result, (provider_cls.name if not self._is_failure(result) else None)
 
     def test_translation(self, text="Hello, world!"):
         """

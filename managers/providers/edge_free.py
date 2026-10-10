@@ -10,11 +10,10 @@ Edge 免费翻译提供者（微软翻译，国内可直连，无需API密钥）
 注意：此为 Edge 前端使用的非公开端点，上层已内置重试与降级机制。
 """
 
-import logging
+import requests
 
+from ..provider_common import ProviderUnavailableError, raise_for_status, wrap_request_error
 from .base import TranslationProvider
-
-logger = logging.getLogger('screenshot-translation')
 
 ENDPOINT = 'https://edge.microsoft.com/translate/translatetext'
 
@@ -44,10 +43,9 @@ class EdgeFreeProvider(TranslationProvider):
         Returns:
             str: 翻译后的文本
         """
-        results = []
-        for chunk in self._chunk_text(text):
-            results.append(self._translate_chunk(chunk, source, target))
-        return '\n'.join(results)
+        return self._translate_chunks(
+            text, lambda chunk: self._translate_chunk(chunk, source, target),
+            max_length=9000)
 
     def _translate_chunk(self, text, source, target):
         """翻译单个文本块"""
@@ -63,22 +61,20 @@ class EdgeFreeProvider(TranslationProvider):
             response = self.session.post(
                 url,
                 json=[text],  # body 必须是字符串数组
-                timeout=self.timeout,
+                timeout=self._http_timeout(),
                 headers={'Content-Type': 'application/json'},
             )
-            response.raise_for_status()
+        except requests.RequestException as e:
+            # 传输层失败一律可重试：换 IP、重连都可能好
+            raise wrap_request_error(e, 'Edge免费翻译') from e
 
-            data = response.json()
-            translated = self._extract_text(data)
-            if not translated:
-                raise Exception(f"Edge翻译返回空结果: {str(data)[:200]}")
-            return translated
+        raise_for_status(response, 'Edge免费翻译')
 
-        except Exception as e:
-            if isinstance(e, Exception) and 'Edge翻译返回空结果' in str(e):
-                raise
-            logger.error(f"Edge免费翻译请求失败: {e}")
-            raise Exception(f"Edge免费翻译请求失败: {e}") from e
+        data = response.json()
+        translated = self._extract_text(data)
+        if not translated:
+            raise ProviderUnavailableError(f"Edge翻译返回空结果: {str(data)[:200]}")
+        return translated
 
     @staticmethod
     def _extract_text(data):
