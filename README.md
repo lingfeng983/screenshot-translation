@@ -32,7 +32,7 @@ pip install -r requirements.txt
 copy config.example.ini config.ini
 
 # 4. 下载 OCR 组件（Tesseract 运行最小集，约85MB，不入仓库，走 Release 附件）
-python scripts/setup_ocr.py
+python scripts/setup_ocr.py --release v1.3.0
 
 # 5. 启动
 python main.py
@@ -40,7 +40,8 @@ python main.py
 
 > **OCR 组件分发方式**：仓库只保留源码；Tesseract 运行最小集（约 85MB）以
 > `ocr-components.zip.00N` 附件形式发布在 Gitee [Releases](https://gitee.com/lingfeng983/screenshot-translation/releases)。
-> 源码端 `scripts/setup_ocr.py` 自动下载、SHA256 校验并解压到 `resources/`；
+> 源码端 `scripts/setup_ocr.py --release <标签>` 下载、SHA256 校验并解压到 `resources/`——
+> Gitee 没有 `latest/download` 这种地址，标签必须写全；
 > 离线环境可用 `python scripts/setup_ocr.py --local <分卷目录>`。
 > 安装程序走的是同一批附件，由 `scripts/fetch_ocr.ps1` 拉取解压到用户数据目录。
 > 维护者更新组件后运行 `python scripts/collect_ocr_bundle.py` +
@@ -277,7 +278,8 @@ ScreenshotTranslation/
 ### 打包（onedir + 安装包）
 ```bash
 # 1. 打包程序本体（不含 OCR，整个目录约 73MB）
-python -m PyInstaller screenshot-translator.spec --noconfirm
+#    ST_VERSION 会被写进 exe 的 Windows 版本资源（右键属性看得到）；不给就没有版本信息
+ST_VERSION=1.3.0 python -m PyInstaller screenshot-translator.spec --noconfirm
 
 # 2. 出 OCR 组件附件（安装时要从 Gitee Release 拉它）
 python scripts/collect_ocr_bundle.py      # → dist/ocr-bundle（约225MB）

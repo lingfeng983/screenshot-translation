@@ -16,6 +16,7 @@ OCR 组件（Tesseract 便携版，约 225 MiB）不随 exe 分发：安装包�
 """
 
 import os
+import re
 from PyInstaller.utils.hooks import collect_submodules
 
 block_cipher = None
@@ -30,10 +31,49 @@ datas = [
 # 隐藏导入：pystray 的 Windows 后端与键盘库按需动态加载
 # 插件包（翻译API / OCR引擎）只在运行时按目录扫描发现，静态分析看不到引用，
 # 不显式收集的话产物里一个 provider 都没有，翻译与OCR全部失效
+# （PIL._tkinter_finder 不收：它一进来就 import tkinter，而 tkinter 在 excludes 里）
 hiddenimports = [
     'pystray._win32',
-    'PIL._tkinter_finder',
 ] + collect_submodules('managers.providers') + collect_submodules('managers.ocr_providers')
+
+
+def _version_file():
+    """
+    生成 Windows 版本资源（右键属性里的文件版本）
+
+    程序本体不显示版本号，出问题时唯一能核对版本的地方就是 exe 属性。
+    版本由 scripts/publish_release.py 通过 ST_VERSION 传进来；没传就不带
+    版本资源（源码态随手构建时不该编出一个假的 1.x.0）。
+    """
+    version = os.environ.get('ST_VERSION', '').strip()
+    if not re.fullmatch(r'\d+\.\d+\.\d+', version):
+        return None
+    nums = tuple(int(n) for n in version.split('.')) + (0,)
+    path = os.path.join('build', 'version_info.txt')
+    os.makedirs('build', exist_ok=True)
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write(
+            "VSVersionInfo(\n"
+            "  ffi=FixedFileInfo(filevers=%s, prodvers=%s,\n"
+            "    mask=0x3f, flags=0x0, OS=0x40004, fileType=0x1, subtype=0x0, date=(0, 0)),\n"
+            "  kids=[\n"
+            "    StringFileInfo([StringTable('080404b0', [\n"
+            "      StringStruct('CompanyName', 'ScreenshotTranslation Project'),\n"
+            "      StringStruct('FileDescription', '截图翻译'),\n"
+            "      StringStruct('FileVersion', '%s'),\n"
+            "      StringStruct('InternalName', 'ScreenshotTranslator'),\n"
+            "      StringStruct('OriginalFilename', 'ScreenshotTranslator.exe'),\n"
+            "      StringStruct('ProductName', '截图翻译'),\n"
+            "      StringStruct('ProductVersion', '%s')])]),\n"
+            "    VarFileInfo([VarStruct('Translation', [2052, 1200])])\n"
+            "  ]\n"
+            ")\n" % (nums, nums, version, version)
+        )
+    print(f'>>> 写入版本资源: {version}')
+    return path
+
+
+_version = _version_file()
 
 a = Analysis(
     ['main.py'],
@@ -136,6 +176,7 @@ exe = EXE(
     strip=False,
     upx=False,
     upx_exclude=[],
+    version=_version,        # None 时不带版本资源，见 _version_file()
     console=False,           # 无控制台黑窗（GUI应用）
     disable_windowed_traceback=False,
     argv_emulation=False,

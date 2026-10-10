@@ -82,9 +82,19 @@ begin
   end;
 
   { 装到当前用户的数据目录：Program Files 只读、覆盖升级也不该动它，
-    与 managers/app_paths.py 的 ocr_resources_dir() 保持同一位置 }
-  Dest := AddBackslash(ExpandConstant('{%USERPROFILE}')) +
-          '.screenshot-translation\resources';
+    与 managers/app_paths.py 的 ocr_resources_dir() 保持同一位置——那边取的是
+    Python expanduser('~')，Windows 上就是 USERPROFILE 环境变量。
+    UAC 提权不换用户，USERPROFILE 不变；只有"以其他用户身份运行 Setup"才会
+    把组件下到别人的配置文件里，那种装法请取消勾选 OCR 组件。 }
+  Dest := ExpandConstant('{%USERPROFILE}');
+  if Dest = '' then
+  begin
+    Result := '当前安装上下文没有 USERPROFILE，无法确定 OCR 组件的落盘位置，' +
+              '安装已中止。请取消勾选"下载 OCR 组件"只装程序本体，' +
+              '或改用普通用户会话重新安装。';
+    Exit;
+  end;
+  Dest := AddBackslash(Dest) + '.screenshot-translation\resources';
   ExtractTemporaryFile('fetch_ocr.ps1');
   Ps1 := AddBackslash(ExpandConstant('{tmp}')) + 'fetch_ocr.ps1';
   if not FileExists(Ps1) then

@@ -46,7 +46,7 @@ def collect_sources():
     收集待打包文件
 
     Returns:
-        list[tuple[str, str]]: (磁盘路径, zip内相对路径)
+        list[tuple[str, str]]: (磁盘路径, zip内相对路径)；缺目录或语言包时为 []
     """
     if not os.path.isdir(BUNDLE_DIR):
         print(f"❌ 缺少 {BUNDLE_DIR}（先运行 python scripts/collect_ocr_bundle.py）")
@@ -57,7 +57,35 @@ def collect_sources():
             path = os.path.join(root, name)
             arcname = os.path.relpath(path, BUNDLE_DIR).replace(os.sep, '/')
             sources.append((path, arcname))
+    if not sources:
+        print(f"❌ {BUNDLE_DIR} 是空的（collect_ocr_bundle.py 没收到任何文件）")
+        return []
+    # 语言包缺失时打出来的包能下载能解压，却跑不了识别——在这里拦掉，
+    # 比让装填端在解压后探测关键文件失败更早、原因也更清楚
+    missing = [rel for rel in ('tessdata/eng.traineddata', 'tessdata/chi_sim.traineddata')
+               if not os.path.isfile(os.path.join(BUNDLE_DIR, *rel.split('/')))]
+    if missing:
+        print(f"❌ 最小集缺少语言数据: {missing}（先运行 python scripts/setup_ocr.py）")
+        return []
     return sources
+
+
+def clear_stale_parts(out_dir, label):
+    """
+    删掉同名包的历史产物
+
+    分卷数会随包大小变（上次 3 卷、这次 2 卷），旧的 .003 留在目录里会被
+    发布脚本一并上传，恢复端按序合并就多出一段脏字节。
+    """
+    if not os.path.isdir(out_dir):
+        return
+    prefix = f"{label}.zip"
+    for name in os.listdir(out_dir):
+        if name.startswith(prefix):
+            path = os.path.join(out_dir, name)
+            if os.path.isfile(path):
+                os.remove(path)
+                print(f"  - 清理旧产物 {name}")
 
 
 def make_package(out_dir, part_size_mb, label):
@@ -74,10 +102,11 @@ def make_package(out_dir, part_size_mb, label):
     """
     sources = collect_sources()
     if not sources:
-        print("❌ 没有可打包的文件（resources/tesseract 与 resources/tessdata 均不存在）")
+        print("❌ 没有可打包的文件（先运行 python scripts/collect_ocr_bundle.py）")
         return []
 
     os.makedirs(out_dir, exist_ok=True)
+    clear_stale_parts(out_dir, label)
     zip_path = os.path.join(out_dir, f"{label}.zip")
 
     # 1) 打完整 zip
@@ -122,8 +151,8 @@ def make_package(out_dir, part_size_mb, label):
     print(f"\n✅ 已生成 {len(part_paths)} 个分卷 + 1 个校验文件，共 {total_size / 1024 / 1024:.1f} MB")
     for p in part_paths + [sha_path]:
         print(f"   {os.path.basename(p)}  ({os.path.getsize(p) / 1024 / 1024:.1f} MB)")
-    print(f"\n下一步：全部上传到 Gitee Release 附件，")
-    print(f"克隆端运行 python scripts/setup_ocr.py 自动下载恢复。")
+    print(f"\n下一步：全部上传到 Gitee Release 附件（tag=v版本），")
+    print(f"克隆端运行 python scripts/setup_ocr.py --release v版本 自动下载恢复。")
     return part_paths + [sha_path]
 
 
@@ -137,8 +166,8 @@ def main():
                         help=f'包名（默认 {DEFAULT_LABEL}，装填器按此名找附件，勿加日期）')
     args = parser.parse_args()
 
-    make_package(args.out, args.part_size, args.label)
-    return 0
+    # 返回 [] 表示什么都没产出：发版脚本据此中止，不能报成功
+    return 0 if make_package(args.out, args.part_size, args.label) else 1
 
 
 if __name__ == '__main__':

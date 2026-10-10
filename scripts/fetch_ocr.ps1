@@ -33,15 +33,26 @@ function Write-Step([string]$Message) {
 }
 
 function Get-RemoteFile([string]$Url, [string]$OutPath) {
-    # 下载单个文件；失败（含 404）返回 $false，不抛异常打断调用方
+    # 下载单个文件，返回三态字符串，调用方据此区分"附件不存在"和"网络不通"：
+    #   ok      下载成功
+    #   missing 远端明确 404（分卷到此为止 / 附件确实没传）
+    #   error   超时、断连、5xx 等，无法判断远端到底有什么
+    # 把 error 当成 missing 会把半套组件当成完整包，校验失败也说不清根因
     try {
         Invoke-WebRequest -Uri $Url -OutFile $OutPath -UseBasicParsing `
             -TimeoutSec 1800 -ErrorAction Stop
-        return (Test-Path $OutPath)
+        if (Test-Path $OutPath) { return 'ok' }
+        Write-Step "下载结束但文件不在：$Url"
+        return 'error'
     } catch {
-        Write-Step "下载失败：$Url`n  $($_.Exception.Message)"
+        $code = 0
+        if ($_.Exception.Response -and $_.Exception.Response.StatusCode) {
+            $code = [int]$_.Exception.Response.StatusCode
+        }
+        Write-Step "请求失败（HTTP $code）：$Url`n  $($_.Exception.Message)"
         if (Test-Path $OutPath) { Remove-Item $OutPath -Force }
-        return $false
+        if ($code -eq 404) { return 'missing' }
+        return 'error'
     }
 }
 
@@ -77,34 +88,47 @@ try {
     Write-Step "从 $baseUrl 下载 OCR 组件"
 
     $parts = @()
+    $reachedMax = $true
     for ($i = 1; $i -le $MaxParts; $i++) {
         $name = "{0}.zip.{1:D3}" -f $Label, $i
         $partPath = Join-Path $tmp $name
-        if (-not (Get-RemoteFile "$baseUrl/$name" $partPath)) {
-            if ($i -eq 1) {
-                Write-Step "首卷都取不到：Release $Tag 可能还没上传 $name 附件"
-                exit 1
-            }
-            break   # 分卷到此为止
+        $status = Get-RemoteFile "$baseUrl/$name" $partPath
+        if ($status -eq 'missing') {
+            $reachedMax = $false
+            break   # 404 才算分卷到此为止
+        }
+        if ($status -ne 'ok') {
+            Write-Step "取 $name 时网络或服务端出错，无法判断组件是否完整"
+            exit 1
         }
         $parts += $partPath
         $sizeMb = [math]::Round((Get-Item $partPath).Length / 1MB, 1)
         Write-Step "已下载 $name（$sizeMb MB）"
     }
 
+    if ($parts.Count -eq 0) {
+        Write-Step "首卷都取不到：Release $Tag 可能还没上传 $Label.zip.001 附件"
+        exit 1
+    }
+    if ($reachedMax) {
+        Write-Step "连续取到 $MaxParts 卷还没遇到结尾，判定为异常（多半是分卷数变了而远端仍有旧卷）"
+        exit 1
+    }
+
+    # 校验文件是必需的：85MB 的组件拼错了字节，装完也只是"识别不出字"
     $shaUrl = "$baseUrl/$Label.zip.sha256"
     $shaPath = Join-Path $tmp "$Label.zip.sha256"
-    if (Get-RemoteFile $shaUrl $shaPath) {
-        $expected = (Get-Content $shaPath -Raw).Split()[0].ToLower()
-        $actual = Get-Sha256 $parts
-        if ($actual -ne $expected) {
-            Write-Step "SHA256 校验不通过 期望=$expected 实际=$actual"
-            exit 1
-        }
-        Write-Step "SHA256 校验通过"
-    } else {
-        Write-Step "无校验文件，跳过完整性校验"
+    if ((Get-RemoteFile $shaUrl $shaPath) -ne 'ok') {
+        Write-Step "取不到校验文件 $shaUrl，无法确认组件完整性，放弃安装"
+        exit 1
     }
+    $expected = (Get-Content $shaPath -Raw).Split()[0].ToLower()
+    $actual = Get-Sha256 $parts
+    if ($actual -ne $expected) {
+        Write-Step "SHA256 校验不通过 期望=$expected 实际=$actual"
+        exit 1
+    }
+    Write-Step "SHA256 校验通过"
 
     # 合并分卷：zip 被按字节切开了，按序拼回去才是完整包
     $merged = Join-Path $tmp "$Label.zip"

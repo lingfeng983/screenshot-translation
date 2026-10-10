@@ -3,12 +3,15 @@
 """
 下载并恢复 OCR 组件（Tesseract 便携包 + tessdata 语言数据）
 
-从本仓库 Gitee Release 附件下载分卷 zip，合并校验后解压到 resources/。
-大文件不入 git 仓库，克隆后运行本脚本一次即可。
+从本仓库 Gitee Release 附件下载分卷 zip，合并校验后解压到项目 resources/。
+大文件不入 git 仓库，克隆后运行本脚本一次即可让源码态跑离线识别。
+打包安装态不走这里：安装包在装填阶段调 scripts/fetch_ocr.ps1，
+把同一套附件解到 ~/.screenshot-translation/resources/。
+
+Gitee 没有 GitHub 那种 latest/download 地址，必须给明确标签。
 
 用法：
-    python scripts/setup_ocr.py
-    python scripts/setup_ocr.py --release v2.0.0
+    python scripts/setup_ocr.py --release v1.3.0
     python scripts/setup_ocr.py --local dist/release   # 用本地已打包的文件恢复（离线）
 """
 
@@ -25,12 +28,44 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 REPO_URL = 'https://gitee.com/lingfeng983/screenshot-translation.git'
 DEFAULT_LABEL = 'ocr-components'
 
+# 分卷数上限，防止探测循环失控
+_MAX_PARTS = 20
+
+
+def repo_base(url):
+    """去掉仓库地址的 .git 尾巴
+
+    不能用 rstrip('.git')：那是按字符集剥的，仓库名以 t/i/g/. 收尾就会被多啃。
+    """
+    return url[:-len('.git')] if url.endswith('.git') else url
+
 
 def _download(url, dest):
-    """下载文件（带进度显示），requests 不可用时回退 curl"""
+    """
+    下载文件，返回三态：'ok' / 'missing'（远端 404）/ 'error'（网络或服务端问题）
+
+    分卷是一个个试出来的，只有 404 能当成"分卷到此为止"；把超时和 5xx 也
+    当成结尾，就会拿半个组件包去合并解压。
+    """
     try:
         import requests
-        with requests.get(url, stream=True, timeout=60) as r:
+    except ImportError:
+        requests = None
+
+    if requests is None:
+        # 回退 curl（Windows 10+ 自带）；--fail 下 404 返回退出码 22
+        code = subprocess.call(['curl', '-sL', '--fail', '-o', dest, url])
+        if code == 0:
+            return 'ok'
+        print(f"  curl 退出码 {code}：{url}")
+        if os.path.exists(dest):
+            os.remove(dest)
+        return 'missing' if code == 22 else 'error'
+
+    try:
+        with requests.get(url, stream=True, timeout=(10, 60)) as r:
+            if r.status_code == 404:
+                return 'missing'
             r.raise_for_status()
             total = int(r.headers.get('content-length', 0))
             done = 0
@@ -42,12 +77,14 @@ def _download(url, dest):
                         pct = done * 100 // total
                         print(f"\r  下载 {pct}% ({done / 1048576:.1f}/{total / 1048576:.1f} MB)",
                               end='', flush=True)
-            print()
-        return True
-    except ImportError:
-        pass
-    # 回退 curl（Windows 10+ 自带）
-    return subprocess.call(['curl', '-L', '--fail', '-o', dest, url]) == 0
+            if total:
+                print()
+        return 'ok'
+    except requests.exceptions.RequestException as e:
+        print(f"  下载失败：{url}\n  {e}")
+        if os.path.exists(dest):
+            os.remove(dest)
+        return 'error'
 
 
 def _sha256_of(paths):
@@ -75,16 +112,16 @@ def _find_parts(source_dir, label):
 
 
 def restore_from_local(source_dir, label):
-    """从本地目录恢复"""
+    """从本地目录恢复（离线；输入是自己刚打的包，缺校验文件只提示不拦）"""
     parts, sha_file = _find_parts(source_dir, label)
     if not parts:
         print(f"❌ {source_dir} 中未找到 {label}.zip.001 分卷")
         return False
 
     print(f"找到 {len(parts)} 个分卷，校验完整性...")
-    actual = _sha256_of(parts)
     if os.path.exists(sha_file):
-        expected = open(sha_file, encoding='utf-8').read().split()[0]
+        actual = _sha256_of(parts)
+        expected = open(sha_file, encoding='utf-8').read().split()[0].lower()
         if actual != expected:
             print(f"❌ 校验失败\n  期望: {expected}\n  实际: {actual}")
             return False
@@ -97,41 +134,44 @@ def restore_from_local(source_dir, label):
 
 def restore_from_release(release_tag, label):
     """从 Gitee Release 附件恢复"""
-    base = f"{REPO_URL.rstrip('.git')}/releases/download/{release_tag}"
+    base = f"{repo_base(REPO_URL)}/releases/download/{release_tag}"
     print(f"从 Release {release_tag} 下载: {base}")
 
     tmp_dir = tempfile.mkdtemp(prefix='ocr-setup-')
     try:
-        # 先探测分卷数量（下载 .001，逐步尝试）
         parts = []
         index = 1
-        while True:
+        while index <= _MAX_PARTS:
             name = f"{label}.zip.{index:03d}"
             dest = os.path.join(tmp_dir, name)
-            url = f"{base}/{name}"
             print(f"下载 {name} ...")
-            if not _download(url, dest):
-                os.remove(dest) if os.path.exists(dest) else None
-                if index == 1:
-                    print(f"❌ 下载失败：{url}\n"
-                          f"   请确认 Release {release_tag} 已上传附件，或检查网络。")
-                    return False
-                break  # 该序号不存在 = 分卷结束
+            status = _download(f"{base}/{name}", dest)
+            if status == 'missing':
+                break           # 404 才算分卷到此为止
+            if status != 'ok':
+                print(f"❌ 取 {name} 时网络或服务端出错，无法判断组件是否完整")
+                return False
             parts.append(dest)
             index += 1
-            if index > 20:  # 安全上限
-                break
+        else:
+            print(f"❌ 连续取到 {_MAX_PARTS} 卷还没遇到结尾，判定为异常")
+            return False
 
-        # 下载校验文件（可选）
+        if not parts:
+            print(f"❌ 首卷都取不到：Release {release_tag} 可能没上传 {label}.zip.001 附件")
+            return False
+
+        # 校验文件必需：网络来的字节拼错了只会表现为"识别不出字"，太难查
         sha_dest = os.path.join(tmp_dir, f"{label}.zip.sha256")
-        if _download(f"{base}/{label}.zip.sha256", sha_dest):
-            parts_sha = parts
-            actual = _sha256_of(parts_sha)
-            expected = open(sha_dest, encoding='utf-8').read().split()[0]
-            if actual != expected:
-                print(f"❌ 校验失败\n  期望: {expected}\n  实际: {actual}")
-                return False
-            print("SHA256 校验通过")
+        if _download(f"{base}/{label}.zip.sha256", sha_dest) != 'ok':
+            print(f"❌ 取不到校验文件 {base}/{label}.zip.sha256，放弃恢复")
+            return False
+        actual = _sha256_of(parts)
+        expected = open(sha_dest, encoding='utf-8').read().split()[0].lower()
+        if actual != expected:
+            print(f"❌ 校验失败\n  期望: {expected}\n  实际: {actual}")
+            return False
+        print("SHA256 校验通过")
 
         return _merge_and_extract(parts)
     finally:
@@ -141,19 +181,25 @@ def restore_from_release(release_tag, label):
 def _merge_and_extract(parts):
     """合并分卷并解压到 resources/"""
     print("合并分卷并解压...")
-    merged = os.path.join(tempfile.gettempdir(), 'ocr-components-merged.zip')
-    with open(merged, 'wb') as out:
-        for part in parts:
-            with open(part, 'rb') as f:
-                shutil.copyfileobj(f, out)
+    fd, merged = tempfile.mkstemp(prefix='ocr-components-', suffix='.zip')
+    os.close(fd)
+    try:
+        with open(merged, 'wb') as out:
+            for part in parts:
+                with open(part, 'rb') as f:
+                    shutil.copyfileobj(f, out)
 
-    resources = os.path.join(PROJECT_ROOT, 'resources')
-    os.makedirs(resources, exist_ok=True)
-    with zipfile.ZipFile(merged) as zf:
-        # zip 内路径为 tesseract/... 与 tessdata/...，直接解到 resources/
-        zf.extractall(resources)
-
-    os.remove(merged)
+        resources = os.path.join(PROJECT_ROOT, 'resources')
+        os.makedirs(resources, exist_ok=True)
+        with zipfile.ZipFile(merged) as zf:
+            # zip 内路径为 tesseract/... 与 tessdata/...，直接解到 resources/
+            zf.extractall(resources)
+    except (OSError, zipfile.BadZipFile) as e:
+        print(f"❌ 合并或解压失败: {e}")
+        return False
+    finally:
+        if os.path.exists(merged):
+            os.remove(merged)
 
     # 验证关键文件
     checks = [
@@ -175,21 +221,20 @@ def _merge_and_extract(parts):
 def main():
     parser = argparse.ArgumentParser(description="下载/恢复 OCR 组件")
     parser.add_argument('--release', default=None,
-                        help='Release 标签（默认自动探测最新，如 v2.0.0）')
+                        help='Release 标签，如 v1.3.0（Gitee 没有 latest 下载地址）')
     parser.add_argument('--label', default=DEFAULT_LABEL,
                         help=f'附件包名前缀（默认 {DEFAULT_LABEL}）')
     parser.add_argument('--local', default=None,
                         help='从本地目录恢复（离线模式），如 dist/release')
     args = parser.parse_args()
 
-    if getattr(sys, 'frozen', False):
-        pass
-
     if args.local:
         ok = restore_from_local(args.local, args.label)
+    elif args.release:
+        ok = restore_from_release(args.release, args.label)
     else:
-        tag = args.release or 'latest'
-        ok = restore_from_release(tag, args.label)
+        parser.error('要么给 --release <标签>（如 v1.3.0），要么给 --local <目录>')
+        return 1
 
     return 0 if ok else 1
 
