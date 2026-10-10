@@ -2,6 +2,18 @@
 
 所有显著改动记录于此。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [Unreleased]
+
+### 修复
+- **改一次设置就崩溃**：配置文件里缺 `[Translation]`/`[Hotkey]`/`[Startup]`
+  任一段时（老文件或手改过的文件都很常见），点“保存”会让对应 setter 抛
+  `NoSectionError`。现在启动时六段逐个补齐，setter 也自带缺段补建
+- **快捷键升级后彻底失灵**：看门狗线程里直接调 `RegisterHotKey(None, …)`
+  会把 WM_HOTKEY 投给不泵消息的看门狗线程，注册“成功”却永远收不到按键，
+  同时兜底的键盘钩子已被摘掉。升级动作改回 Qt 主线程执行
+- `Startup.minimize_to_tray` 写成非法布尔值时不再抛 `ValueError`（回退默认
+  `true`），配置落盘的临时文件改为进程+线程唯一命名，权限收紧移到替换之前
+
 ## [v1.3.0] — 2026-10-10 — 安装包瘦身：OCR 组件改为安装时从 Gitee 下载
 
 ### 变更

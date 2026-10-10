@@ -297,6 +297,12 @@ class HotkeyManager:
         """
         if self._backend != 'keyboard' or not self.hotkey:
             return False
+        if threading.current_thread() is not threading.main_thread():
+            # RegisterHotKey(hwnd=None) 把 WM_HOTKEY 投给“调用线程”的消息队列，
+            # 而看门狗线程不泵消息：在这儿注册等于注册了个哑巴热键，还会因
+            # 下面的摘钩子把唯一可用的路径一起废掉
+            qt_dispatcher.dispatch_to_main_thread(self._try_native_upgrade)
+            return False
         if not self._register_native():
             return False
         # 原生已接管：钩子必须摘掉，否则同一次按键会被两条路径各触发一次

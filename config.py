@@ -9,6 +9,7 @@ import configparser
 import contextlib
 import logging
 import os
+import threading
 
 from managers import app_paths
 
@@ -30,6 +31,8 @@ class ConfigManager:
         """
         self.config_file = config_file or app_paths.config_file()
         self.config = configparser.ConfigParser()
+        # 写侧锁：池线程读、主线程写并发存在，写盘与批量改值必须串行
+        self._lock = threading.RLock()
         # 批量写盘：配置窗口保存时几十个 setter 只需落盘一次
         self._batch_depth = 0
         self._pending_changes = False
@@ -63,18 +66,10 @@ class ConfigManager:
             try:
                 self.config.read(self.config_file, encoding='utf-8')
                 logger.info(f"配置文件加载成功: {self.config_file}")
-                # 旧配置文件自动迁移：补充 [OCR]、[Overlay] 与 [UI] 段
-                migrated = False
-                if not self.config.has_section('OCR'):
-                    self._set_ocr_defaults()
-                    migrated = True
-                if not self.config.has_section('Overlay'):
-                    self._set_overlay_defaults()
-                    migrated = True
-                if not self.config.has_section('UI'):
-                    self._set_ui_defaults()
-                    migrated = True
-                if migrated:
+                # 旧配置文件自动迁移：六个段逐个补齐。缺段的危害不只是读不到值
+                # （读侧有 fallback 兜着），而是 setter 里的 config.set 会直接
+                # 抛 NoSectionError——用户点一次“保存”就崩一次。
+                if self._migrate_sections():
                     self.save_config()
             except Exception as e:
                 logger.error(f"配置文件加载失败，回退默认配置: {e}")
@@ -86,6 +81,62 @@ class ConfigManager:
             logger.info(f"配置文件不存在，本次使用内存默认配置: {self.config_file}")
             self._set_defaults()
 
+    # 全部配置段与其默认值填充器；老文件缺哪段就补哪段
+    _SECTION_DEFAULTS = (
+        ('Translation', '_set_translation_defaults'),
+        ('Hotkey', '_set_hotkey_defaults'),
+        ('Startup', '_set_startup_defaults'),
+        ('UI', '_set_ui_defaults'),
+        ('Overlay', '_set_overlay_defaults'),
+        ('OCR', '_set_ocr_defaults'),
+    )
+
+    def _migrate_sections(self):
+        """
+        补齐缺失的配置段并填入该段默认值
+
+        Returns:
+            bool: 是否有段落被补齐（需要落盘，避免每次启动重复迁移）
+        """
+        migrated = False
+        for section, filler in self._SECTION_DEFAULTS:
+            if not self.config.has_section(section):
+                getattr(self, filler)()
+                migrated = True
+        return migrated
+
+    def _ensure_section(self, section):
+        """
+        保证配置段存在（缺段时补该段默认值）
+
+        Args:
+            section (str): 段名
+
+        Returns:
+            bool: True 表示本次新建了该段
+        """
+        if self.config.has_section(section):
+            return False
+        getattr(self, dict(self._SECTION_DEFAULTS)[section])()
+        return True
+
+    def _set(self, section, option, value):
+        """
+        写单个配置项：缺段自动补，写入串行化
+
+        直接 self.config.set 在缺段的旧配置上会抛 NoSectionError；配置段的
+        默认值只在“文件不存在”分支里建过，手改或被裁剪过的 ini 随时会缺。
+        补建只改内存，落盘由调用方的 save_config 完成。
+
+        Args:
+            section (str): 段名
+            option (str): 配置项名
+            value (str): 值
+        """
+        with self._lock:
+            self._ensure_section(section)
+            self.config.set(section, option, str(value))
+
     def _set_defaults(self):
         """
         设置默认配置值（只写内存，不落盘）
@@ -94,8 +145,26 @@ class ConfigManager:
         的用户也留下一份 config.ini，且掩盖“配置是否被改过”这个信息。
         """
         # 翻译API配置
+        self._set_translation_defaults()
+        # 快捷键配置
+        self._set_hotkey_defaults()
+        # 启动行为配置
+        self._set_startup_defaults()
+        # 界面外观配置
+        self._set_ui_defaults()
+        # 截图遮罩默认配置
+        self._set_overlay_defaults()
+        # OCR 默认配置
+        self._set_ocr_defaults()
+
+    def _set_translation_defaults(self):
+        """
+        设置 [Translation] 段默认配置值（段已存在时原样返回，不重置用户值）
+        """
         if not self.config.has_section('Translation'):
             self.config.add_section('Translation')
+        else:
+            return
 
         self.config.set('Translation', 'api_type', 'edge_free')  # 默认使用Edge免费翻译（微软翻译，国内可直连）
         self.config.set('Translation', 'libretranslate_url', 'https://libretranslate.com/translate')
@@ -111,24 +180,23 @@ class ConfigManager:
         self.config.set('Translation', 'llm_api_key', '')
         self.config.set('Translation', 'llm_model', 'gpt-4o-mini')
 
-        # 快捷键配置
+    def _set_hotkey_defaults(self):
+        """设置 [Hotkey] 段默认配置值"""
         if not self.config.has_section('Hotkey'):
             self.config.add_section('Hotkey')
+        else:
+            return
 
         self.config.set('Hotkey', 'global_hotkey', 'alt+z')  # 默认快捷键
 
-        # 启动行为配置
+    def _set_startup_defaults(self):
+        """设置 [Startup] 段默认配置值"""
         if not self.config.has_section('Startup'):
             self.config.add_section('Startup')
+        else:
+            return
 
         self.config.set('Startup', 'minimize_to_tray', 'true')  # 默认最小化到托盘
-
-        # 界面外观配置
-        self._set_ui_defaults()
-        # 截图遮罩默认配置
-        self._set_overlay_defaults()
-        # OCR 默认配置
-        self._set_ocr_defaults()
 
     def _set_ocr_defaults(self):
         """
@@ -139,6 +207,8 @@ class ConfigManager:
         """
         if not self.config.has_section('OCR'):
             self.config.add_section('OCR')
+        else:
+            return
 
         self.config.set('OCR', 'ocr_type', 'tesseract')  # 默认本地Tesseract
         self.config.set('OCR', 'tesseract_langs', 'eng+chi_sim')  # 识别语言组合
@@ -151,6 +221,8 @@ class ConfigManager:
         """
         if not self.config.has_section('Overlay'):
             self.config.add_section('Overlay')
+        else:
+            return
 
         self.config.set('Overlay', 'snap_threshold', '12')  # 磁吸阈值（像素）
         self.config.set('Overlay', 'dim_opacity', '90')     # 暗角透明度 (0~180)
@@ -159,6 +231,8 @@ class ConfigManager:
         """设置 [UI] 段默认配置值（界面主题）"""
         if not self.config.has_section('UI'):
             self.config.add_section('UI')
+        else:
+            return
 
         self.config.set('UI', 'theme', 'dark')  # dark / light
 
@@ -181,26 +255,28 @@ class ConfigManager:
 
         直接覆盖原文件时，若写到一半被中断（退出、断电、杀进程）会留下
         半截文件，下次启动被当成损坏配置整份回退默认值——密钥与快捷键全丢。
+        临时名带进程与线程标识：多实例共用固定 ".tmp" 会互相顶替。
         """
         self._pending_changes = False
-        tmp_file = f"{self.config_file}.tmp"
-        try:
-            with open(tmp_file, 'w', encoding='utf-8') as f:
-                self.config.write(f)
-            os.replace(tmp_file, self.config_file)
+        tmp_file = (f"{self.config_file}.{os.getpid()}.{threading.get_ident()}.tmp")
+        with self._lock:
             try:
-                os.chmod(self.config_file, 0o600)
-            except OSError:
-                # Windows 等平台 chmod 语义有限，失败不影响主流程
-                pass
-            logger.debug(f"配置保存成功: {self.config_file}")
-        except Exception as e:
-            logger.error(f"配置保存失败: {e}")
-            try:
-                if os.path.exists(tmp_file):
-                    os.remove(tmp_file)
-            except OSError:
-                pass
+                with open(tmp_file, 'w', encoding='utf-8') as f:
+                    self.config.write(f)
+                try:
+                    # 收紧权限要在 replace 之前：替换后再 chmod，密钥有一段
+                    # 按默认权限可读的窗口期
+                    os.chmod(tmp_file, 0o600)
+                except OSError:
+                    # Windows 等平台 chmod 语义有限，失败不影响主流程
+                    pass
+                os.replace(tmp_file, self.config_file)
+                logger.debug(f"配置保存成功: {self.config_file}")
+            except Exception as e:
+                logger.error(f"配置保存失败: {e}")
+                with contextlib.suppress(OSError):
+                    if os.path.exists(tmp_file):
+                        os.remove(tmp_file)
 
     # 翻译API相关配置
     def get_api_type(self):
@@ -219,7 +295,7 @@ class ConfigManager:
         Args:
             api_type (str): API类型
         """
-        self.config.set('Translation', 'api_type', api_type)
+        self._set('Translation', 'api_type', api_type)
         self.save_config()
 
     def get_fallback_api_type(self):
@@ -238,7 +314,7 @@ class ConfigManager:
         Args:
             api_type (str): API类型
         """
-        self.config.set('Translation', 'fallback_api_type', api_type)
+        self._set('Translation', 'fallback_api_type', api_type)
         self.save_config()
 
     def get_target_lang(self):
@@ -257,7 +333,7 @@ class ConfigManager:
         Args:
             target_lang (str): 目标语言代码
         """
-        self.config.set('Translation', 'target_lang', target_lang)
+        self._set('Translation', 'target_lang', target_lang)
         self.save_config()
 
     def get_libretranslate_url(self):
@@ -276,7 +352,7 @@ class ConfigManager:
         Args:
             url (str): API地址
         """
-        self.config.set('Translation', 'libretranslate_url', url)
+        self._set('Translation', 'libretranslate_url', url)
         self.save_config()
 
     # OCR引擎相关配置
@@ -298,7 +374,7 @@ class ConfigManager:
         """
         if not self.config.has_section('OCR'):
             self._set_ocr_defaults()
-        self.config.set('OCR', 'ocr_type', ocr_type)
+        self._set('OCR', 'ocr_type', ocr_type)
         self.save_config()
 
     def get_ocr_option(self, option, fallback=''):
@@ -322,9 +398,7 @@ class ConfigManager:
             option (str): 配置项名
             value (str): 配置值
         """
-        if not self.config.has_section('OCR'):
-            self._set_ocr_defaults()
-        self.config.set('OCR', option, value)
+        self._set('OCR', option, value)
         self.save_config()
 
     # 翻译API通用配置项（插件自定义字段的后备读写通道）
@@ -352,9 +426,7 @@ class ConfigManager:
             option (str): 配置项名
             value (str): 配置值
         """
-        if not self.config.has_section('Translation'):
-            self.config.add_section('Translation')
-        self.config.set('Translation', option, value)
+        self._set('Translation', option, value)
         self.save_config()
 
     # 截图遮罩配置
@@ -379,9 +451,7 @@ class ConfigManager:
             option (str): 配置项名
             value (str): 配置值
         """
-        if not self.config.has_section('Overlay'):
-            self._set_overlay_defaults()
-        self.config.set('Overlay', option, value)
+        self._set('Overlay', option, value)
         self.save_config()
 
     # 界面外观配置
@@ -406,9 +476,7 @@ class ConfigManager:
         value = str(theme or '').strip().lower()
         if value not in ('dark', 'light'):
             value = 'dark'
-        if not self.config.has_section('UI'):
-            self._set_ui_defaults()
-        self.config.set('UI', 'theme', value)
+        self._set('UI', 'theme', value)
         self.save_config()
 
     # 快捷键配置
@@ -428,7 +496,7 @@ class ConfigManager:
         Args:
             hotkey (str): 快捷键组合
         """
-        self.config.set('Hotkey', 'global_hotkey', hotkey)
+        self._set('Hotkey', 'global_hotkey', hotkey)
         self.save_config()
 
     # 启动行为配置
@@ -437,9 +505,16 @@ class ConfigManager:
         获取是否最小化到托盘
 
         Returns:
-            bool: 是否最小化到托盘
+            bool: 是否最小化到托盘；值不是合法布尔字面量时按默认 true
         """
-        return self.config.getboolean('Startup', 'minimize_to_tray', fallback=True)
+        try:
+            return self.config.getboolean('Startup', 'minimize_to_tray',
+                                          fallback=True)
+        except ValueError:
+            # fallback 只兜“缺项/缺段”，值写坏了（如 maybe=）照样抛 ValueError，
+            # 而启动路径会因此跳过整段启动行为
+            logger.warning("Startup.minimize_to_tray 不是合法布尔值，按默认 true 处理")
+            return True
 
     def set_minimize_to_tray(self, minimize):
         """
@@ -448,7 +523,7 @@ class ConfigManager:
         Args:
             minimize (bool): 是否最小化到托盘
         """
-        self.config.set('Startup', 'minimize_to_tray', str(minimize).lower())
+        self._set('Startup', 'minimize_to_tray', str(minimize).lower())
         self.save_config()
 
     # 其他API配置方法
@@ -484,7 +559,7 @@ class ConfigManager:
         Args:
             api_key (str): API密钥
         """
-        self.config.set('Translation', 'bing_api_key', api_key)
+        self._set('Translation', 'bing_api_key', api_key)
         self.save_config()
 
     def get_baidu_api_info(self):
@@ -506,8 +581,8 @@ class ConfigManager:
             app_id (str): 应用ID
             api_key (str): 应用密钥
         """
-        self.config.set('Translation', 'baidu_app_id', app_id)
-        self.config.set('Translation', 'baidu_api_key', api_key)
+        self._set('Translation', 'baidu_app_id', app_id)
+        self._set('Translation', 'baidu_api_key', api_key)
         self.save_config()
 
     def get_youdao_api_info(self):
@@ -529,8 +604,8 @@ class ConfigManager:
             app_id (str): 应用ID
             api_key (str): 应用密钥
         """
-        self.config.set('Translation', 'youdao_app_id', app_id)
-        self.config.set('Translation', 'youdao_api_key', api_key)
+        self._set('Translation', 'youdao_app_id', app_id)
+        self._set('Translation', 'youdao_api_key', api_key)
         self.save_config()
 
     # LLM（OpenAI兼容接口）翻译配置
@@ -551,7 +626,7 @@ class ConfigManager:
         Args:
             base_url (str): API地址
         """
-        self.config.set('Translation', 'llm_base_url', base_url)
+        self._set('Translation', 'llm_base_url', base_url)
         self.save_config()
 
     def get_llm_api_key(self):
@@ -570,7 +645,7 @@ class ConfigManager:
         Args:
             api_key (str): API密钥
         """
-        self.config.set('Translation', 'llm_api_key', api_key)
+        self._set('Translation', 'llm_api_key', api_key)
         self.save_config()
 
     def get_llm_model(self):
@@ -589,7 +664,7 @@ class ConfigManager:
         Args:
             model (str): 模型名称
         """
-        self.config.set('Translation', 'llm_model', model)
+        self._set('Translation', 'llm_model', model)
         self.save_config()
 
 if __name__ == '__main__':
