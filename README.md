@@ -226,11 +226,12 @@ ScreenshotTranslation/
 ├── scripts/
 │   ├── make_release_package.py  # OCR组件分卷打包（上传Release用）
 │   └── setup_ocr.py             # 从Release下载恢复OCR组件
-├── tests/                   # 回归测试（从项目根可直接运行）
+├── tests/                   # pytest 回归测试（从项目根直接 python -m pytest tests/）
+│   ├── conftest.py                  # 共用装置：sys.path、会话级 QApplication、online/smoke 标记
 │   ├── test_translation_providers.py  # 翻译架构测试
 │   ├── test_ocr_providers.py          # OCR架构测试
 │   ├── test_features.py               # 基础功能测试
-│   └── test_config_ui.py              # 配置界面测试（开发中）
+│   └── test_config_ui.py              # 配置界面 + 遮罩结果态测试
 ├── managers/                # 核心功能模块
 │   ├── provider_common.py   # ★ 插件架构公共基座（注册表/自动发现/基类/降级链）
 │   ├── app_paths.py         # ★ 路径定位（源码→项目根 / 打包→~/.screenshot-translation，含旧数据迁移）
@@ -307,6 +308,17 @@ exe 启动即加载本目录下的 `_internal`，不再解包到临时目录。�
 产物目录保持只读——放进
 Program Files 或整目录覆盖升级都不会丢配置；旧版本留在 exe 同目录的配置与缓存
 首次启动会自动搬进该目录（只补缺，不覆盖已有文件）。源码运行仍在项目根。
+
+### 测试
+```bash
+PYTHONIOENCODING=utf-8 python -m pytest tests/ -q -rs    # 全程离线，发版前必跑
+ST_RUN_ONLINE=1 python -m pytest tests/ -q -m ""          # 追加真连各翻译接口
+ST_RUN_SMOKE=1 python -m pytest tests/ -q -m ""           # 追加真拉起 main.py（会注册全局热键）
+```
+界面用例跑在临时数据目录里：配置、缓存、日志、OCR 路径都被重定向到 tmp，
+不碰项目根的 `config.ini`；模态弹窗换成记录型假弹窗，所以保存流程会真的走一遍。
+遮罩断言用真实平台的 `grab()` 取像素（offscreen 平台没有中文字体，绘制会静默失败），
+滚轮用例带一个未加过滤的对照组，证明事件本身有效而不是空跑。
 
 ## 🆘 技术支持
 

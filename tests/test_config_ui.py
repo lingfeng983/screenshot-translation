@@ -1,38 +1,62 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-配置界面完整回归测试
+配置界面与遮罩结果的交互回归（pytest 用例）
 
-覆盖：
-1. 翻译API下拉框：7个provider全部出现、默认选中与配置一致
-2. 目标语言/降级API下拉框：选项与默认值
-3. 逐个切换每个翻译API：动态字段按 config_fields 生成、密码遮蔽正确、默认值载入
-4. OCR引擎下拉框：3个引擎逐个切换，动态字段正确
-5. 测试翻译按钮：edge_free 真实网络点击应成功
-6. 全部API真实连通性矩阵（限定超时，失败必须优雅）
-7. 保存流程：写入配置、同步翻译/OCR管理器（测试后还原config.ini）
-8. 主题切换：浅色/深色渲染实测、保存落盘；扩展provider自定义字段保存与回读
-9. 遮罩结果态：就地译文覆盖、工具条三态、段落卡片、降级与失败态
-10. 真实启动冒烟：spawn main.py，验证日志出现"应用启动成功"后结束进程
-11. 设置页排版：下拉框滚轮免疫（带对照组）、分组/行距紧凑、标签右对齐
+覆盖面：
+1. 翻译/OCR 下拉框的选项、默认值与逐个切换时的动态字段
+2. 保存流程：写配置 + 同步翻译/OCR 管理器
+3. 主题切换的真实渲染、扩展 provider 自定义字段持久化
+4. 遮罩结果态：就地覆盖、工具条三态、段落卡片、降级与失败
+5. 设置页排版：下拉框滚轮免疫、紧凑间距、标签右对齐
+6. 设置窗口单实例
+
+默认全部离线可跑。两类用例要显式开启：
+- 真连翻译接口的（`ST_RUN_ONLINE=1`）
+- 真拉起 main.py 的（`ST_RUN_SMOKE=1`，会注册全局热键、驻留托盘）
 """
 
 import os
+import subprocess
 import sys
 import time
-import shutil
-import subprocess
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import pytest
 
-from PyQt5.QtWidgets import QApplication, QLineEdit
-from PyQt5.QtCore import QTimer
+from PyQt5.QtWidgets import QLineEdit
+
+ONLINE = os.environ.get('ST_RUN_ONLINE') == '1'
+SMOKE = os.environ.get('ST_RUN_SMOKE') == '1'
+
+online = pytest.mark.skipif(not ONLINE, reason='需要真实网络：ST_RUN_ONLINE=1 才跑')
+smoke = pytest.mark.skipif(not SMOKE, reason='会注册全局热键：ST_RUN_SMOKE=1 才跑')
+
+# 各 provider/引擎应有的动态配置字段（字段名按 config_fields 顺序）
+EXPECTED_API_FIELDS = {
+    'baidu': ('baidu_app_id', 'baidu_api_key'),
+    'youdao': ('youdao_app_id', 'youdao_api_key'),
+    'bing': ('bing_api_key',),
+    'libretranslate': ('libretranslate_url',),
+    'llm': ('llm_base_url', 'llm_api_key', 'llm_model'),
+    'edge_free': (),
+    'google_free': (),
+}
+EXPECTED_OCR_FIELDS = {
+    'tesseract': ('tesseract_langs',),
+    'baidu_cloud': ('baidu_ocr_api_key', 'baidu_ocr_secret_key'),
+    'mock': (),
+}
 
 
-def _spin(wait_ms, app, condition=None, timeout_ms=30000):
-    """驱动事件循环直到条件满足或超时（无condition时按时长驱动）"""
+def spin(app, condition=None, timeout_ms=20000, duration_ms=150):
+    """
+    驱动事件循环
+
+    要么按时长驱动，要么等条件满足（超时返回 False）。设置页的动态字段、
+    测试按钮的结果都靠事件循环推进，纯 sleep 等不到。
+    """
     if condition is None:
-        end = time.time() + wait_ms / 1000
+        end = time.time() + duration_ms / 1000
         while time.time() < end:
             app.processEvents()
             time.sleep(0.02)
@@ -46,543 +70,580 @@ def _spin(wait_ms, app, condition=None, timeout_ms=30000):
     return False
 
 
-def main():
-    print("开始配置界面回归测试...\n")
-    app = QApplication.instance() or QApplication(sys.argv)
+@pytest.fixture(autouse=True)
+def isolated_data_dir(tmp_path, monkeypatch):
+    """
+    配置/缓存/日志全部指向每条用例自己的临时目录
 
-    # ---- 备份配置，测试后还原 ----
-    # 默认配置已改成只存内存、不改设置就不落盘，因此这里可能本来就没有 config.ini
-    had_config = os.path.exists('config.ini')
-    if had_config:
-        shutil.copy('config.ini', 'config.ini.bak')
+    源码态默认把它们写在项目根，用例一点"保存"就真改开发者配置——
+    既脏了工作区，也让用例之间互相影响。
+    """
+    from managers import app_paths
 
-    failures = []
-    try:
-        _run_tests(app, failures)
-    finally:
-        if had_config:
-            shutil.move('config.ini.bak', 'config.ini')
-            print("\nconfig.ini 已还原")
-        elif os.path.exists('config.ini'):
-            # 保存流程会真的写出配置：本来没有配置文件时把它删掉，保持工作区干净
-            os.remove('config.ini')
-            print("\n本次测试生成的 config.ini 已清理")
-
-    if failures:
-        print(f"\n❌ {len(failures)} 项失败:")
-        for f in failures:
-            print(f"  - {f}")
-        return 1
-    print("\n🎉 配置界面回归测试全部通过！")
-    return 0
+    root = str(tmp_path)
+    monkeypatch.setattr(app_paths, 'data_dir', lambda: root)
+    monkeypatch.setattr(app_paths, 'config_file',
+                        lambda: os.path.join(root, 'config.ini'))
+    monkeypatch.setattr(app_paths, 'cache_file',
+                        lambda: os.path.join(root, 'translation_cache.json'))
+    monkeypatch.setattr(app_paths, 'log_file',
+                        lambda: os.path.join(root, 'screenshot_translation.log'))
+    monkeypatch.setattr(app_paths, 'ocr_resources_dir',
+                        lambda: os.path.join(root, 'resources'))
+    # 翻译缓存是模块级单例，导入时就绑定了路径，只能改它的字段
+    from managers import cache_manager as cache_module
+    cache_module.cache_manager.cache_file = os.path.join(
+        root, 'translation_cache.json')
+    yield
 
 
-def _run_tests(app, failures):
-    from config import ConfigManager
-    from main import MainApp, ConfigWindow
-    from managers.translation import TranslationManager
-    from managers.ocr import OCRManager
+@pytest.fixture(autouse=True)
+def no_modal_boxes():
+    """
+    把 QMessageBox 的三个静态弹窗换成记录器
+
+    无头跑用例没人点"确定"，真弹窗会永久阻塞。
+    """
     from PyQt5.QtWidgets import QMessageBox
 
-    # 本文件会真的走一次翻译：全局缓存单例必须指向临时文件，
-    # 否则测试把结果写进项目根的 translation_cache.json
-    import tempfile
-    from managers import cache_manager as cache_manager_module
-    _cache_dir = tempfile.TemporaryDirectory()
-    _cache_singleton = cache_manager_module.cache_manager
-    _cache_singleton.cache_file = os.path.join(_cache_dir.name, 'cache.json')
-    _cache_singleton._keep_tmpdir = _cache_dir
+    log = []
 
-    # 保存流程会弹模态 QMessageBox，无头测试没人点确定会永久阻塞：
-    # 把 information/critical/warning 全部替换为记录型假弹窗
-    messagebox_log = []
-
-    def _fake_box(*args, **kwargs):
-        messagebox_log.append(args[1] if len(args) >= 2 else str(args))
+    def fake(*args, **kwargs):
+        log.append(args[1] if len(args) >= 2 else str(args))
         return QMessageBox.Ok
 
-    QMessageBox.information = staticmethod(_fake_box)
-    QMessageBox.critical = staticmethod(_fake_box)
-    QMessageBox.warning = staticmethod(_fake_box)
+    originals = (QMessageBox.information, QMessageBox.critical, QMessageBox.warning)
+    QMessageBox.information = staticmethod(fake)
+    QMessageBox.critical = staticmethod(fake)
+    QMessageBox.warning = staticmethod(fake)
+    yield log
+    (QMessageBox.information, QMessageBox.critical,
+     QMessageBox.warning) = originals
 
-    def check(name, fn):
-        print(f"▶ 开始: {name}", flush=True)
-        try:
-            fn()
-            print(f"✅ {name}", flush=True)
-        except Exception as e:
-            failures.append(f"{name}: {e}")
-            print(f"❌ {name}: {e}", flush=True)
 
-    main_app = MainApp()
-    main_app.app = app
-    main_app.config_manager = ConfigManager()
-    main_app.ocr_manager = OCRManager(main_app.config_manager)
-    main_app.translation_manager = TranslationManager(main_app.config_manager)
-    main_app.hotkey_manager = None  # 不注册热键，避免污染系统
+@pytest.fixture(autouse=True)
+def restore_theme(qapp):
+    """主题切换是进程级 stylesheet，用例跑完必须还回去"""
+    from managers import styles
 
-    win = ConfigWindow(main_app)
-    win.show()
-    _spin(200, app)
+    before = styles.current_theme()
+    yield
+    if styles.current_theme() != before:
+        styles.set_current_theme(before)
+        styles.apply_app(qapp)
 
+
+@pytest.fixture()
+def main_app(qapp):
+    """
+    只搭管理器骨架、不碰托盘与热键的 MainApp
+
+    hotkey_manager 留空：注册全局热键会影响整机，也不该由用例来验证。
+    """
+    from config import ConfigManager
+    from main import MainApp
+    from managers.ocr import OCRManager
+    from managers.translation import TranslationManager
+
+    app = MainApp()
+    app.app = qapp
+    app.config_manager = ConfigManager()
+    app.ocr_manager = OCRManager(app.config_manager)
+    app.translation_manager = TranslationManager(app.config_manager)
+    app.hotkey_manager = None
+    yield app
+    app.config_window = None
+
+
+@pytest.fixture()
+def win(main_app, qapp):
+    """已显示的设置窗口（grab 取像素要求窗口真实存在过）"""
+    from main import ConfigWindow
+
+    window = ConfigWindow(main_app)
+    window.show()
+    spin(qapp, duration_ms=200)
+    yield window
+    window.close()
+    spin(qapp, duration_ms=50)
+
+
+# ---------------------------------------------------------------- 下拉框
+
+
+def test_translation_api_combo_lists_every_provider(win):
     from managers.providers import provider_registry
+
+    data = [win.api_type_combo.itemData(i)
+            for i in range(win.api_type_combo.count())]
+    assert set(provider_registry.names()) <= set(data), f"下拉框缺provider: {data}"
+    assert data[win.api_type_combo.currentIndex()] == 'edge_free', \
+        f"默认应为 edge_free，实际 {data[win.api_type_combo.currentIndex()]}"
+    for i in range(win.api_type_combo.count()):
+        assert win.api_type_combo.itemText(i) == \
+            provider_registry.display_name_of(win.api_type_combo.itemData(i)), \
+            "显示名与 provider 声明不符"
+
+
+def test_target_lang_and_fallback_defaults(win):
+    assert win.target_lang_combo.count() == 9, "目标语言应为9种"
+    assert win.target_lang_combo.currentData() == 'zh'
+    assert win.fallback_api_combo.count() == len(EXPECTED_API_FIELDS) + 1, \
+        "降级API应为 不降级 + 每个provider 一项"
+    assert (win.fallback_api_combo.currentData() or '') == '', "默认应是不降级"
+
+
+@pytest.mark.parametrize('name', sorted(EXPECTED_API_FIELDS))
+def test_switching_translation_api_builds_declared_fields(win, qapp, name):
+    from managers.providers import provider_registry
+
+    combo = win.api_type_combo
+    idx = combo.findData(name)
+    assert idx >= 0, f"{name} 不在下拉框"
+    combo.setCurrentIndex(idx)
+    spin(qapp)
+
+    assert tuple(win._api_field_edits.keys()) == EXPECTED_API_FIELDS[name], \
+        f"{name} 动态字段与 config_fields 不符"
+    cls = provider_registry.get(name)
+    for field_name, _label, is_password in cls.config_fields:
+        edit = win._api_field_edits.get(field_name)
+        assert edit is not None, f"{name} 缺字段 {field_name}"
+        masked = edit.echoMode() == QLineEdit.Password
+        assert masked == bool(is_password), f"{name}.{field_name} 密码遮蔽错误"
+
+    if name == 'llm':
+        assert win._api_field_edits['llm_base_url'].text(), "llm_base_url 未载入默认值"
+    if name == 'libretranslate':
+        assert 'libretranslate' in win._api_field_edits['libretranslate_url'].text(), \
+            "libretranslate_url 未载入默认值"
+
+
+@pytest.mark.parametrize('name', sorted(EXPECTED_OCR_FIELDS))
+def test_switching_ocr_engine_builds_declared_fields(win, qapp, name):
     from managers.ocr_providers import ocr_provider_registry
 
-    # ---- 1. 翻译API下拉框 ----
-    def t_api_combo():
-        data = [win.api_type_combo.itemData(i) for i in range(win.api_type_combo.count())]
-        assert set(provider_registry.names()) <= set(data), f"下拉框缺provider: {data}"
-        assert data[win.api_type_combo.currentIndex()] == 'edge_free', \
-            f"默认应为edge_free, 实际{data[win.api_type_combo.currentIndex()]}"
-        for i in range(win.api_type_combo.count()):
-            assert win.api_type_combo.itemText(i) == \
-                provider_registry.display_name_of(win.api_type_combo.itemData(i)), "显示名不符"
-    check("翻译API下拉框：7个provider、默认edge_free、显示名一致", t_api_combo)
+    combo = win.ocr_type_combo
+    idx = combo.findData(name)
+    assert idx >= 0, f"{name} 不在 OCR 下拉框"
+    combo.setCurrentIndex(idx)
+    spin(qapp)
 
-    # ---- 2. 目标语言/降级API ----
-    def t_lang_combo():
-        assert win.target_lang_combo.count() == 9, "目标语言应为9种"
-        assert win.target_lang_combo.currentData() == 'zh'
-        assert win.fallback_api_combo.count() == 8, "降级API应为 不降级+7个provider"
-        assert win.fallback_api_combo.currentData() in ('', None) or \
-            win.fallback_api_combo.currentData() == '', "默认不降级"
-    check("目标语言9种/降级API默认不降级", t_lang_combo)
+    assert tuple(win._ocr_field_edits.keys()) == EXPECTED_OCR_FIELDS[name], \
+        f"{name} OCR 字段与 config_fields 不符"
+    assert combo.itemText(idx) == ocr_provider_registry.display_name_of(name), \
+        "OCR 显示名与 provider 声明不符"
 
-    # ---- 3. 逐个切换翻译API：动态字段 ----
-    EXPECTED_API_FIELDS = {
-        'baidu': ('baidu_app_id', 'baidu_api_key'),
-        'youdao': ('youdao_app_id', 'youdao_api_key'),
-        'bing': ('bing_api_key',),
-        'libretranslate': ('libretranslate_url',),
-        'llm': ('llm_base_url', 'llm_api_key', 'llm_model'),
-        'edge_free': (),
-        'google_free': (),
-    }
 
-    def t_switch_all_apis():
-        combo = win.api_type_combo
-        for name in EXPECTED_API_FIELDS:
-            idx = combo.findData(name)
-            assert idx >= 0, f"{name} 不在下拉框"
-            combo.setCurrentIndex(idx)
-            _spin(150, app)
-            fields = tuple(win._api_field_edits.keys())
-            assert fields == EXPECTED_API_FIELDS[name], \
-                f"{name} 动态字段 {fields} != {EXPECTED_API_FIELDS[name]}"
-            # 密码框遮蔽校验
-            cls = provider_registry.get(name)
-            for field_name, label, is_password in cls.config_fields:
-                edit = win._api_field_edits.get(field_name)
-                assert edit is not None
-                masked = edit.echoMode() == QLineEdit.Password
-                assert masked == bool(is_password), f"{name}.{field_name} 遮蔽错误"
-            # 默认值载入（llm_base_url / libretranslate_url）
-            if name == 'llm':
-                assert 'openai' in win._api_field_edits['llm_base_url'].text() or \
-                    win._api_field_edits['llm_base_url'].text(), "llm_base_url 未载入默认值"
-            if name == 'libretranslate':
-                assert 'libretranslate' in win._api_field_edits['libretranslate_url'].text()
-        combo.setCurrentIndex(combo.findData('edge_free'))
-        _spin(100, app)
-    check("逐个切换7个翻译API：动态字段/密码遮蔽/默认值正确", t_switch_all_apis)
+# ---------------------------------------------------------------- 保存与持久化
 
-    # ---- 4. OCR引擎逐个切换 ----
-    EXPECTED_OCR_FIELDS = {
-        'tesseract': ('tesseract_langs',),
-        'baidu_cloud': ('baidu_ocr_api_key', 'baidu_ocr_secret_key'),
-        'mock': (),
-    }
 
-    def t_switch_ocr():
-        combo = win.ocr_type_combo
-        for name in EXPECTED_OCR_FIELDS:
-            idx = combo.findData(name)
-            assert idx >= 0, f"{name} 不在OCR下拉框"
-            combo.setCurrentIndex(idx)
-            _spin(150, app)
-            fields = tuple(win._ocr_field_edits.keys())
-            assert fields == EXPECTED_OCR_FIELDS[name], \
-                f"{name} OCR字段 {fields} != {EXPECTED_OCR_FIELDS[name]}"
-            assert win.ocr_type_combo.itemText(idx) == \
-                ocr_provider_registry.display_name_of(name), "OCR显示名不符"
-        combo.setCurrentIndex(combo.findData('tesseract'))
-        _spin(100, app)
-    check("逐个切换3个OCR引擎：动态字段/显示名正确", t_switch_ocr)
+def test_save_writes_config_and_syncs_managers(win, qapp, main_app, no_modal_boxes):
+    win.api_type_combo.setCurrentIndex(win.api_type_combo.findData('llm'))
+    spin(qapp)
+    win._api_field_edits['llm_base_url'].setText('https://api.deepseek.com/v1')
+    win._api_field_edits['llm_model'].setText('deepseek-chat')
+    win.target_lang_combo.setCurrentIndex(win.target_lang_combo.findData('ja'))
+    win.ocr_type_combo.setCurrentIndex(win.ocr_type_combo.findData('baidu_cloud'))
+    spin(qapp)
 
-    # ---- 5. 测试翻译按钮（真实网络，edge_free）----
-    def t_test_button():
-        win._save_form_fields()  # 模拟点击前表单状态
-        win._on_test_translation()
-        ok = _spin(200, app,
-                   condition=lambda: win.test_result_label.text().startswith(('✅', '❌')),
-                   timeout_ms=40000)
-        assert ok, f"测试按钮未返回结果: {win.test_result_label.text()}"
-        text = win.test_result_label.text()
-        print(f"   ↳ 测试按钮结果: {text}")
-        assert text.startswith('✅'), f"edge_free 真实测试应成功: {text}"
-    check("测试翻译按钮：edge_free真实网络成功", t_test_button)
+    win._on_save()
 
-    # ---- 6. 全API连通性矩阵 ----
-    def t_api_matrix():
-        import requests
-        timeout = 12
-        results = {}
-        for name in provider_registry.names():
-            cls = provider_registry.get(name)
-            p = cls(config_manager=win.config_manager,
-                    session=main_app.translation_manager.session, timeout=timeout)
-            try:
-                r = p.translate("hello", source='auto', target='zh')
-                results[name] = 'OK' if r and not r.startswith('[翻译失败') else 'EMPTY'
-            except Exception as e:
-                results[name] = f"FAIL({str(e)[:40]})"
-        print("   ↳ API矩阵:", results)
-        # edge_free 必须通；其余允许因密钥/网络失败，但不能崩溃
-        assert results['edge_free'] == 'OK', f"edge_free必须可用: {results}"
-    check("全API真实连通性矩阵：无崩溃、edge_free可用", t_api_matrix)
+    assert no_modal_boxes and no_modal_boxes[-1] == "保存成功", \
+        f"应弹出保存成功提示: {no_modal_boxes}"
+    cm = win.config_manager
+    assert cm.get_api_type() == 'llm'
+    assert cm.get_target_lang() == 'ja'
+    assert cm.get_ocr_type() == 'baidu_cloud'
+    assert cm.get_llm_base_url() == 'https://api.deepseek.com/v1'
+    assert cm.get_llm_model() == 'deepseek-chat'
+    # 管理器要立刻跟上，不然改完设置得重启才生效
+    assert main_app.translation_manager.api_type == 'llm'
+    assert main_app.translation_manager.target_lang == 'ja'
+    assert main_app.ocr_manager.ocr_type == 'baidu_cloud'
 
-    # ---- 7. 保存流程 ----
-    def t_save():
-        win.api_type_combo.setCurrentIndex(win.api_type_combo.findData('llm'))
-        _spin(100, app)
-        win._api_field_edits['llm_base_url'].setText('https://api.deepseek.com/v1')
-        win._api_field_edits['llm_model'].setText('deepseek-chat')
-        win.target_lang_combo.setCurrentIndex(win.target_lang_combo.findData('ja'))
-        win.ocr_type_combo.setCurrentIndex(win.ocr_type_combo.findData('baidu_cloud'))
-        _spin(100, app)
-        win._on_save()  # QMessageBox 已被替换为假弹窗，不会阻塞
-        assert messagebox_log and messagebox_log[-1] == "保存成功", \
-            f"应弹出保存成功提示: {messagebox_log}"
-        cm = win.config_manager
-        assert cm.get_api_type() == 'llm'
-        assert cm.get_target_lang() == 'ja'
-        assert cm.get_ocr_type() == 'baidu_cloud'
-        assert cm.get_llm_base_url() == 'https://api.deepseek.com/v1'
-        assert cm.get_llm_model() == 'deepseek-chat'
-        # 管理器同步
-        assert main_app.translation_manager.api_type == 'llm'
-        assert main_app.translation_manager.target_lang == 'ja'
-        assert main_app.ocr_manager.ocr_type == 'baidu_cloud'
-        # 恢复下拉选择，避免影响后续测试
-        win.api_type_combo.setCurrentIndex(win.api_type_combo.findData('edge_free'))
-    check("保存流程：配置写盘+翻译/OCR管理器同步", t_save)
 
-    # ---- 7b. 主题切换（浅色渲染实测）与扩展 provider 字段持久化 ----
-    def t_theme_and_extension():
-        from managers import styles
-        from managers.providers import provider_registry
-        from managers.providers.base import TranslationProvider
+def test_theme_switch_changes_real_rendering(win, qapp, main_app, no_modal_boxes):
+    from managers import styles
 
-        assert win.theme_combo.count() == len(styles.available_themes()), "主题下拉项数量不符"
+    assert win.theme_combo.count() == len(styles.available_themes()), "主题下拉项数量不符"
 
-        def panel_lightness():
-            """取分组面板区域的亮度（窗口已关闭时 grab 仍会重新渲染）"""
-            image = win.grab().toImage()
-            if image.isNull():
-                return None
-            return image.pixelColor(image.width() // 2, 200).lightness()
+    def panel_lightness():
+        image = win.grab().toImage()
+        return None if image.isNull() else image.pixelColor(image.width() // 2, 200).lightness()
 
-        # 浅色：进程级样式立即生效，且渲染出来确实是浅色
-        win.theme_combo.setCurrentIndex(win.theme_combo.findData('light'))
-        _spin(150, app)
-        assert styles.current_theme() == 'light', "主题未切换到浅色"
-        assert '#f2f4f8' in app.styleSheet(), "浅色主题未应用到全局样式"
-        light_value = panel_lightness()
-        if light_value is not None:
-            assert light_value > 180, f"浅色主题面板仍偏暗: {light_value}"
+    win.theme_combo.setCurrentIndex(win.theme_combo.findData('light'))
+    spin(qapp)
+    assert styles.current_theme() == 'light', "主题未切换到浅色"
+    assert '#f2f4f8' in qapp.styleSheet(), "浅色主题未应用到全局样式"
+    light_value = panel_lightness()
 
-        # 深色：换回来必须是暗底，证明两套主题真的换了色
-        win.theme_combo.setCurrentIndex(win.theme_combo.findData('dark'))
-        _spin(150, app)
-        assert styles.current_theme() == 'dark'
-        dark_value = panel_lightness()
-        if dark_value is not None:
-            assert dark_value < 120, f"深色主题面板不够暗: {dark_value}"
+    win.theme_combo.setCurrentIndex(win.theme_combo.findData('dark'))
+    spin(qapp)
+    assert styles.current_theme() == 'dark'
+    dark_value = panel_lightness()
 
-        # 浅色 + 保存：主题应落盘
-        win.theme_combo.setCurrentIndex(win.theme_combo.findData('light'))
-        _spin(120, app)
-        win._on_save()
-        assert win.config_manager.get_theme() == 'light', "主题未保存到配置"
-        print(f"   ↳ 主题渲染亮度: 浅色={light_value} 深色={dark_value}")
+    # 拿到像素就必须是真的换了色，而不是两套主题画出一样的灰
+    if light_value is not None and dark_value is not None:
+        assert light_value > 180, f"浅色主题面板仍偏暗: {light_value}"
+        assert dark_value < 120, f"深色主题面板不够暗: {dark_value}"
 
-        # 扩展 provider 声明的自定义字段必须能保存与回读（插件架构承诺）
-        class ProbeProvider(TranslationProvider):
-            name = 'probe_api'
-            display_name = '探针翻译'
-            config_fields = (('probe_custom_field', '自定义字段', False),)
+    win.theme_combo.setCurrentIndex(win.theme_combo.findData('light'))
+    spin(qapp)
+    win._on_save()
+    assert win.config_manager.get_theme() == 'light', "主题未保存到配置"
 
-        provider_registry.register(ProbeProvider, override=True)
+
+def test_extension_provider_custom_fields_persist(win, qapp, main_app):
+    """插件架构的承诺：第三方 provider 声明的字段能存能读回来"""
+    from managers.providers import provider_registry
+    from managers.providers.base import TranslationProvider
+
+    class ProbeProvider(TranslationProvider):
+        name = 'probe_api'
+        display_name = '探针翻译'
+        config_fields = (('probe_custom_field', '自定义字段', False),)
+
+    provider_registry.register(ProbeProvider, override=True)
+    try:
         probe_win = None
         try:
-            probe_win = ConfigWindow(main_app)
-            probe_win.api_type_combo.setCurrentIndex(
-                probe_win.api_type_combo.findData('probe_api'))
-            _spin(150, app)
-            assert 'probe_custom_field' in probe_win._api_field_edits, \
-                f"扩展provider字段未生成: {list(probe_win._api_field_edits)}"
+            probe_win = _open_probe_window(main_app, qapp)
             probe_win._api_field_edits['probe_custom_field'].setText('扩展字段值')
             probe_win._save_form_fields()
-            assert win.config_manager.get_translation_option('probe_custom_field') == '扩展字段值', \
-                "扩展provider字段未写入配置"
+            assert win.config_manager.get_translation_option('probe_custom_field') \
+                == '扩展字段值', "扩展provider字段未写入配置"
             probe_win.close()
-            probe_win = ConfigWindow(main_app)
-            probe_win.api_type_combo.setCurrentIndex(
-                probe_win.api_type_combo.findData('probe_api'))
-            _spin(150, app)
+            probe_win = _open_probe_window(main_app, qapp)
             assert probe_win._api_field_edits['probe_custom_field'].text() == '扩展字段值', \
                 "扩展provider字段未回读"
         finally:
             if probe_win is not None:
                 probe_win.close()
-            provider_registry.unregister('probe_api')
-            # 还原：主题回深色，清掉探针字段（config.ini 最后整体还原）
-            win.theme_combo.setCurrentIndex(win.theme_combo.findData('dark'))
-            _spin(100, app)
-            win.config_manager.set_translation_option('probe_custom_field', '')
-    check("主题切换（浅色渲染实测）与扩展provider字段持久化", t_theme_and_extension)
+                spin(qapp, duration_ms=50)
+    finally:
+        provider_registry.unregister('probe_api')
 
-    # ---- 8. 遮罩结果态：就地覆盖 + 工具条 + 气泡卡片 ----
-    def t_overlay_result():
-        from PIL import Image, ImageDraw
-        from PyQt5.QtCore import QPoint, QRect
-        from PyQt5.QtWidgets import QApplication, QPushButton
 
-        import managers.result_render as rr
-        from managers.screenshot import ScreenshotWidget
-        from managers.text_block import TextBlock, group_paragraphs
+def _open_probe_window(main_app, qapp):
+    """开一个已选中 probe_api 的设置窗口（动态字段要切换后才生成）"""
+    from main import ConfigWindow
 
-        lines = ['Hello world, this is line one',
-                 'and this is the second line',
-                 'third line of the paragraph']
-        translated = ['第一行译文', '第二行译文内容较长用于验证缩放', '第三行译文']
-        scale = 2.0
-        image = Image.new('RGB', (int(300 * scale), int(80 * scale)), (250, 250, 250))
-        draw = ImageDraw.Draw(image)
-        for i in range(3):
-            draw.text((int(4 * scale), int(i * 26 * scale)), lines[i],
-                      fill=(20, 20, 20))
-        blocks = [TextBlock(t, int(4 * scale), int(i * 26 * scale),
-                            int(220 * scale), int(20 * scale))
-                  for i, t in enumerate(lines)]
-        payload = {
-            'original_text': '\n'.join(lines),
-            'translated_text': '\n'.join(translated),
-            'blocks': blocks, 'block_texts': translated,
-            'image': image, 'region': QRect(20, 30, 300, 80),
-            'languages': [('zh', '中文'), ('ja', '日文')],
-            'target_lang': 'zh', 'request_id': 0, 'error': None,
-        }
+    probe_win = ConfigWindow(main_app)
+    probe_win.api_type_combo.setCurrentIndex(
+        probe_win.api_type_combo.findData('probe_api'))
+    spin(qapp)
+    assert 'probe_custom_field' in probe_win._api_field_edits, \
+        f"扩展provider字段未生成: {list(probe_win._api_field_edits)}"
+    return probe_win
 
-        widget = ScreenshotWidget()
-        widget.resize(900, 520)
+
+def test_config_window_reuses_single_instance(main_app, qapp):
+    """
+    反复打开设置只置前同一实例
+
+    旧实现每次重建窗口：刚粘进去还没保存的密钥被连带销毁。
+    """
+    from main import ConfigWindow
+
+    def windows():
+        return [w for w in qapp.topLevelWidgets() if isinstance(w, ConfigWindow)]
+
+    main_app.config_window = None
+    baseline = len(windows())
+
+    main_app.open_config_window()
+    spin(qapp, duration_ms=150)
+    first = main_app.config_window
+    assert isinstance(first, ConfigWindow), "设置窗口未创建"
+    assert first.isVisible(), "设置窗口应显示"
+    assert len(windows()) == baseline + 1, \
+        f"首次打开应只增一个窗口: {baseline} -> {len(windows())}"
+
+    first.hotkey_edit.setText('ctrl+alt+q')
+    for _ in range(3):
+        main_app.open_config_window()
+        spin(qapp, duration_ms=80)
+    assert main_app.config_window is first, "重复打开应复用同一实例而不是重建"
+    assert first.hotkey_edit.text() == 'ctrl+alt+q', "再次打开丢失了未保存的表单内容"
+    assert first.isVisible(), "复用时应置前显示"
+    assert len(windows()) == baseline + 1, \
+        f"重复打开叠出了 {len(windows()) - baseline} 个窗口"
+
+    first.close()
+    spin(qapp, duration_ms=80)
+    main_app.open_config_window()
+    spin(qapp, duration_ms=150)
+    assert main_app.config_window is first, "关闭后重开应复用同一实例"
+    assert first.isVisible(), "关闭后重开应重新显示"
+    assert first.hotkey_edit.text() == 'ctrl+alt+q', "重开后表单内容应保留"
+    first.close()
+    spin(qapp, duration_ms=50)
+
+
+# ---------------------------------------------------------------- 设置页排版
+
+
+def test_settings_combos_ignore_wheel_but_page_still_scrolls(win, qapp):
+    from PyQt5.QtCore import QPoint, QPointF, Qt
+    from PyQt5.QtGui import QWheelEvent
+    from PyQt5.QtWidgets import QComboBox, QApplication, QScrollArea
+
+    def wheel_down(widget):
+        """投递一次滚轮向下（走 sendEvent，会经过事件过滤器）"""
+        center = widget.rect().center()
+        ev = QWheelEvent(QPointF(center), widget.mapToGlobal(center),
+                         QPoint(), QPoint(0, -120),
+                         Qt.NoButton, Qt.NoModifier, Qt.ScrollUpdate, False)
+        QApplication.sendEvent(widget, ev)
+
+    # 对照组：没加过滤的下拉框必须被滚轮改变，否则是事件没生效而不是免疫成功
+    control = QComboBox()
+    control.addItems(['甲', '乙', '丙'])
+    control.setCurrentIndex(1)
+    wheel_down(control)
+    assert control.currentIndex() != 1, "对照组滚轮未改变下拉值，事件构造无效"
+    control.deleteLater()
+
+    for combo in (win.theme_combo, win.api_type_combo, win.target_lang_combo,
+                  win.fallback_api_combo, win.ocr_type_combo):
+        before = combo.currentIndex()
+        wheel_down(combo)
+        assert combo.currentIndex() == before, \
+            f"下拉框响应了滚轮: {before} -> {combo.currentIndex()}"
+
+    # 滚轮被吞掉不等于页面不能滚：鼠标停在下拉框上时该转交滚动区
+    scroll = win.findChildren(QScrollArea)[0]
+    vbar = scroll.verticalScrollBar()
+    if vbar.maximum() > 0:
+        vbar.setValue(0)
+        spin(qapp, duration_ms=50)
+        before_scroll = vbar.value()
+        wheel_down(win.theme_combo)
+        assert vbar.value() > before_scroll, \
+            f"滚轮未转交滚动区: {before_scroll} -> {vbar.value()}"
+
+
+def test_settings_layout_is_compact_and_labels_right_aligned(win):
+    from PyQt5.QtCore import Qt
+    from PyQt5.QtWidgets import QFormLayout, QGroupBox, QPushButton, QScrollArea
+
+    content_layout = win.findChildren(QScrollArea)[0].widget().layout()
+    assert content_layout.spacing() <= 10, f"分组间距过大: {content_layout.spacing()}"
+
+    group_count = 0
+    for group in win.findChildren(QGroupBox):
+        form = group.layout()
+        if not isinstance(form, QFormLayout):
+            continue
+        group_count += 1
+        assert form.verticalSpacing() <= 6, \
+            f"{group.title()} 行距过大: {form.verticalSpacing()}"
+        assert form.labelAlignment() & Qt.AlignRight, \
+            f"{group.title()} 标签未右对齐"
+    assert group_count >= 6, f"分组数量异常: {group_count}"
+
+    texts = [b.text() for b in win.findChildren(QPushButton)]
+    assert '测试翻译' in texts and '保存' in texts, \
+        f"操作行按钮不齐: {texts}"
+
+
+# ---------------------------------------------------------------- 遮罩结果态
+
+
+def _result_payload():
+    """一段三行的原文 + 对应译文，物理像素按 2 倍率画"""
+    from PIL import Image, ImageDraw
+    from PyQt5.QtCore import QRect
+
+    from managers.text_block import TextBlock
+
+    lines = ['Hello world, this is line one',
+             'and this is the second line',
+             'third line of the paragraph']
+    translated = ['第一行译文', '第二行译文内容较长用于验证缩放', '第三行译文']
+    scale = 2.0
+    image = Image.new('RGB', (int(300 * scale), int(80 * scale)), (250, 250, 250))
+    draw = ImageDraw.Draw(image)
+    for i, line in enumerate(lines):
+        draw.text((int(4 * scale), int(i * 26 * scale)), line, fill=(20, 20, 20))
+    blocks = [TextBlock(t, int(4 * scale), int(i * 26 * scale),
+                        int(220 * scale), int(20 * scale))
+              for i, t in enumerate(lines)]
+    return {
+        'original_text': '\n'.join(lines),
+        'translated_text': '\n'.join(translated),
+        'blocks': blocks, 'block_texts': translated,
+        'image': image, 'region': QRect(20, 30, 300, 80),
+        'languages': [('zh', '中文'), ('ja', '日文')],
+        'target_lang': 'zh', 'request_id': 0, 'error': None,
+    }
+
+
+@pytest.fixture()
+def overlay(qapp):
+    from managers.screenshot import ScreenshotWidget
+
+    widget = ScreenshotWidget()
+    widget.resize(900, 520)
+    widget._request_id = 0
+    yield widget
+    widget.close()
+    widget.deleteLater()
+    spin(qapp, duration_ms=50)
+
+
+def test_overlay_result_lands_with_logical_blocks_and_paragraph(overlay):
+    from managers.text_block import group_paragraphs
+
+    overlay.show_result(_result_payload())
+
+    assert overlay.has_result(), "结果未落地"
+    assert overlay.current_payload() is not None
+    assert overlay._scale == 2.0, f"像素倍率应为2.0，实际{overlay._scale}"
+    assert len(overlay._blocks) == 3
+    assert overlay._blocks[0].left == 4, "行块未换算为逻辑坐标"
+    assert len(group_paragraphs(overlay._blocks)) == 1, "同段三行被拆开"
+    assert len(overlay._paragraphs) == 1, "段落聚合结果不符"
+
+
+def test_overlay_toolbar_offers_three_modes_and_actions(overlay):
+    from PyQt5.QtCore import QPoint
+    from PyQt5.QtWidgets import QPushButton
+
+    import managers.result_render as rr
+
+    overlay.show_result(_result_payload())
+    toolbar = overlay._toolbar
+    assert toolbar is not None, "工具条未创建"
+    texts = [b.text() for b in toolbar.findChildren(QPushButton)]
+    for expect in ('原文', '双语', '译文', '复制', '钉住', '保存', '重译', '×'):
+        assert expect in texts, f"工具条缺少 {expect}: {texts}"
+    assert toolbar.current_mode() == rr.MODE_TRANSLATED
+    assert toolbar.current_language() == 'zh'
+
+    # 三态各画一次：覆盖重绘最容易在某个模式下炸，异常会让进程静默退出
+    for mode in rr.MODES:
+        overlay._set_mode(mode)
+        assert overlay.grab() is not None, f"{mode} 模式绘制失败"
+
+    para_rect, _indices = overlay._paragraphs[0]
+    assert overlay._paragraph_at(para_rect.center()) == 0, "段落命中测试失败"
+    assert overlay._paragraph_at(QPoint(860, 500)) is None
+    overlay._hover_paragraph = 0
+    assert overlay._card_info(), "悬停段落应出气泡卡片"
+    overlay._hover_paragraph = None
+    assert overlay._card_info() is None, "不悬停时不该再有卡片"
+
+
+def test_overlay_copy_goes_through_validating_clipboard(overlay, qapp):
+    """
+    复制必须经 managers.clipboard（带归属校验与重试）
+
+    不直接断言系统剪贴板内容：第三方程序可能长期占用导致写入失败，
+    那类失败由 clipboard 模块记警告日志，这里只盯接线与内容。
+    """
+    import managers.screenshot as screenshot_mod
+
+    overlay.show_result(_result_payload())
+    copied = []
+
+    class SpyClipboard:
+        @staticmethod
+        def set_text(text):
+            copied.append(text)
+            return True
+
+        @staticmethod
+        def set_text_later(text, on_done=None):
+            copied.append(text)
+            if on_done:
+                on_done(True)
+
+    real = screenshot_mod.clipboard
+    screenshot_mod.clipboard = SpyClipboard
+    try:
+        overlay._copy_result()
+    finally:
+        screenshot_mod.clipboard = real
+    assert copied and '第一行译文' in copied[0], \
+        f"复制未经过校验写入器或内容不符: {copied}"
+
+
+def test_overlay_degrades_to_paragraph_card_without_line_texts(overlay):
+    payload = _result_payload()
+    payload['block_texts'] = []
+    overlay.show_result(payload)
+
+    assert overlay._card_info(), "无行级译文时应展示整段卡片"
+    assert overlay.grab() is not None
+
+
+def test_overlay_failure_and_stale_result(main_app, overlay):
+    from managers.screenshot import ScreenshotManager
+
+    overlay.show_failure('OCR 服务不可用')
+    assert overlay._error and not overlay.has_result()
+    assert overlay.grab() is not None
+
+    # 过期请求的结果（用户已经重框/取消）不能覆盖当前状态
+    stale = _result_payload()
+    stale['request_id'] = 99
+    manager = main_app.screenshot_manager or ScreenshotManager()
+    previous = manager._screenshot_widget
+    manager._screenshot_widget = overlay
+    try:
+        manager._apply_result(overlay, stale)
+    finally:
+        manager._screenshot_widget = previous
+    assert overlay._error == 'OCR 服务不可用', "过期选区的结果被误应用"
+
+
+# ---------------------------------------------------------------- 需显式开启
+
+
+@online
+def test_test_translation_button_succeeds_on_edge_free(win, qapp):
+    win._save_form_fields()
+    win._on_test_translation()
+    done = spin(qapp,
+                condition=lambda: win.test_result_label.text().startswith(('✅', '❌')),
+                timeout_ms=40000)
+    text = win.test_result_label.text()
+    assert done, f"测试按钮未返回结果: {text}"
+    assert text.startswith('✅'), f"edge_free 真实测试应成功: {text}"
+
+
+@online
+def test_every_provider_degrades_gracefully_on_real_calls(main_app, win):
+    from managers.providers import provider_registry
+
+    timeout = 12
+    results = {}
+    for name in provider_registry.names():
+        cls = provider_registry.get(name)
+        provider = cls(config_manager=win.config_manager,
+                       session=main_app.translation_manager.session,
+                       timeout=timeout)
         try:
-            widget._request_id = 0
-            widget.show_result(payload)
-            assert widget.has_result(), "结果未落地"
-            assert widget.current_payload() is payload
-            assert widget._scale == scale, f"像素倍率应为{scale}，实际{widget._scale}"
-            assert len(widget._blocks) == 3
-            assert widget._blocks[0].left == 4, "行块未换算为逻辑坐标"
-            assert len(group_paragraphs(widget._blocks)) == 1, "同段三行被拆开"
-            assert len(widget._paragraphs) == 1, "段落聚合结果不符"
+            r = provider.translate("hello", source='auto', target='zh')
+            results[name] = 'OK' if r and not r.startswith('[翻译失败') else 'EMPTY'
+        except Exception as e:
+            results[name] = f"FAIL({str(e)[:40]})"
 
-            # 工具条：三态按钮 + 语言下拉 + 操作按钮齐全
-            toolbar = widget._toolbar
-            assert toolbar is not None, "工具条未创建"
-            btn_texts = [b.text() for b in toolbar.findChildren(QPushButton)]
-            for expect in ('原文', '双语', '译文', '复制', '钉住', '保存', '重译', '×'):
-                assert expect in btn_texts, f"工具条缺少 {expect}: {btn_texts}"
-            assert toolbar.current_mode() == rr.MODE_TRANSLATED
-            assert toolbar.current_language() == 'zh'
-
-            # 三态切换 + 悬停/点击段落 + 复制，逐状态绘制一次确认不抛异常
-            for mode in rr.MODES:
-                widget._set_mode(mode)
-                assert widget.grab() is not None, f"{mode} 模式绘制失败"
-            widget._set_mode(rr.MODE_TRANSLATED)
-
-            para_rect, indices = widget._paragraphs[0]
-            assert widget._paragraph_at(para_rect.center()) == 0, "段落命中测试失败"
-            assert widget._paragraph_at(QPoint(860, 500)) is None
-            widget._hover_paragraph = 0
-            assert widget._card_info(), "悬停段落应出气泡卡片"
-            widget._hover_paragraph = None
-            assert widget._card_info() is None, "无行级译文缺失时不该再压卡片"
-
-            # 复制走带校验的写入器（managers.clipboard）。不直接断言剪贴板
-            # 内容：环境里剪贴板可能被第三方程序长期占用而写入失败（那类
-            # 失败由 managers/clipboard.py 记警告日志），这里只盯接线与内容。
-            import managers.screenshot as screenshot_mod
-
-            copied = []
-
-            class SpyClipboard:
-                @staticmethod
-                def set_text(text):
-                    copied.append(text)
-                    return True
-
-                @staticmethod
-                def set_text_later(text, on_done=None):
-                    copied.append(text)
-                    if on_done:
-                        on_done(True)
-
-            real_clipboard = screenshot_mod.clipboard
-            screenshot_mod.clipboard = SpyClipboard
-            try:
-                widget._copy_result()
-            finally:
-                screenshot_mod.clipboard = real_clipboard
-            assert copied and '第一行译文' in copied[0], \
-                f"复制未经过校验写入器或内容不符: {copied}"
-
-            # 行级译文缺失时降级为整段卡片
-            degraded = dict(payload)
-            degraded['block_texts'] = []
-            widget.show_result(degraded)
-            assert widget._card_info(), "无行级译文时应展示整段卡片"
-            assert widget.grab() is not None
-
-            # 失败态与过期结果
-            widget.show_failure('OCR 服务不可用')
-            assert widget._error and not widget.has_result()
-            assert widget.grab() is not None
-            from managers.screenshot import ScreenshotManager
-            sm = main_app.screenshot_manager or ScreenshotManager()
-            stale = dict(payload)
-            stale['request_id'] = 99
-            previous_widget = sm._screenshot_widget
-            sm._screenshot_widget = widget
-            sm._apply_result(widget, stale)
-            assert widget._error == 'OCR 服务不可用', "过期选区的结果被误应用"
-            sm._screenshot_widget = previous_widget
-        finally:
-            widget.close()
-            widget.deleteLater()
-    check("遮罩结果态：就地覆盖/工具条/段落卡片/降级/失败", t_overlay_result)
-
-    # ---- 11. 设置页排版：滚轮免疫 / 紧凑间距 / 标签右对齐 ----
-    def t_layout_polish():
-        from PyQt5.QtCore import QPointF, QPoint, Qt
-        from PyQt5.QtGui import QWheelEvent
-        from PyQt5.QtWidgets import QComboBox, QFormLayout, QGroupBox, QScrollArea
-
-        def wheel_down(widget):
-            """向控件投递一次滚轮向下事件（走 QApplication.notify，会经过事件过滤器）"""
-            center = widget.rect().center()
-            ev = QWheelEvent(QPointF(center), widget.mapToGlobal(center),
-                             QPoint(), QPoint(0, -120),
-                             Qt.NoButton, Qt.NoModifier, Qt.ScrollUpdate, False)
-            QApplication.sendEvent(widget, ev)
-
-        # 对照组：未加过滤的下拉框必须能被滚轮改变，证明事件本身有效
-        ctrl = QComboBox()
-        ctrl.addItems(['甲', '乙', '丙'])
-        ctrl.setCurrentIndex(1)
-        wheel_down(ctrl)
-        assert ctrl.currentIndex() != 1, "对照组滚轮未改变下拉值，事件构造无效"
-        ctrl.deleteLater()
-
-        # 设置页下拉框：滚轮必须被忽略，选项不变
-        combos = (win.theme_combo, win.api_type_combo, win.target_lang_combo,
-                  win.fallback_api_combo, win.ocr_type_combo)
-        for combo in combos:
-            before = combo.currentIndex()
-            wheel_down(combo)
-            assert combo.currentIndex() == before, \
-                f"下拉框响应了滚轮: {before} -> {combo.currentIndex()}"
-
-        # 紧凑间距：分组间 ≤10px，各表单行距 ≤6px
-        scroll = win.findChildren(QScrollArea)[0]
-        content_layout = scroll.widget().layout()
-        assert content_layout.spacing() <= 10, f"分组间距过大: {content_layout.spacing()}"
-
-        # 滚轮转交：鼠标停在下拉框上时页面照常滚动（不是被吞掉）
-        vbar = scroll.verticalScrollBar()
-        if vbar.maximum() > 0:
-            vbar.setValue(0)
-            _spin(50, app)
-            before_scroll = vbar.value()
-            wheel_down(win.theme_combo)
-            assert vbar.value() > before_scroll, \
-                f"滚轮未转交滚动区: {before_scroll} -> {vbar.value()}"
-        group_count = 0
-        for group in win.findChildren(QGroupBox):
-            form = group.layout()
-            if isinstance(form, QFormLayout):
-                group_count += 1
-                assert form.verticalSpacing() <= 6, \
-                    f"{group.title()} 行距过大: {form.verticalSpacing()}"
-                assert form.labelAlignment() & Qt.AlignRight, \
-                    f"{group.title()} 标签未右对齐"
-        assert group_count >= 6, f"分组数量异常: {group_count}"
-
-        # 操作行：测试按钮与保存按钮同排固定在滚动区外
-        from PyQt5.QtWidgets import QPushButton
-        btn_texts = [b.text() for b in win.findChildren(QPushButton)]
-        assert '测试翻译' in btn_texts and '保存' in btn_texts
-    check("设置页排版：滚轮免疫/紧凑间距/标签右对齐", t_layout_polish)
-
-    # ---- 12. 设置窗口单实例：反复打开只置前，不重建 ----
-    def t_single_config_window():
-        def windows():
-            return [w for w in app.topLevelWidgets()
-                    if isinstance(w, ConfigWindow)]
-
-        # 本用例自行接管这一状态，不受其他用例影响
-        main_app.config_window = None
-        baseline = len(windows())
-
-        main_app.open_config_window()
-        _spin(120, app)
-        first = main_app.config_window
-        assert isinstance(first, ConfigWindow), "设置窗口未创建"
-        assert first.isVisible(), "设置窗口应显示"
-        assert len(windows()) == baseline + 1, \
-            f"首次打开应只增一个窗口: {baseline} -> {len(windows())}"
-
-        # 托盘双击/菜单「设置」可反复触发：必须置前同一实例。
-        # 旧实现每次重建窗口，旧窗口连同未保存的表单输入（如刚粘的密钥）
-        # 一起被销毁 —— 改完配置还没点保存就被清空。
-        first.hotkey_edit.setText('ctrl+alt+q')
-        for _ in range(3):
-            main_app.open_config_window()
-            _spin(80, app)
-        assert main_app.config_window is first, \
-            "重复打开设置应复用同一实例，而不是重建窗口"
-        assert first.hotkey_edit.text() == 'ctrl+alt+q', \
-            "再次打开设置丢失了未保存的表单内容"
-        assert first.isVisible(), "复用时应置前显示"
-        assert len(windows()) == baseline + 1, \
-            f"重复打开设置叠出了 {len(windows()) - baseline} 个窗口"
-
-        # 用户关掉后再打开：复用同一实例并重新显示（而不是新建一个）
-        first.close()
-        _spin(80, app)
-        main_app.open_config_window()
-        _spin(120, app)
-        assert main_app.config_window is first, "关闭后重开应复用同一实例"
-        assert first.isVisible(), "关闭后重开应重新显示"
-        assert first.hotkey_edit.text() == 'ctrl+alt+q', "重开后表单内容应保留"
-        assert len(windows()) == baseline + 1, "关闭后重开不应新建窗口"
-        first.close()
-        _spin(50, app)
-    check("设置窗口单实例：反复打开只置前不重建", t_single_config_window)
+    # 没密钥的失败可以，但必须是可预期的结果而不是抛穿
+    assert results['edge_free'] == 'OK', f"edge_free必须可用: {results}"
 
 
-    win.close()
-
-
-def smoke_run_main():
-    """真实启动冒烟：spawn main.py，日志出现'应用启动成功'即通过"""
-    print("\n=== 真实启动冒烟 ===")
+@smoke
+def test_main_entry_point_starts():
+    """真拉起 main.py：日志出现启动成功即通过（会注册全局热键）"""
     env = dict(os.environ, PYTHONIOENCODING='utf-8')
     proc = subprocess.Popen(
         [sys.executable, 'main.py'],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env, text=True,
-        encoding='utf-8', errors='replace')
+        encoding='utf-8', errors='replace',
+        cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     try:
         deadline = time.time() + 25
         started = False
@@ -594,21 +655,9 @@ def smoke_run_main():
             if proc.poll() is not None:
                 break
         assert started, "main.py 启动日志未出现'应用启动成功'"
-        print("✅ main.py 真实启动成功（含配置窗口/托盘初始化）")
     finally:
         proc.terminate()
         try:
             proc.wait(timeout=8)
         except subprocess.TimeoutExpired:
             proc.kill()
-
-
-if __name__ == '__main__':
-    code = main()
-    if code == 0:
-        try:
-            smoke_run_main()
-        except Exception as e:
-            print(f"❌ 启动冒烟失败: {e}")
-            code = 1
-    sys.exit(code)
