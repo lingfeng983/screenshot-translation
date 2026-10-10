@@ -12,7 +12,7 @@ onedir 不解包，启动只剩导入耗时，磁盘也不再生成 _MEI。
 
 OCR 组件（Tesseract 便携版，约 225 MiB）不随 exe 分发：安装包在装填阶段
 从 Gitee Release 附件下载并解压到 ~/.screenshot-translation/resources/
-（见 scripts/fetch_ocr.ps1 与 scripts/setup.iss），exe 只负责运行时探测。
+（由 scripts/setup.iss 的内置下载完成），exe 只负责运行时探测。
 """
 
 import os

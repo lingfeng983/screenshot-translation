@@ -43,7 +43,8 @@ python main.py
 > 源码端 `scripts/setup_ocr.py --release <标签>` 下载、SHA256 校验并解压到 `resources/`——
 > Gitee 没有 `latest/download` 这种地址，标签必须写全；
 > 离线环境可用 `python scripts/setup_ocr.py --local <分卷目录>`。
-> 安装程序走的是同一批附件，由 `scripts/fetch_ocr.ps1` 拉取解压到用户数据目录。
+> 安装程序走的是同一批附件，由 Setup 自己下载校验并解压到用户数据目录，
+> 全程不起外部进程（所以不会弹控制台窗口）。
 > 维护者更新组件后运行 `python scripts/collect_ocr_bundle.py` +
 > `python scripts/make_release_package.py` 重新打包（包名固定，勿加日期）。
 
@@ -155,7 +156,18 @@ def register(registry):
 遮罩工具条是浮在屏幕内容之上的深色元素，风格独立，不随主题变化（白底卡片在亮屏幕上会看不清）。
 
 ### 快捷键设置
-可在配置面板中自定义全局快捷键
+可在配置面板中自定义全局快捷键。快捷键分组里有一行实时状态：注册成功会写明走
+系统投递还是键盘钩子；被别的程序占用时直接标红提示"原生注册失败，已退回键盘钩子"，
+并按日志里的原因提示如何释放占用。开窗、改组合、点保存都会刷新这一行。
+
+### 单实例
+同一时间只允许运行一个实例（命名互斥体 `Local\ScreenshotTranslator.SingleInstance`）。
+重复启动只会弹一句"已经在运行中，请用托盘图标或 Alt+Z"然后退出，避免出现两套托盘
+图标、两个全局热键互相抢占、后启动的进程覆盖前一个写好的缓存。开发/联调确实要多开时：
+
+```bash
+set ST_ALLOW_MULTI_INSTANCE=1 && python main.py
+```
 
 ### 启动行为
 - 启动后最小化到托盘（默认）
@@ -224,17 +236,22 @@ ScreenshotTranslation/
 ├── run_fixed.bat        # 启动脚本
 ├── screenshot-translator.spec  # PyInstaller onedir 打包配置（含依赖裁剪）
 ├── scripts/
-│   ├── make_release_package.py  # OCR组件分卷打包（上传Release用）
-│   └── setup_ocr.py             # 从Release下载恢复OCR组件
+│   ├── publish_release.py       # 一条命令出包＋发版（测试→构建→Setup→发 Release）
+│   ├── setup.iss                # Inno Setup 7 安装脚本（OCR 组件由 Setup 内置下载）
+│   ├── collect_ocr_bundle.py    # 抽出 Tesseract 运行最小集 → dist/ocr-bundle
+│   ├── make_release_package.py  # OCR组件分卷打包（上传Release用，并写 ocr-artifact.iss）
+│   └── setup_ocr.py             # 从Release下载恢复OCR组件（源码态/手工补装）
 ├── tests/                   # pytest 回归测试（从项目根直接 python -m pytest tests/）
 │   ├── conftest.py                  # 共用装置：sys.path、会话级 QApplication、online/smoke 标记
 │   ├── test_translation_providers.py  # 翻译架构测试
 │   ├── test_ocr_providers.py          # OCR架构测试
 │   ├── test_features.py               # 基础功能测试
-│   └── test_config_ui.py              # 配置界面 + 遮罩结果态测试
+│   ├── test_config_ui.py              # 配置界面 + 遮罩结果态测试
+│   └── test_single_instance.py        # 单实例互斥（仅 Windows）
 ├── managers/                # 核心功能模块
 │   ├── provider_common.py   # ★ 插件架构公共基座（注册表/自动发现/基类/降级链）
 │   ├── app_paths.py         # ★ 路径定位（源码→项目根 / 打包→~/.screenshot-translation，含旧数据迁移）
+│   ├── single_instance.py   # ★ 命名互斥体单实例守卫（重复启动时提示并退出）
 │   ├── translation.py       # 翻译管理器（分发/缓存/降级链）
 │   ├── ocr.py               # OCR管理器（分发/重试/降级）
 │   ├── screenshot.py        # 截图遮罩（磁吸/气泡/角标记）+ 就地译文结果态
@@ -285,17 +302,20 @@ ST_VERSION=1.3.0 python -m PyInstaller screenshot-translator.spec --noconfirm
 # 2. 出 OCR 组件附件（安装时要从 Gitee Release 拉它）
 python scripts/collect_ocr_bundle.py      # → dist/ocr-bundle（约225MB）
 python scripts/make_release_package.py    # → dist/release/ocr-components.zip.001 + .sha256（约85MB）
+                                          #   同时写 ocr-artifact.iss：安装脚本编译期要的
+                                          #   附件名/字节数/SHA256，所以这一步必须在第 3 步之前
 
 # 3. 编译安装器（先把 dist/ScreenshotTranslator/ 拷进 release/onedir/）
 iscc.exe /DMyAppVersion=1.3.0 /DMyAppOcrTag=v1.3.0 scripts\setup.iss
 # 产物：release/ScreenshotTranslator-Setup.exe（约30MB，唯一对外分发包）
 ```
 > 上面三步 `python scripts/publish_release.py --version 1.3.0` 一条命令串完，
-> 顺带提交、打 tag、发 Release。
+> 顺带提交、打 tag、发 Release。编译安装脚本需要 Inno Setup 7（内置下载是 7 的能力）。
 
-Tesseract **不再打进 exe**：安装程序在装填阶段从 Gitee Release 附件下载
-`ocr-components.zip.00N`，SHA256 校验后解压到
-`%USERPROFILE%\.screenshot-translation\resources\`（`scripts/fetch_ocr.ps1`）。
+Tesseract **不再打进 exe**：安装程序在装填阶段由 Setup 自己从 Gitee Release 附件下载
+`ocr-components.zip.001`，SHA256 由 Setup 校验、解压到
+`%USERPROFILE%\.screenshot-translation\resources\`，进度就在向导里，不起外部进程所以
+不会弹控制台窗口。同一标签已装过则跳过下载（靠 `ocr-version.txt` 标记）。
 代价是安装时要联网，好处是安装包从 105MB 降到 30MB，225MB 的二进制不跟着每个包跑。
 
 打包时自动裁剪无用依赖：Qt 的 QML/场景图/Vulkan 插件与翻译文件、PIL 的
@@ -319,6 +339,8 @@ ST_RUN_SMOKE=1 python -m pytest tests/ -q -m ""           # 追加真拉起 main
 不碰项目根的 `config.ini`；模态弹窗换成记录型假弹窗，所以保存流程会真的走一遍。
 遮罩断言用真实平台的 `grab()` 取像素（offscreen 平台没有中文字体，绘制会静默失败），
 滚轮用例带一个未加过滤的对照组，证明事件本身有效而不是空跑。
+冒烟用例会带着 `ST_ALLOW_MULTI_INSTANCE=1` 拉起 `main.py`（否则第二次启动会被
+单实例守卫挡掉），单实例本身的用例只在 Windows 跑，并且各自用唯一的互斥体名。
 
 ## 🆘 技术支持
 

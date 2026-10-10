@@ -5,8 +5,8 @@
 
 从本仓库 Gitee Release 附件下载分卷 zip，合并校验后解压到项目 resources/。
 大文件不入 git 仓库，克隆后运行本脚本一次即可让源码态跑离线识别。
-打包安装态不走这里：安装包在装填阶段调 scripts/fetch_ocr.ps1，
-把同一套附件解到 ~/.screenshot-translation/resources/。
+打包安装态不走这里：安装包（scripts/setup.iss）由 Setup 自己从同一批附件下载
+并解压到 ~/.screenshot-translation/resources/。本脚本是给源码态/手工补装用的。
 
 Gitee 没有 GitHub 那种 latest/download 地址，必须给明确标签。
 

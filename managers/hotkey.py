@@ -462,6 +462,30 @@ class HotkeyManager:
                 "（键盘钩子）注册：在提权窗口或锁屏切换后可能收不到按键。\n"
                 "建议换一个组合（例如 ctrl+alt+z）以获得更稳定的响应。")
 
+    def status_hint(self):
+        """
+        当前快捷键的真实注册状态，供设置页直接展示
+
+        只说"注册成功"是不够的：退到键盘钩子时按键照样能触发，直到某次
+        提权窗口抢了焦点才失灵，那种状态必须写在界面上。
+
+        Returns:
+            tuple[str, bool]: (文案, 是否属于需要提醒用户的异常状态)
+        """
+        if not self.hotkey:
+            return ('未设置快捷键：填一个"修饰键+主键"的组合（如 ctrl+alt+z）后保存',
+                    True)
+        hint = self.native_conflict_hint()
+        if hint:
+            return hint, True
+        if self.last_error:
+            return self.last_error, True
+        if self._backend == 'native':
+            return f'快捷键 {self.hotkey} 已由系统注册，随时可用', False
+        if self._backend == 'keyboard':
+            return f'快捷键 {self.hotkey} 通过键盘钩子生效', False
+        return f'快捷键 {self.hotkey} 当前未注册，点一次“保存”即可注册', True
+
     def cleanup(self):
         """注销全局快捷键并复位运行状态"""
         try:

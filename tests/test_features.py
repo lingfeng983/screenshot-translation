@@ -748,7 +748,7 @@ def test_app_paths_ocr_component_location():
     """
     OCR 组件的安装位置与运行时探测路径必须是同一个
 
-    安装包（scripts/setup.iss 调 scripts/fetch_ocr.ps1）把 Tesseract 解压到
+    安装包（scripts/setup.iss 内置下载）把 Tesseract 解压到
     ~/.screenshot-translation/resources/，exe 不再自带这 225MB。
     两侧路径各改一半的表现是"装完仍然没有本地识别"，所以这条耦合要钉住。
     """
@@ -799,6 +799,48 @@ def test_app_paths_ocr_component_location():
             else:
                 setattr(sys, attr, value)
         sys.executable = saved_executable
+
+
+def test_installer_downloads_ocr_without_external_process():
+    """
+    OCR 组件的下载必须整个交给 Setup，安装阶段不许再拉外部进程
+
+    老做法是 PrepareToInstall 里 Exec 一个 powershell 脚本，控制台窗口会弹出来、
+    进度也在那个窗口里而不是向导里。现在下载、校验、解压全在 [Files] 里声明，
+    所以钉三件事：脚本里没有任何外部进程调用、内置下载三件套齐全、
+    编译期参数（附件名/字节数/SHA256）确实由出包脚本产出并在编安装器之前产出。
+    """
+    print("=== 测试安装包内置下载 ===")
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    def read(*parts):
+        with open(os.path.join(root, *parts), encoding='utf-8-sig') as f:
+            return f.read()
+
+    iss = read('scripts', 'setup.iss')
+    lowered = iss.lower()
+    assert 'exec(' not in lowered, "装填阶段又去起外部进程了（会弹控制台）"
+    assert '.ps1' not in lowered and 'fetch_ocr' not in lowered
+    assert 'extracttemporaryfile' not in lowered
+
+    # Inno 7 内置下载：download 标志 + 编译期大小 + 校验值 + 归档解压
+    assert 'Flags: external download extractarchive recursesubdirs ignoreversion' in iss
+    assert 'ExternalSize: {#MyAppOcrSize}' in iss
+    assert 'Hash: "{#MyAppOcrSha}"' in iss
+    assert 'ArchiveExtraction=auto' in iss
+    # 同一标签重装不该再走一遍 85MB
+    assert 'Check: ShouldFetchOcr' in iss
+    assert 'ocr-version.txt' in iss
+
+    packager = read('scripts', 'make_release_package.py')
+    for define in ('MyAppOcrPartName', 'MyAppOcrSize', 'MyAppOcrSha', 'MyAppOcrParts'):
+        assert f'#define {define}' in packager, f"出包脚本没写 {define}，iss 编译期拿不到"
+
+    publisher = read('scripts', 'publish_release.py')
+    assemble = publisher.split('def step_assemble')[1].split('\ndef ')[0]
+    built_at = assemble.index('make_release_package.py')
+    compiled_at = assemble.index('iscc')
+    assert built_at < compiled_at, "必须先出 OCR 包再编安装器，否则校验值是上一版的"
 
 
 def test_app_paths_user_data():

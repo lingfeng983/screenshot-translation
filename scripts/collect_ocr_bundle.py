@@ -5,7 +5,7 @@
 
 从 resources/tesseract/ 与 resources/tessdata/ 抽取 OCR 运行必需的文件，
 输出到 dist/ocr-bundle/（供 scripts/make_release_package.py 切成 Release 附件，
-安装阶段再由 scripts/fetch_ocr.ps1 下载解压）：
+安装阶段由 scripts/setup.iss 内置下载并解压）：
 
 - tesseract.exe + 全部 .dll（运行必需）
 - tessdata：eng.traineddata + chi_sim.traineddata + tessdata/configs 配置

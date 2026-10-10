@@ -14,6 +14,10 @@ Release 附件下载并解压到 ~/.screenshot-translation/resources/，所以�
 分卷格式：单个 zip 按字节顺序切分；恢复端按序合并后即为完整 zip。
 sha256 文件记录完整 zip 的校验值。
 
+除了分卷和校验文件，还会写出 dist/release/ocr-artifact.iss：安装脚本编译期 include
+它的三元组（第一卷附件名、该附件字节数、整包 SHA256）。Inno 的 download 标志要求
+编译期就给出 ExternalSize 与 Hash，装填端没法运行时现算，只能由这里传过去。
+
 用法：
     python scripts/collect_ocr_bundle.py
     python scripts/make_release_package.py
@@ -21,6 +25,7 @@ sha256 文件记录完整 zip 的校验值。
 
 输出：dist/release/ocr-components.zip.001 / .002 / ...
       dist/release/ocr-components.zip.sha256
+      dist/release/ocr-artifact.iss
 """
 
 import argparse
@@ -37,6 +42,9 @@ BUNDLE_DIR = os.path.join(PROJECT_ROOT, 'dist', 'ocr-bundle')
 
 # 装填器按这个名字找附件，改动要同步 scripts/setup.iss 与 setup_ocr.py
 DEFAULT_LABEL = 'ocr-components'
+
+# 安装脚本编译期 include 的参数文件（路径也写在 setup.iss 的 MyAppOcrArtifact 里）
+ARTIFACT_FILENAME = 'ocr-artifact.iss'
 
 _CHUNK = 1024 * 1024  # 1MB
 
@@ -88,6 +96,33 @@ def clear_stale_parts(out_dir, label):
                 print(f"  - 清理旧产物 {name}")
 
 
+def write_artifact_include(out_dir, part_paths, zip_sha):
+    """
+    写安装脚本编译期要用的下载参数
+
+    Inno 的 download 标志要求在编译期就给出 ExternalSize（远端文件字节数）和
+    Hash（下载文件的 SHA256），装填端运行时算不出来，只能由出包这一步传过去。
+    校验值取整包 zip 的：只有一卷时 .001 就是 zip 本身，逐字节相同。
+
+    Args:
+        out_dir (str): 输出目录
+        part_paths (list[str]): 分卷路径（有序）
+        zip_sha (str): 完整 zip 的 sha256（十六进制小写）
+
+    Returns:
+        str: 生成的 ocr-artifact.iss 路径
+    """
+    path = os.path.join(out_dir, ARTIFACT_FILENAME)
+    with open(path, 'w', encoding='utf-8', newline='\n') as f:
+        f.write('; 由 scripts/make_release_package.py 生成，scripts/setup.iss 编译期 include，不要手改\n')
+        f.write(f'#define MyAppOcrPartName "{os.path.basename(part_paths[0])}"\n')
+        f.write(f'#define MyAppOcrSize {os.path.getsize(part_paths[0])}\n')
+        f.write(f'#define MyAppOcrSha "{zip_sha}"\n')
+        f.write(f'#define MyAppOcrParts {len(part_paths)}\n')
+    print(f"已生成 {ARTIFACT_FILENAME}（{len(part_paths)} 卷，内置下载{'可用' if len(part_paths) == 1 else '不可用：只支持单附件'}）")
+    return path
+
+
 def make_package(out_dir, part_size_mb, label):
     """
     打包为分卷
@@ -125,9 +160,10 @@ def make_package(out_dir, part_size_mb, label):
         for block in iter(lambda: f.read(_CHUNK), b''):
             sha.update(block)
     sha_path = f"{zip_path}.sha256"
+    zip_sha = sha.hexdigest()
     with open(sha_path, 'w', encoding='utf-8') as f:
-        f.write(f"{sha.hexdigest()}  {label}.zip\n")
-    print(f"SHA256: {sha.hexdigest()[:16]}...")
+        f.write(f"{zip_sha}  {label}.zip\n")
+    print(f"SHA256: {zip_sha[:16]}...")
 
     # 3) 按字节切分卷
     part_size = part_size_mb * _CHUNK
@@ -147,13 +183,16 @@ def make_package(out_dir, part_size_mb, label):
     # 切完即删完整 zip（恢复端合并生成）
     os.remove(zip_path)
 
+    # 4) 安装脚本编译期要用的下载三元组
+    artifact_path = write_artifact_include(out_dir, part_paths, zip_sha)
+
     total_size = sum(os.path.getsize(p) for p in part_paths)
     print(f"\n✅ 已生成 {len(part_paths)} 个分卷 + 1 个校验文件，共 {total_size / 1024 / 1024:.1f} MB")
     for p in part_paths + [sha_path]:
         print(f"   {os.path.basename(p)}  ({os.path.getsize(p) / 1024 / 1024:.1f} MB)")
     print(f"\n下一步：全部上传到 Gitee Release 附件（tag=v版本），")
     print(f"克隆端运行 python scripts/setup_ocr.py --release v版本 自动下载恢复。")
-    return part_paths + [sha_path]
+    return part_paths + [sha_path, artifact_path]
 
 
 def main():

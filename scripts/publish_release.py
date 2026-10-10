@@ -43,10 +43,10 @@ GITEE_REPO = "lingfeng983/screenshot-translation"
 GITEE_API = "https://gitee.com/api/v5"
 
 ISCC_CANDIDATES = [
-    r"C:\Program Files (x86)\Inno Setup 6\iscc.exe",
-    r"C:\Program Files\Inno Setup 6\iscc.exe",
-    r"C:\Program Files (x86)\Inno Setup 7\iscc.exe",
+    # 安装脚本用了 Inno 7 的内置下载（download 标志 + ExternalSize + Hash +
+    # extractarchive），6.x 编不过，所以候选只列 7
     r"C:\Program Files\Inno Setup 7\iscc.exe",
+    r"C:\Program Files (x86)\Inno Setup 7\iscc.exe",
 ]
 
 
@@ -86,21 +86,31 @@ def step_assemble(version):
         shutil.rmtree(dst)
     shutil.copytree(src, dst)
 
-    iscc = next((p for p in ISCC_CANDIDATES if os.path.isfile(p)), None)
-    if not iscc:
-        sys.exit("未找到 Inno Setup 编译器 iscc.exe，请安装后重试")
-    iss = os.path.join(PROJECT_ROOT, "scripts", "setup.iss")
-    run([iscc, f"/DMyAppVersion={version}", f"/DMyAppOcrTag=v{version}", iss])
-
-    # OCR 组件不进 exe，改成安装时从本次 Release 的附件拉取，
-    # 所以分卷必须跟安装包一起产出、一起上传（包名固定，装填器按名字找）
+    # OCR 组件不进 exe，改成安装时从本次 Release 的附件拉取，所以分卷必须跟安装包
+    # 一起产出、一起上传（包名固定，装填器按名字找）。而且必须**先**打包再编安装脚本：
+    # download 标志要在编译期给出附件字节数与 SHA256，这两个值只有出包那步知道
     run([sys.executable, "scripts/collect_ocr_bundle.py"])
     run([sys.executable, "scripts/make_release_package.py"])
     parts_dir = os.path.join(PROJECT_ROOT, "dist", "release")
-    for name in ("ocr-components.zip.001", "ocr-components.zip.sha256"):
+    for name in ("ocr-components.zip.001", "ocr-components.zip.sha256",
+                 "ocr-artifact.iss"):
         path = os.path.join(parts_dir, name)
         if not os.path.isfile(path):
             sys.exit(f"缺少 OCR 附件：{path}（安装包里勾了下载的都会失败）")
+    parts = sorted(n for n in os.listdir(parts_dir)
+                   if n.startswith("ocr-components.zip.") and not n.endswith(".sha256"))
+    if len(parts) > 1:
+        # Setup 内置下载只取单个附件，多卷得回到老的合并路线，不能默默出一个
+        # 勾了 OCR 就必然中止的安装包
+        sys.exit(f"OCR 组件被切成了 {len(parts)} 卷：安装包只会下载第一卷，识别必然失败。"
+                 f"用 --part-size 放宽到单卷（Gitee 单附件上限 100MB），"
+                 f"或临时用 python scripts/setup_ocr.py --release v{version} 补装组件")
+
+    iscc = next((p for p in ISCC_CANDIDATES if os.path.isfile(p)), None)
+    if not iscc:
+        sys.exit("未找到 Inno Setup 7 编译器 iscc.exe，请安装后重试")
+    iss = os.path.join(PROJECT_ROOT, "scripts", "setup.iss")
+    run([iscc, f"/DMyAppVersion={version}", f"/DMyAppOcrTag=v{version}", iss])
 
 
 def step_changelog(version):

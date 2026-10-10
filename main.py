@@ -21,7 +21,7 @@ from PyQt5.QtWidgets import (
 
 # 配置日志（全局唯一入口，其他模块只使用 logging.getLogger）
 # 日志路径按运行形态定位：源码→项目根，exe→~/.screenshot-translation（可写）
-from managers import app_paths, result_render, styles
+from managers import app_paths, result_render, single_instance, styles
 from managers.provider_common import redact_url_query
 
 
@@ -167,6 +167,16 @@ class MainApp:
     def start(self):
         """启动应用：初始化各管理器并进入Qt事件循环"""
         logger.info("启动应用")
+
+        # 多开会让两个实例抢同一个热键（后起的只能退到键盘钩子）、托盘上叠出
+        # 两个图标，用户侧就是"快捷键时灵时不灵"。必须在注册热键之前拦住。
+        if not single_instance.acquire():
+            single_instance.notify_already_running()
+            # 不走 _force_exit：本进程什么都没读过，落盘翻译缓存只会把已经在跑
+            # 的那个实例写好的 translation_cache.json 覆盖成空表
+            logging.shutdown()
+            os._exit(0)
+            return
 
         try:
             # 初始化QApplication（使用单例模式）
@@ -710,6 +720,14 @@ class ConfigWindow(QDialog):
                     logger.error(f"获取全局快捷键失败: {e}")
             hotkey_layout.addRow("全局快捷键:", self.hotkey_edit)
 
+            # 快捷键的真实注册状态摆在眼前：被别的程序占用时只能退到键盘钩子，
+            # 而钩子在提权窗口/锁屏切换后收不到按键——用户只觉得"偶尔失灵"。
+            # 只在保存时才说就太晚了，打开设置就得看见。
+            self.hotkey_status_label = QLabel("")
+            # 整行宽度都要用上：占用提示是两行长句，缩在字段列里会被裁掉
+            self.hotkey_status_label.setWordWrap(True)
+            hotkey_layout.addRow(self.hotkey_status_label)
+
             hotkey_group.setLayout(hotkey_layout)
             layout.addWidget(hotkey_group)
 
@@ -753,6 +771,7 @@ class ConfigWindow(QDialog):
             for combo in content.findChildren(QComboBox):
                 combo.installEventFilter(self)
 
+            self._refresh_hotkey_status()
             logger.info("配置窗口UI初始化成功")
         except Exception as e:
             logger.error(f"初始化配置窗口UI失败: {e}")
@@ -768,6 +787,38 @@ class ConfigWindow(QDialog):
                 QApplication.sendEvent(scroll.viewport(), event)
             return True
         return super().eventFilter(obj, event)
+
+    def _refresh_hotkey_status(self):
+        """
+        把快捷键的注册状态写进快捷键分组
+
+        每次显示窗口都重算：占用是动态的——看门狗会在占用方退出后把后端升回
+        系统原生注册，用户再次打开设置时应该看到恢复后的状态而不是旧文案。
+        """
+        label = getattr(self, 'hotkey_status_label', None)
+        if label is None:
+            return
+        manager = getattr(self.main_app, 'hotkey_manager', None)
+        if manager is None:
+            text, warning = ("快捷键管理器不可用：本次启动未能注册全局快捷键", True)
+        else:
+            try:
+                text, warning = manager.status_hint()
+            except Exception as e:
+                logger.warning(f"读取快捷键状态失败: {e}")
+                return
+
+        label.setText(text)
+        # objectName 决定颜色，改完必须重新 polish，否则 QSS 还是旧的那套
+        label.setObjectName("hotkeyWarning" if warning else "hintLabel")
+        style = label.style()
+        style.unpolish(label)
+        style.polish(label)
+
+    def showEvent(self, event):
+        """每次显示设置窗口都刷新快捷键状态（占用情况会在运行期间变化）"""
+        super().showEvent(event)
+        self._refresh_hotkey_status()
 
     def _target_languages(self):
         """获取目标语言列表（翻译管理器可用时从其读取，否则用默认值）"""
@@ -1024,6 +1075,8 @@ class ConfigWindow(QDialog):
                 fail_reason = getattr(
                     self.main_app.hotkey_manager, 'last_error', '') or \
                     f"快捷键 {hotkey} 注册失败，已保留原快捷键。"
+                # 回滚之后窗口还开着，状态行必须跟上，不然显示的仍是刚输入的值
+                self._refresh_hotkey_status()
                 QMessageBox.warning(
                     self,
                     "快捷键无效",

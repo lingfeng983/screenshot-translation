@@ -4,6 +4,19 @@
 
 ## [Unreleased]
 
+### 新增
+- **同一时间只允许一个实例**：`managers/single_instance.py` 用命名互斥体
+  `Local\ScreenshotTranslator.SingleInstance` 占位，重复启动时弹一句"已经在运行
+  中，请用托盘图标或 Alt+Z"然后直接退出——多开会出现两套托盘图标、两个全局热键
+  抢同一组合，而且第二个实例的写盘会把第一个的缓存与配置顶掉。退出走的是
+  `logging.shutdown()` + 直接结束进程，不落翻译缓存（这进程什么都没读过，落盘
+  只会把正在跑的那个实例写好的 `translation_cache.json` 覆盖成空表）。联调或
+  测试要故意多开时设 `ST_ALLOW_MULTI_INSTANCE=1`
+- **打开设置就能看到快捷键到底注册上了没有**：以前被别的程序占用时界面一切正常，
+  只有按键没反应才知道坏了。现在快捷键分组里多一行状态：占用时红字写明是
+  "系统注册失败，已改用键盘钩子兜底"还是"当前未注册"，并给出释放占用的方向；
+  注册成功则写明走系统投递还是钩子。开窗、改组合、点保存都会刷新这一行
+
 ### 修复
 - **改一次设置就崩溃**：配置文件里缺 `[Translation]`/`[Hotkey]`/`[Startup]`
   任一段时（老文件或手改过的文件都很常见），点“保存”会让对应 setter 抛
@@ -109,6 +122,17 @@
 - **没保存也换了主题**：设置窗口下拉一改就预览（改的是进程级 stylesheet），
   直接关窗则界面一直顶着预览主题跑，与配置里的值不一致。关窗时若预览值
   与已落盘值不同就恢复回去
+- **安装 OCR 组件时弹出控制台窗口**：装填阶段用 `Exec` 拉起 powershell 跑
+  `scripts/fetch_ocr.ps1`，那个窗口既挡在向导前面、进度也只在窗口里。现在下载、
+  SHA256 校验、解压整个交给 Setup 自己完成（`[Files]` 的 `download` + `Hash` +
+  `extractarchive`，配 `[Setup]` 的 `ArchiveExtraction=auto`），全程不起外部进程，
+  进度条就在向导里；`fetch_ocr.ps1` 随之删除，同一标签已装过仍按
+  `ocr-version.txt` 跳过重复下载（老脚本写的带 CRLF 标记也能识别）
+- **分组标题贴在内容框上**：`QGroupBox` 的 `margin-top` 只有 14px，标题行高 13px，
+  基线刚好压着框线上边框，看着像写在框里。标题改占框外独立一行（`margin-top: 24px`
+  配合 `left: 2px`、内边距收紧），两套主题都用
+  `style().subControlRect(CC_GroupBox, …, SC_GroupBoxLabel/SC_GroupBoxFrame)`
+  量过标题矩形不越过框矩形
 
 ### 测试
 - 新增遮罩坐标/失败语义用例：裁剪框含右下像素（含横纵不等比与裁空取消）、
@@ -128,8 +152,27 @@
 - **`QApplication` 由会话级 fixture 一直持有**：Qt 的 C++ 对象一旦随 Python
   引用被回收，之后再构造任何控件都会触发 `qFatal` 直接结束进程（没有 Python
   异常、没有回溯），用例必须共用同一个实例
+- 新增 `tests/test_single_instance.py`：同一互斥体名第二次申请必须被拒、句柄
+  关闭后可重新取得、重复 `acquire()` 幂等且不泄漏句柄、`ST_ALLOW_MULTI_INSTANCE=1`
+  放行、提示文案提到托盘；非 Windows 平台整体跳过，用例各用唯一名字互不干扰
+- 新增分组标题与快捷键状态行用例：前者按 `SC_GroupBoxLabel`/`SC_GroupBoxFrame`
+  实量（标题底边不得越过框顶边，覆盖 ≥6 个分组），后者把注册状态的各种
+  backend/错误组合参数化，断言文案、告警色与自动换行
+- 新增安装包内置下载用例：钉住 `[Files]` 的 `download`+`ExternalSize`+`Hash`+
+  `extractarchive` 与 `[Code]` 的跳过标记都在，同时断言脚本里不再出现任何
+  `Exec(`、`.ps1` 引用，并检查发版流程确实是先出 OCR 包再编安装器
 
 ### 发版与安装
+- **安装包的下载地址在编译期注入**：`make_release_package.py` 出完分卷顺手写
+  `dist/release/ocr-artifact.iss`（第一卷附件名、字节数、整包 SHA256、卷数），
+  `setup.iss` 编译期 include 它——Inno 的 `download` 标志强制要 `ExternalSize`，
+  而 `iscc` 没有 SHA256/文件大小内置函数，装填端更算不出来。发版流程因此改成
+  **先出 OCR 包、再编安装器**，反了就会拿上一版的校验值编出一个装不上的包；
+  组件被切成多卷（内置下载只支持单附件）时发版当场中止，而不是产出一个勾了
+  OCR 就必然报错的安装包
+- **编译安装包需要 Inno Setup 7**：内置下载与 `extractarchive` 是 7 的能力，
+  `publish_release.py` 的编译器候选去掉了 6.x；`Check` 回调在 7 里不接受
+  `Param: String` 形参（报 Invalid prototype），改用无参函数
 - **发版只认发布目标仓库**：动手前先核对 `origin` 就是本仓库，Release 的
   `target_commitish` 跟随当前分支；在 fork 里执行会当场中止，不会把版本和
   附件发到上游去

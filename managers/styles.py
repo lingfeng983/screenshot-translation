@@ -46,6 +46,7 @@ _PALETTES = {
         'accent': '#3b82f6',       # 强调蓝
         'accent_hover': '#60a5fa',
         'accent_pressed': '#2f6fd8',
+        'danger': '#f87171',       # 需要用户处理的异常状态文字
         'selection_text': '#ffffff',
     },
     THEME_LIGHT: {
@@ -61,6 +62,7 @@ _PALETTES = {
         'accent': '#2563eb',
         'accent_hover': '#1d4ed8',
         'accent_pressed': '#1e40af',
+        'danger': '#d92d20',       # 需要用户处理的异常状态文字
         'selection_text': '#ffffff',
     },
 }
@@ -150,21 +152,27 @@ QGroupBox {{
     background-color: {p['panel_bg']};
     border: 1px solid {p['border']};
     border-radius: 10px;
-    margin-top: 14px;
-    padding: 10px 12px 9px 12px;
+    /* margin-top 就是留给标题的一行：标题落在边框之上，不再压着卡片边线 */
+    margin-top: 24px;
+    padding: 12px 14px 11px 14px;
     font-weight: 600;
 }}
 QGroupBox::title {{
     subcontrol-origin: margin;
     subcontrol-position: top left;
-    left: 12px;
-    padding: 0 6px;
+    left: 2px;
+    padding: 0;
     color: {p['accent']};
+    background: transparent;
 }}
 
 QLabel {{ background: transparent; }}
 QLabel#testResultLabel, QLabel#hintLabel {{ color: {p['text_sub']}; }}
 QLabel#hintLabel {{ font-size: 12px; }}
+QLabel#hotkeyWarning {{
+    color: {p['danger']};
+    font-size: 12px;
+}}
 
 QLineEdit, QTextEdit, QPlainTextEdit, QSpinBox, QDoubleSpinBox {{
     background-color: {p['input_bg']};

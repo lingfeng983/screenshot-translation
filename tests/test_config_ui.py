@@ -8,8 +8,9 @@
 2. 保存流程：写配置 + 同步翻译/OCR 管理器
 3. 主题切换的真实渲染、扩展 provider 自定义字段持久化
 4. 遮罩结果态：就地覆盖、工具条三态、段落卡片、降级与失败
-5. 设置页排版：下拉框滚轮免疫、紧凑间距、标签右对齐
+5. 设置页排版：下拉框滚轮免疫、紧凑间距、标签右对齐、分组标题不压边框
 6. 设置窗口单实例
+7. 快捷键注册状态在设置页直接可见（被占用时给警示文案）
 
 默认全部离线可跑。两类用例要显式开启：
 - 真连翻译接口的（`ST_RUN_ONLINE=1`）
@@ -424,6 +425,99 @@ def test_settings_combos_ignore_wheel_but_page_still_scrolls(win, qapp):
             f"滚轮未转交滚动区: {before_scroll} -> {vbar.value()}"
 
 
+def test_group_titles_have_their_own_line_above_the_frame(win):
+    """
+    分组标题必须整条落在卡片边框之上
+
+    Qt 的 QGroupBox 默认把标题画在边框线上，之前 margin-top 只给了 14px
+    （比标题本身还矮），于是每个分类的标题都"贴"在内容框上。这里直接问
+    style 要两个子控件矩形，比数像素稳。
+    """
+    from PyQt5.QtWidgets import QGroupBox, QStyle, QStyleOptionGroupBox
+
+    checked = 0
+    for group in win.findChildren(QGroupBox):
+        if not group.title():
+            continue
+        option = QStyleOptionGroupBox()
+        option.initFrom(group)
+        option.text = group.title()
+        option.subControls = (QStyle.SC_GroupBoxLabel |
+                              QStyle.SC_GroupBoxFrame)
+        style = group.style()
+        title_rect = style.subControlRect(
+            QStyle.CC_GroupBox, option, QStyle.SC_GroupBoxLabel, group)
+        frame_rect = style.subControlRect(
+            QStyle.CC_GroupBox, option, QStyle.SC_GroupBoxFrame, group)
+        assert title_rect.isValid() and frame_rect.isValid(), \
+            f"{group.title()} 子控件矩形取不到，断言失效"
+        assert title_rect.bottom() <= frame_rect.top(), \
+            f"{group.title()} 标题压在内容框上: {title_rect} vs {frame_rect}"
+        checked += 1
+    assert checked >= 6, f"检查到的分组太少: {checked}"
+
+
+class _StubHotkeyManager:
+    """只汇报状态的快捷键替身（用例不该为了看文案去注册真热键）"""
+
+    def __init__(self, hint):
+        self._hint = hint
+
+    def status_hint(self):
+        return self._hint
+
+
+@pytest.mark.parametrize('hint, expected_object_name', [
+    (('快捷键 alt+z 已被其他程序占用，已改用兼容方式（键盘钩子）注册', True),
+     'hotkeyWarning'),
+    (('快捷键 ctrl+alt+z 已由系统注册，随时可用', False), 'hintLabel'),
+])
+def test_hotkey_status_line_reports_registration_state(
+        main_app, qapp, hint, expected_object_name):
+    """
+    打开设置就得看到占用提示
+
+    占用只影响可靠性（钩子在提权窗口/锁屏切换后收不到键），不影响"按一次响一次"，
+    所以以前只在保存时弹一次框——用户平时根本不知道自己处在降级状态。
+    """
+    from main import ConfigWindow
+
+    main_app.hotkey_manager = _StubHotkeyManager(hint)
+    window = ConfigWindow(main_app)
+    window.show()
+    spin(qapp)
+    try:
+        label = window.hotkey_status_label
+        assert label.text() == hint[0], f"状态行没显示当前状态: {label.text()!r}"
+        assert label.objectName() == expected_object_name, \
+            f"异常状态没走警示配色: {label.objectName()}"
+        assert label.wordWrap(), "两行的占用提示不换行会被裁掉"
+    finally:
+        window.close()
+
+
+def test_status_hint_flags_unregistered_hotkey(main_app):
+    """状态文案由管理器给：没注册成功就不能说“随时可用”"""
+    from managers.hotkey import HotkeyManager
+
+    manager = HotkeyManager(None, main_app.config_manager)
+    try:
+        text, warning = manager.status_hint()
+        assert warning and '未设置' in text, f"空快捷键应提醒: {text}"
+
+        manager.hotkey = 'ctrl+alt+z'
+        manager._backend = 'native'
+        text, warning = manager.status_hint()
+        assert not warning and 'ctrl+alt+z' in text, f"原生注册不该报警: {text}"
+
+        manager._backend = None
+        manager.last_error = '快捷键 ctrl+alt+z 注册失败'
+        text, warning = manager.status_hint()
+        assert warning and '注册失败' in text, f"注册失败必须显式提醒: {text}"
+    finally:
+        manager.cleanup()
+
+
 def test_settings_layout_is_compact_and_labels_right_aligned(win):
     from PyQt5.QtCore import Qt
     from PyQt5.QtWidgets import QFormLayout, QGroupBox, QPushButton, QScrollArea
@@ -638,7 +732,9 @@ def test_every_provider_degrades_gracefully_on_real_calls(main_app, win):
 @smoke
 def test_main_entry_point_starts():
     """真拉起 main.py：日志出现启动成功即通过（会注册全局热键）"""
-    env = dict(os.environ, PYTHONIOENCODING='utf-8')
+    # 允许多开：用户本机往往已经跑着正式安装的实例，单实例守卫会把这次
+    # 冒烟直接拦成"程序已在运行"，而那个提示框还是模态的、没人点
+    env = dict(os.environ, PYTHONIOENCODING='utf-8', ST_ALLOW_MULTI_INSTANCE='1')
     proc = subprocess.Popen(
         [sys.executable, 'main.py'],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env, text=True,
