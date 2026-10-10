@@ -30,6 +30,8 @@ class ThreadPoolManager:
         self.is_initialized = False
         # 终态标志：一旦 shutdown 就不再允许重建线程池
         self._is_shutdown = False
+        # 已提交且未完成的 future：收尾时按超时等它们，而不是碰私有属性
+        self._pending = set()
 
         logger.info(f"线程池管理器初始化，最大工作线程数: {max_workers}")
 
@@ -44,21 +46,19 @@ class ThreadPoolManager:
             if self._is_shutdown:
                 logger.warning("线程池已关闭，拒绝重新初始化")
                 return False
-            if not self.is_initialized:
-                try:
-                    self.executor = concurrent.futures.ThreadPoolExecutor(
-                        max_workers=self.max_workers,
-                        thread_name_prefix="screenshot-translation-"
-                    )
-                    self.is_initialized = True
-                    logger.info("线程池初始化成功")
-                    return True
-                except Exception as e:
-                    logger.error(f"线程池初始化失败: {e}")
-                    import traceback
-                    traceback.print_exc()
-                    return False
-            return True
+            if self.is_initialized:
+                return True
+            try:
+                self.executor = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=self.max_workers,
+                    thread_name_prefix="screenshot-translation-"
+                )
+                self.is_initialized = True
+                logger.info("线程池初始化成功")
+                return True
+            except Exception as e:
+                logger.exception(f"线程池初始化失败: {e}")
+                return False
 
     def submit(self, func, *args, **kwargs):
         """
@@ -89,38 +89,67 @@ class ThreadPoolManager:
 
         try:
             future = executor.submit(func, *args, **kwargs)
-            logger.debug(f"任务已提交到线程池: {func.__name__}")
-            return future
         except Exception as e:
-            logger.error(f"提交任务到线程池失败: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.exception(f"提交任务到线程池失败: {e}")
             return None
 
-    def shutdown(self, wait=True, cancel_futures=False):
+        # 记账要在 future 完成的瞬间摘掉：否则 _pending 只会越积越大
+        self._pending.add(future)
+        future.add_done_callback(self._pending.discard)
+        logger.debug(f"任务已提交到线程池: {getattr(func, '__name__', repr(func))}")
+        return future
+
+    def wait_pending(self, timeout=None):
+        """
+        等待已提交的任务收尾
+
+        Args:
+            timeout (float 或 None): 最多等这么多秒；None 表示等到全部结束
+
+        Returns:
+            int: 超时仍未完成的任务数
+        """
+        with self.lock:
+            pending = set(self._pending)
+        if not pending:
+            return 0
+        concurrent.futures.wait(pending, timeout=timeout)
+        return sum(1 for future in pending if not future.done())
+
+    def shutdown(self, wait=True, cancel_futures=False, timeout=None):
         """
         关闭线程池（终态操作，之后不再允许重建）
 
         Args:
             wait (bool): 是否等待已提交任务执行完成
             cancel_futures (bool): 是否取消尚未开始执行的任务（Python 3.9+）
+            timeout (float 或 None): wait=True 时最多等这么多秒；None 表示
+                等到收尾为止。这里的等待只是尽力而为：工作线程可能正卡在
+                网络读上，调用方要按“可能等满 timeout”来安排退出流程
         """
         with self.lock:
+            if self._is_shutdown:
+                return
             self._is_shutdown = True
-            if self.is_initialized:
-                try:
-                    try:
-                        self.executor.shutdown(wait=wait, cancel_futures=cancel_futures)
-                    except TypeError:
-                        # Python < 3.9 不支持 cancel_futures
-                        self.executor.shutdown(wait=wait)
-                    self.is_initialized = False
-                    self.executor = None
-                    logger.info(f"线程池已关闭，等待任务完成: {wait}，取消排队任务: {cancel_futures}")
-                except Exception as e:
-                    logger.error(f"关闭线程池失败: {e}")
-                    import traceback
-                    traceback.print_exc()
+            executor = self.executor
+            self.executor = None
+            self.is_initialized = False
+
+        if executor is None:
+            return
+
+        # 等待放在锁外做：持着锁 join 会把这期间任何 submit() 一起卡住
+        try:
+            executor.shutdown(wait=False, cancel_futures=cancel_futures)
+        except TypeError:
+            # Python < 3.9 不支持 cancel_futures
+            executor.shutdown(wait=False)
+
+        left = self.wait_pending(timeout) if wait else 0
+        logger.info(f"线程池已关闭（取消排队任务: {cancel_futures}，"
+                    f"仍在运行的任务: {left}）")
+        if left:
+            logger.warning(f"{left}个任务在超时后仍未结束，退出不再等它们")
 
     def is_running(self):
         """

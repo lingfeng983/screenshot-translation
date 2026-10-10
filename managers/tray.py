@@ -13,6 +13,7 @@ import time
 import pystray
 
 from .icon import generate_icon
+from .qt_dispatcher import qt_dispatcher
 
 logger = logging.getLogger('screenshot-translation')
 
@@ -247,17 +248,24 @@ class SystemTrayManager:
     def _on_exit(self, icon=None, item=None):
         """
         退出菜单项回调
+
+        回调跑在 pystray 自己的线程里：直接在这调用 `QApplication.quit()`
+        只是给主线程置个退出标志，事件循环还在睡，用户看到的就是
+        “点了退出没反应”，要等下一个事件才被带走。所以把退出动作投回主线程。
         """
         logger.info("托盘菜单：退出应用")
         try:
-            # 先清理托盘资源
+            # 先清理托盘资源（只碰 pystray 侧，不涉及 Qt 对象）
             self.cleanup()
+        except Exception as e:
+            logger.error(f"清理托盘资源失败: {e}")
 
+        try:
             if self.main_app:
-                # 通知主应用退出
-                self.main_app.quit()
+                # 通知主应用退出：必须在 Qt 主线程执行
+                qt_dispatcher.dispatch_to_main_thread(self.main_app.quit)
             else:
-                # 直接退出
+                # 没有主应用可通知，直接结束进程
                 import sys
                 sys.exit(0)
         except Exception as e:

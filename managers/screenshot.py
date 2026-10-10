@@ -19,6 +19,7 @@ from PyQt5.QtWidgets import QApplication, QWidget
 # 导入必要的模块
 from . import clipboard
 from . import result_render
+from .error_handler import error_handler
 from .ocr import is_ocr_notice
 from .overlay_toolbar import OverlayToolbar
 from .pin_window import PinWindow
@@ -230,11 +231,16 @@ class ScreenshotManager:
             self._screenshot_widget.setFocus()
 
             logger.info("截图窗口已显示")
+            # 遮罩是全屏置顶窗口：此时弹模态错误框会把用户卡在
+            # “遮罩关不掉、框又看不见”的位置，失败文案改由遮罩内展示
+            error_handler.set_modal_allowed(False)
             # 不在此处调用 app.exec_()：主事件循环已在运行，嵌套调用会立即返回
         except Exception as e:
-            logger.error(f"截图流程失败: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.exception(f"截图流程失败: {e}")
+            pending = self._screenshot_widget
+            if pending is None or not self._widget_is_live(pending):
+                # 遮罩没能立起来，恢复弹窗（否则错误提示从此静默）
+                error_handler.set_modal_allowed(True)
 
     @staticmethod
     def _widget_is_live(widget):
@@ -257,6 +263,8 @@ class ScreenshotManager:
         """关闭并释放截图窗口引用（窗口已被销毁时可安全调用）"""
         # 遮罩都没了，在途的识别与翻译再无去处，立刻让它们收手
         self._cancel_inflight()
+        # 全屏遮罩不在了，错误提示可以正常弹窗
+        error_handler.set_modal_allowed(True)
         widget = self._screenshot_widget
         self._screenshot_widget = None
         self._last_request = None
@@ -393,7 +401,6 @@ class ScreenshotManager:
                 blocks, original_text, target_lang, force_refresh,
                 whole=payload['translated_text'], token=token)
         except Exception as e:
-            from .error_handler import error_handler
             error_handler.handle_error(e, "截图处理")
             payload['error'] = str(e)
         finally:

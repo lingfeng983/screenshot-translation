@@ -22,6 +22,30 @@ class ErrorHandler:
     负责统一处理错误和提供友好的错误提示
     """
 
+    # 是否允许弹模态框：截图遮罩是全屏置顶窗口，此时弹框会把用户卡在
+    # “遮罩点不掉、框也看不见”的位置
+    _modal_allowed = True
+    # 退出清理期间置位且不再复位：收尾阶段冒出来的框会挡住退出流程
+    _modal_disabled_for_shutdown = False
+
+    @staticmethod
+    def set_modal_allowed(allowed):
+        """
+        开关模态错误框（遮罩显示期间关闭，遮罩释放后恢复）
+
+        Args:
+            allowed (bool): 是否允许弹出模态错误框
+        """
+        if allowed and ErrorHandler._modal_disabled_for_shutdown:
+            return
+        ErrorHandler._modal_allowed = bool(allowed)
+
+    @staticmethod
+    def disable_modals_for_shutdown():
+        """退出清理期间永久禁框：此后遮罩释放也不恢复"""
+        ErrorHandler._modal_disabled_for_shutdown = True
+        ErrorHandler._modal_allowed = False
+
     @staticmethod
     def handle_error(error, module_name, show_message=True):
         """
@@ -41,6 +65,10 @@ class ErrorHandler:
 
         # 显示错误提示（可能被工作线程调用，QMessageBox 必须在主线程创建）
         if show_message:
+            if not ErrorHandler._modal_allowed:
+                # 遮罩在场：失败文案由遮罩内的结果区展示，弹窗只会挡住交互
+                logger.info(f"{module_name}的错误提示已改为遮罩内展示/仅记日志")
+                return f"{module_name}模块发生错误: {str(error)}"
             qt_dispatcher.dispatch_to_main_thread(
                 ErrorHandler._show_critical_box, module_name, error
             )

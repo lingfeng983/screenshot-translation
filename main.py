@@ -103,6 +103,9 @@ class MainApp:
     负责各管理器的初始化、生命周期管理与资源清理
     """
 
+    # 退出时给在飞的后台任务留这么点收尾时间，到点就不再陪它们
+    _EXIT_DRAIN_SECONDS = 1.5
+
     def __init__(self):
         """初始化主应用并注册全局异常处理"""
         logger.info("初始化主应用")
@@ -156,8 +159,7 @@ class MainApp:
                 self.cleanup()
             except Exception as cleanup_error:
                 logger.error(f"清理过程中出错: {cleanup_error}")
-            finally:
-                sys.exit(0)
+            self._force_exit(0)
 
         # 使用统一的错误处理
         error_handler.handle_error(exc_value, "主应用")
@@ -226,7 +228,7 @@ class MainApp:
             logger.info(f"应用事件循环结束，退出代码: {exit_code}")
             # 事件循环正常结束也要释放热键钩子、托盘与线程池
             self.cleanup()
-            sys.exit(exit_code)
+            self._force_exit(exit_code)
 
         except Exception as e:
             error_handler.handle_error(e, "应用启动")
@@ -235,7 +237,7 @@ class MainApp:
                 self.cleanup()
             except Exception as cleanup_error:
                 logger.error(f"启动失败后清理资源出错: {cleanup_error}")
-            sys.exit(1)
+            self._force_exit(1)
 
     def _apply_app_icon(self):
         """设置应用全局图标（窗口与任务栏）"""
@@ -379,11 +381,15 @@ class MainApp:
         if self.app:
             self.app.quit()
         else:
-            sys.exit(0)
+            # 事件循环已经不在了：不会再有下一段代码替我们收尾，直接结束进程
+            self._force_exit(0)
 
     def cleanup(self):
         """按序清理快捷键、托盘、线程池与Qt应用资源"""
         logger.info("清理资源")
+
+        # 清理阶段再弹模态框等于把退出流程卡住（要用户点掉才能继续）
+        error_handler.disable_modals_for_shutdown()
 
         with self._resource_lock:
             if self._cleaned_up:
@@ -399,9 +405,12 @@ class MainApp:
                     logger.debug("清理系统托盘")
                     self.tray_manager.cleanup()
 
-                # 关闭线程池：取消尚未开始的任务，避免退出时被在飞的翻译重试阻塞数分钟
+                # 关闭线程池：排队任务直接取消，在飞的最多再等这么点时间。
+                # 真等它们收尾不划算——worker 可能正卡在一次网络读上
                 logger.debug("关闭线程池")
-                thread_pool_manager.shutdown(wait=False, cancel_futures=True)
+                thread_pool_manager.shutdown(
+                    wait=True, cancel_futures=True,
+                    timeout=self._EXIT_DRAIN_SECONDS)
 
                 # 释放翻译链路的连接池（复用同一个 Session，退出时不留 socket）
                 if self.translation_manager:
@@ -419,15 +428,37 @@ class MainApp:
                 logger.info("资源清理完成")
 
             except Exception as e:
-                logger.error(f"清理资源失败: {e}")
-                import traceback
-                traceback.print_exc()
+                logger.exception(f"清理资源失败: {e}")
                 # 即使清理失败也要尽力释放资源
                 if self.app:
                     try:
                         self.app.quit()
                     except Exception as e:
                         logger.error(f"退出Qt应用失败: {e}")
+
+    def _force_exit(self, exit_code=0):
+        """
+        落盘缓存与日志后立即结束进程
+
+        解释器收尾阶段会无条件 join 线程池的工作线程（`concurrent.futures` 在
+        3.9 起把 worker 设成非 daemon 并注册 atexit 等待），卡在单次网络读上的
+        worker 能让进程迟迟不退——实测最久约 90 秒。清理与落盘都已经在这之前
+        做完，剩下的只有“别人替我们等”，所以直接结束进程。
+
+        Args:
+            exit_code (int): 进程退出码
+        """
+        try:
+            from managers.cache_manager import cache_manager
+            # atexit 不会再跑，翻译缓存必须在这里落盘
+            cache_manager.flush()
+        except Exception as e:
+            logger.warning(f"退出前落盘缓存失败: {e}")
+        try:
+            logging.shutdown()
+        except Exception as e:
+            logger.warning(f"退出前刷新日志失败: {e}")
+        os._exit(exit_code)
 
 class ConfigWindow(QDialog):
     """
