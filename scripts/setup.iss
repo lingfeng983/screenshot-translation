@@ -6,7 +6,7 @@
 ; ~/.screenshot-translation/resources/，程序运行时按该路径探测
 ; （managers/app_paths.py: ocr_resources_dir）。全程不起外部进程，
 ; 所以不会再弹控制台窗口。
-; 这样 Setup.exe 从 105MB 降到约 10MB，也不用维护 225MB 的二进制入库。
+; 这样 Setup.exe 从 105MB 降到约 30MB，也不用维护 225MB 的二进制入库。
 ;
 ; 前置条件（依次执行，publish_release.py 会串起来）：
 ;   1. python -m PyInstaller screenshot-translator.spec --noconfirm
@@ -40,6 +40,7 @@
 ; 出包脚本写进这个文件的三元组：附件名、字节数、整包 SHA256。
 ; 编译期拿不到就没法用内置下载（download 标志强制要 ExternalSize），
 ; 届时勾了 OCR 组件的安装会直接中止并说明原因，而不是悄悄装个没识别能力的包。
+; 这里的相对路径按本脚本所在目录解析（不是 iscc 的工作目录），从仓库根编译也对。
 #define MyAppOcrArtifact "..\dist\release\ocr-artifact.iss"
 #define MyAppOcrPartName ""
 #define MyAppOcrSize 0
@@ -57,6 +58,16 @@
   #else
     #define MyAppOcrDownloadReady 1
   #endif
+#endif
+
+; 编译期把结论打在输出里：[Files] 里的 download 条目是条件编译的，编出来的
+; Setup.exe 名字一样、看不出有没有带 OCR 下载地址，而勾了 OCR 的安装要到用户
+; 机器上才中止。发版脚本（publish_release.py）抓这行 ASCII 哨兵，没就绪就中止。
+#if MyAppOcrDownloadReady
+  #pragma message "OCRDownloadReady=1 part=" + MyAppOcrPartName
+#else
+  #pragma message "OCRDownloadReady=0 reason=" + \
+    (MyAppOcrSha == "" ? "no-artifact-include" : "multi-part")
 #endif
 
 [Setup]

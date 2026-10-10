@@ -146,26 +146,28 @@ def test_dispatch_and_fallback():
     provider_registry.register(FakeOKProvider, override=True)
 
     manager = TranslationManager(config_manager=None)
-    manager.set_api_type('fake_fail')
-    manager.fallback_api_type = 'fake_ok'
+    try:
+        manager.set_api_type('fake_fail')
+        manager.fallback_api_type = 'fake_ok'
 
-    result = manager.perform_translation("hello world")
-    print(f"主API故障后的降级结果: {result}")
-    assert '[zh] hello world' in result, "应降级到备用API并成功翻译"
+        result = manager.perform_translation("hello world")
+        print(f"主API故障后的降级结果: {result}")
+        assert '[zh] hello world' in result, "应降级到备用API并成功翻译"
 
-    # 主API正常时不走降级
-    manager.set_api_type('fake_ok')
-    result2 = manager.perform_translation("another")
-    assert '[zh] another' in result2
+        # 主API正常时不走降级
+        manager.set_api_type('fake_ok')
+        result2 = manager.perform_translation("another")
+        assert '[zh] another' in result2
 
-    # 未知API类型回退到谷歌免费
-    manager.set_api_type('no_such_api')
-    result3 = manager._dispatch_translation("test")
-    assert result3, "未知API应回退到谷歌免费并返回结果"
-
-    # 清理fake provider
-    provider_registry.unregister('fake_fail')
-    provider_registry.unregister('fake_ok')
+        # 未知API类型回退到谷歌免费
+        manager.set_api_type('no_such_api')
+        result3 = manager._dispatch_translation("test")
+        assert result3, "未知API应回退到谷歌免费并返回结果"
+    finally:
+        # 注册表是进程级单例：断言一失败 fake 就一直挂着，后面的用例会在不相干的
+        # 那个断言上失败（结果里冒出 "[故障API] …"），真正的原因反而看不出来
+        provider_registry.unregister('fake_fail')
+        provider_registry.unregister('fake_ok')
 
     print("✅ 分发与降级测试通过\n")
 
@@ -198,24 +200,24 @@ def test_primary_retry_policy():
 
     provider_registry.register(FakeRetryableProvider, override=True)
     manager = TranslationManager(config_manager=None)
+    try:
+        assert manager._default_retry_handler() is translation_retry_handler, \
+            "主API应使用翻译链统一重试器而非基类通用重试器"
 
-    assert manager._default_retry_handler() is translation_retry_handler, \
-        "主API应使用翻译链统一重试器而非基类通用重试器"
+        # 直接走单provider链路，避开免费接口兜底的真实网络请求
+        started = time.monotonic()
+        result, serving = manager._translate_via(FakeRetryableProvider, "hello")
+        elapsed = time.monotonic() - started
 
-    # 直接走单provider链路，避开免费接口兜底的真实网络请求
-    started = time.monotonic()
-    result, serving = manager._translate_via(FakeRetryableProvider, "hello")
-    elapsed = time.monotonic() - started
-
-    assert result.startswith('[翻译失败'), f"故障应转为失败文本: {result}"
-    assert serving is None, "失败的provider不应被记为实际服务方"
-    assert calls['n'] == translation_retry_handler.max_attempts, (
-        f"主API应重试 {translation_retry_handler.max_attempts} 次，实际 {calls['n']} 次"
-        f"（通用策略是 {default_retry_handler.max_attempts} 次）")
-    # 通用策略退避 1s+2s≈3s；统一策略两次之间只等 0.5s±25% 抖动
-    assert elapsed < 1.5, f"主API退避过久: {elapsed:.2f}s，应使用短间隔重试"
-
-    provider_registry.unregister('fake_tr_retryable')
+        assert result.startswith('[翻译失败'), f"故障应转为失败文本: {result}"
+        assert serving is None, "失败的provider不应被记为实际服务方"
+        assert calls['n'] == translation_retry_handler.max_attempts, (
+            f"主API应重试 {translation_retry_handler.max_attempts} 次，实际 {calls['n']} 次"
+            f"（通用策略是 {default_retry_handler.max_attempts} 次）")
+        # 通用策略退避 1s+2s≈3s；统一策略两次之间只等 0.5s±25% 抖动
+        assert elapsed < 1.5, f"主API退避过久: {elapsed:.2f}s，应使用短间隔重试"
+    finally:
+        provider_registry.unregister('fake_tr_retryable')
     print("✅ 主API重试策略测试通过\n")
 
 
@@ -238,29 +240,30 @@ def test_per_translation_target_lang():
 
     provider_registry.register(FakeCaptureProvider, override=True)
     manager = TranslationManager(config_manager=None)
-    manager.set_api_type('fake_capture')
+    try:
+        manager.set_api_type('fake_capture')
 
-    # 用唯一文本避免持久化缓存跨运行命中，确保真的调用到provider
-    import time
-    unique = f"hello {time.time()}"
+        # 用唯一文本避免持久化缓存跨运行命中，确保真的调用到provider
+        import time
+        unique = f"hello {time.time()}"
 
-    # 默认使用全局配置的目标语言
-    manager.perform_translation(unique)
-    assert captured['target'] == 'zh'
+        # 默认使用全局配置的目标语言
+        manager.perform_translation(unique)
+        assert captured['target'] == 'zh'
 
-    # 单次指定目标语言，不修改全局配置
-    result = manager.perform_translation(unique, target_lang='ja')
-    assert captured['target'] == 'ja'
-    assert result == '[ja] ' + unique
-    assert manager.target_lang == 'zh', "全局配置不应被单次翻译修改"
+        # 单次指定目标语言，不修改全局配置
+        result = manager.perform_translation(unique, target_lang='ja')
+        assert captured['target'] == 'ja'
+        assert result == '[ja] ' + unique
+        assert manager.target_lang == 'zh', "全局配置不应被单次翻译修改"
 
-    # 强制刷新 + 指定语言（结果对话框重新翻译路径）
-    result2 = manager.perform_translation(
-        unique, force_refresh=True, target_lang='en')
-    assert captured['target'] == 'en'
-    assert result2 == '[en] ' + unique
-
-    provider_registry.unregister('fake_capture')
+        # 强制刷新 + 指定语言（结果对话框重新翻译路径）
+        result2 = manager.perform_translation(
+            unique, force_refresh=True, target_lang='en')
+        assert captured['target'] == 'en'
+        assert result2 == '[en] ' + unique
+    finally:
+        provider_registry.unregister('fake_capture')
     print("✅ 单次翻译目标语言测试通过\n")
 
 
@@ -597,32 +600,10 @@ def test_request_timeout_shares_remaining_budget():
 
 
 def main():
+    """脚本运行器：用例名单由 _runner 按本模块命名空间发现，不再手抄"""
     print("开始翻译架构测试...\n")
-
-    try:
-        test_provider_registry()
-        test_edge_free_provider()
-        test_chunk_text()
-        test_dispatch_and_fallback()
-        test_primary_retry_policy()
-        test_per_translation_target_lang()
-        test_llm_messages()
-        test_target_languages()
-        test_baidu_language_codes_and_byte_limit()
-        test_business_error_code_classification()
-        test_blank_translation_is_not_success()
-        test_free_fallback_skips_already_tried_engine()
-        test_bing_uses_microsoft_language_codes()
-        test_non_json_response_is_classified()
-        test_request_timeout_shares_remaining_budget()
-
-        print("🎉 所有翻译架构测试通过！")
-        return True
-    except Exception as e:
-        print(f"❌ 测试失败: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
+    from _runner import run_all
+    return run_all(globals(), "🎉 所有翻译架构测试通过！")
 
 
 if __name__ == "__main__":

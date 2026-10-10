@@ -6,7 +6,7 @@
 
 ### 方式一：安装程序（推荐普通用户）
 从 [Releases](https://gitee.com/lingfeng983/screenshot-translation/releases) 下载
-`ScreenshotTranslator-Setup.exe`（约 10MB），双击安装：
+`ScreenshotTranslator-Setup.exe`（约 30MB），双击安装：
 
 1. 安装时会问你是否**下载 OCR 离线识别组件**（默认勾选，约 85MB，从同一 Release 的
    附件取，装到 `%USERPROFILE%\.screenshot-translation\resources\`）。
@@ -232,7 +232,8 @@ ScreenshotTranslation/
 ├── config.py            # 配置管理（[Translation]/[OCR]/[Overlay]/[UI]/[Hotkey]/[Startup]）
 ├── config.ini           # 配置文件（旧版本自动迁移补齐新段）
 ├── CHANGELOG.md         # 更新日志
-├── requirements.txt     # 依赖列表
+├── requirements.txt     # 依赖列表（跑程序）
+├── requirements-dev.txt # 开发/发版工具（pytest、PyInstaller）
 ├── run_fixed.bat        # 启动脚本
 ├── screenshot-translator.spec  # PyInstaller onedir 打包配置（含依赖裁剪）
 ├── scripts/
@@ -243,6 +244,7 @@ ScreenshotTranslation/
 │   └── setup_ocr.py             # 从Release下载恢复OCR组件（源码态/手工补装）
 ├── tests/                   # pytest 回归测试（从项目根直接 python -m pytest tests/）
 │   ├── conftest.py                  # 共用装置：sys.path、会话级 QApplication、online/smoke 标记
+│   ├── _runner.py                   # 脚本运行器的用例发现（python tests/test_xxx.py 时走它）
 │   ├── test_translation_providers.py  # 翻译架构测试
 │   ├── test_ocr_providers.py          # OCR架构测试
 │   ├── test_features.py               # 基础功能测试
@@ -294,10 +296,12 @@ ScreenshotTranslation/
 定义 `name`/`display_name`/`config_fields` + 工作方法 + `register(registry)` 即自动上架配置界面。
 
 ### 打包（onedir + 安装包）
-```bash
+```powershell
 # 1. 打包程序本体（不含 OCR，整个目录约 73MB）
 #    ST_VERSION 会被写进 exe 的 Windows 版本资源（右键属性看得到）；不给就没有版本信息
-ST_VERSION=1.3.0 python -m PyInstaller screenshot-translator.spec --noconfirm
+#    环境变量按你的 shell 给：PowerShell 用 $env:，cmd 用 set，Bash 才用 VAR=值 前缀
+$env:ST_VERSION = "1.3.0"      # cmd: set ST_VERSION=1.3.0
+python -m PyInstaller screenshot-translator.spec --noconfirm
 
 # 2. 出 OCR 组件附件（安装时要从 Gitee Release 拉它）
 python scripts/collect_ocr_bundle.py      # → dist/ocr-bundle（约225MB）
@@ -308,6 +312,9 @@ python scripts/make_release_package.py    # → dist/release/ocr-components.zip.
 # 3. 编译安装器（先把 dist/ScreenshotTranslator/ 拷进 release/onedir/）
 iscc.exe /DMyAppVersion=1.3.0 /DMyAppOcrTag=v1.3.0 scripts\setup.iss
 # 产物：release/ScreenshotTranslator-Setup.exe（约30MB，唯一对外分发包）
+# 输出里的 `OCRDownloadReady=1 part=...` 表示内置下载真编进去了；
+# 打成 `OCRDownloadReady=0 reason=...` 时安装包同名但勾了 OCR 就会中止，
+# publish_release.py 抓这行，未就绪直接中止发版
 ```
 > 上面三步 `python scripts/publish_release.py --version 1.3.0` 一条命令串完，
 > 顺带提交、打 tag、发 Release。编译安装脚本需要 Inno Setup 7（内置下载是 7 的能力）。
@@ -330,11 +337,16 @@ Program Files 或整目录覆盖升级都不会丢配置；旧版本留在 exe �
 首次启动会自动搬进该目录（只补缺，不覆盖已有文件）。源码运行仍在项目根。
 
 ### 测试
-```bash
-PYTHONIOENCODING=utf-8 python -m pytest tests/ -q -rs    # 全程离线，发版前必跑
-ST_RUN_ONLINE=1 python -m pytest tests/ -q -m ""          # 追加真连各翻译接口
-ST_RUN_SMOKE=1 python -m pytest tests/ -q -m ""           # 追加真拉起 main.py（会注册全局热键）
+```powershell
+# Windows 上先把输出编码设好（$env:PYTHONIOENCODING="utf-8"），否则中文用例会乱码
+$env:PYTHONIOENCODING = "utf-8"
+python -m pytest tests/ -q -rs                 # 全程离线，发版前必跑
+$env:ST_RUN_ONLINE = "1"; python -m pytest tests/ -q -m ""   # 追加真连各翻译接口
+$env:ST_RUN_SMOKE = "1"; python -m pytest tests/ -q -m ""    # 追加真拉起 main.py（会注册全局热键）
 ```
+不跑 pytest 也能直接 `python tests/test_features.py`：用例由 `tests/_runner.py`
+按模块命名空间发现（不再手抄名单），需要 pytest fixture 的那几条会列出名字而不是
+静默跳过。开发/发版工具装在 `requirements-dev.txt`（pytest、PyInstaller）。
 界面用例跑在临时数据目录里：配置、缓存、日志、OCR 路径都被重定向到 tmp，
 不碰项目根的 `config.ini`；模态弹窗换成记录型假弹窗，所以保存流程会真的走一遍。
 遮罩断言用真实平台的 `grab()` 取像素（offscreen 平台没有中文字体，绘制会静默失败），

@@ -50,12 +50,29 @@ ISCC_CANDIDATES = [
 ]
 
 
-def run(cmd, cwd=PROJECT_ROOT, check=True, env=None):
+def run(cmd, cwd=PROJECT_ROOT, check=True, env=None, capture=False):
+    """
+    执行子命令
+
+    Args:
+        capture (bool): 收走输出并原样回显，同时把文本返回给调用方判定
+        （iscc 的输出是控制台码页，哨兵本身是 ASCII，解码失败也不影响判定）
+
+    Returns:
+        str: capture 时为合并后的输出，否则为空串
+    """
     print(f"$ {' '.join(cmd)}")
-    result = subprocess.run(cmd, cwd=cwd, env=env)
+    if capture:
+        result = subprocess.run(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, errors="replace")
+        output = result.stdout or ""
+        print(output, end="")
+    else:
+        result = subprocess.run(cmd, cwd=cwd, env=env)
+        output = ""
     if check and result.returncode != 0:
         sys.exit(f"命令失败，退出码 {result.returncode}")
-    return result.returncode
+    return output
 
 
 def step_tests(skip):
@@ -110,7 +127,16 @@ def step_assemble(version):
     if not iscc:
         sys.exit("未找到 Inno Setup 7 编译器 iscc.exe，请安装后重试")
     iss = os.path.join(PROJECT_ROOT, "scripts", "setup.iss")
-    run([iscc, f"/DMyAppVersion={version}", f"/DMyAppOcrTag=v{version}", iss])
+    output = run([iscc, f"/DMyAppVersion={version}", f"/DMyAppOcrTag=v{version}", iss],
+                 capture=True)
+    # 上面查的是文件在不在，这里查的是编译结果真把 download 条目编进去了没有：
+    # 三元组缺一项或多卷时 setup.iss 走的是"未就绪"分支，产物同名、编得过，
+    # 只有装到用户机器上勾了 OCR 才会中止——那种包不能发
+    if "OCRDownloadReady=1" not in output:
+        reason = re.search(r"OCRDownloadReady=0 reason=(\S+)", output)
+        sys.exit("安装包没编进 OCR 内置下载（"
+                 + (reason.group(1) if reason else "编译输出里没有就绪哨兵")
+                 + "）：确认 dist/release/ocr-artifact.iss 与单卷附件齐备后重跑")
 
 
 def step_changelog(version):
@@ -178,6 +204,17 @@ def step_git(version, notes_title):
     tags = git_output(["git", "tag", "-l", tag])
     if not tags:
         run(["git", "tag", "-a", tag, "-m", notes_title or f"v{version}"])
+    else:
+        # tag 已存在时不新建，但必须确认它指的就是刚才这一份代码：脚本随后会在这个
+        # tag 上发 Release 并挂本次构建的附件，tag 指向别处就等于发出去的安装包
+        # 和页面上的源码对不上。改 tag 要 force-push（会顶掉别人已经拉过的引用），
+        # 所以这里只中止，由人决定是重版本号还是确认过再手动移动。
+        tagged = git_output(["git", "rev-list", "-n", "1", tag])
+        head = git_output(["git", "rev-parse", "HEAD"])
+        if tagged and tagged != head:
+            sys.exit(f"tag {tag} 已存在且指向 {tagged[:8]}，当前提交是 {head[:8]}："
+                     f"发出去的附件会和该 tag 的源码不一致。请用新版本号重发，"
+                     f"或确认无误后自行 git tag -f {tag} 再重跑（--only-release 只补发行版）")
     branch = current_branch()
     run(["git", "push", "origin", branch])
     run(["git", "push", "origin", tag])
@@ -284,14 +321,24 @@ def upload_attachment(rid, path, token):
                        content_type=f"multipart/form-data; boundary={bid}")
     print(f"  已上传 {resp['name']}（{resp['size'] / 1048576:.1f} MB）")
     print(f"  {resp['browser_download_url']}")
+    undeleted = []
     for att_id in stale:
         try:
             api_request(f"{url_base}/{att_id}", token, method="DELETE")
             print(f"  已删除被顶掉的旧附件 id={att_id}")
         except HTTPError as e:
-            # 新附件已经在了，删不掉旧的最多是页面上多一份，不值得让整个发版失败
-            print(f"  ⚠ 旧附件 id={att_id} 没删掉（HTTP {e.code}），"
-                  f"页面上会多一份同名文件，可手动删除")
+            if e.code == 404:
+                # 已经被删掉了（并发重跑、或页面上手动删过），目的达到
+                print(f"  旧附件 id={att_id} 已不存在")
+                continue
+            undeleted.append(f"{name} id={att_id}（HTTP {e.code}：{error_detail(e)}）")
+    if undeleted:
+        # 同名两份不是"页面上多一份"这么轻：装填端是按名字取附件的，命中旧的
+        # 那份就永远过不了 SHA256 校验，而且每台机器都这样。传新件成功但清不掉
+        # 旧件时必须让这条命令以失败结束，逼人在页面上删掉再重跑。
+        raise RuntimeError("以下同名旧附件没删掉，页面上会有两份、装填端可能取到旧的那份，"
+                           "请到 Release 页面手动删除后重跑（--only-release 只补这一步）：\n  "
+                           + "\n  ".join(undeleted))
 
 
 def collect_attachments():

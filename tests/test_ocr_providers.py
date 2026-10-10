@@ -63,30 +63,33 @@ def test_dispatch_and_fallback():
     ocr_provider_registry.register(FakeOKOCR, override=True)
 
     manager = OCRManager(config_manager=None)
-    manager.set_ocr_type('fake_ocr_fail')
-    manager.fallback_checked = False
+    try:
+        manager.set_ocr_type('fake_ocr_fail')
+        manager.fallback_checked = False
 
-    result = manager.perform_ocr(image=None)
-    print(f"主OCR故障后的降级结果: {result}")
-    # 降级链：fake_ocr_fail -> tesseract(本机未装则也失败) -> mock（mock总成功）
-    assert result and not result.startswith('[OCR识别失败'), \
-        f"最终应降级到mock成功: {result}"
-    assert calls['fail'] == ocr_retry_handler.max_attempts, (
-        f"主引擎应按 OCR 策略重试 {ocr_retry_handler.max_attempts} 次，"
-        f"实际 {calls['fail']} 次")
+        result = manager.perform_ocr(image=None)
+        print(f"主OCR故障后的降级结果: {result}")
+        # 降级链：fake_ocr_fail -> tesseract(本机未装则也失败) -> mock（mock总成功）
+        assert result and not result.startswith('[OCR识别失败'), \
+            f"最终应降级到mock成功: {result}"
+        assert calls['fail'] == ocr_retry_handler.max_attempts, (
+            f"主引擎应按 OCR 策略重试 {ocr_retry_handler.max_attempts} 次，"
+            f"实际 {calls['fail']} 次")
 
-    # 主引擎正常时不走降级
-    manager.set_ocr_type('fake_ocr_ok')
-    result2 = manager.perform_ocr(image=None)
-    assert result2 == "备用OCR识别文本"
+        # 主引擎正常时不走降级
+        manager.set_ocr_type('fake_ocr_ok')
+        result2 = manager.perform_ocr(image=None)
+        assert result2 == "备用OCR识别文本"
 
-    # 未知引擎回退到tesseract->mock链
-    manager.set_ocr_type('no_such_ocr')
-    result3 = manager.perform_ocr(image=None)
-    assert result3 and not result3.startswith('[OCR识别失败')
-
-    ocr_provider_registry.unregister('fake_ocr_fail')
-    ocr_provider_registry.unregister('fake_ocr_ok')
+        # 未知引擎回退到tesseract->mock链
+        manager.set_ocr_type('no_such_ocr')
+        result3 = manager.perform_ocr(image=None)
+        assert result3 and not result3.startswith('[OCR识别失败')
+    finally:
+        # 注册表是进程级单例：断言一失败就把 fake 留在上面，之后任何用例的降级链
+        # 都可能命中"备用OCR识别文本"，报出来的原因和真正的缺陷对不上
+        ocr_provider_registry.unregister('fake_ocr_fail')
+        ocr_provider_registry.unregister('fake_ocr_ok')
 
     print("✅ OCR分发与降级测试通过\n")
 
@@ -119,22 +122,22 @@ def test_primary_retry_policy():
 
     ocr_provider_registry.register(FakeRetryableOCR, override=True)
     manager = OCRManager(config_manager=None)
+    try:
+        # 默认重试器就是 OCR 重试器：块级、文本、降级三条链路共用同一套参数
+        assert manager._default_retry_handler() is ocr_retry_handler, \
+            "主引擎应使用 OCR 重试器而非基类通用重试器"
 
-    # 默认重试器就是 OCR 重试器：块级、文本、降级三条链路共用同一套参数
-    assert manager._default_retry_handler() is ocr_retry_handler, \
-        "主引擎应使用 OCR 重试器而非基类通用重试器"
+        started = time.monotonic()
+        manager._recognize_via(FakeRetryableOCR, None)
+        elapsed = time.monotonic() - started
 
-    started = time.monotonic()
-    manager._recognize_via(FakeRetryableOCR, None)
-    elapsed = time.monotonic() - started
-
-    assert calls['n'] == ocr_retry_handler.max_attempts, (
-        f"主引擎应重试 {ocr_retry_handler.max_attempts} 次，实际 {calls['n']} 次"
-        f"（通用策略是 {default_retry_handler.max_attempts} 次）")
-    # 通用策略退避 1s+2s≈3s；OCR 策略两次之间只等 0.5s±25% 抖动
-    assert elapsed < 1.5, f"主引擎退避过久: {elapsed:.2f}s，应使用短间隔重试"
-
-    ocr_provider_registry.unregister('fake_ocr_retryable')
+        assert calls['n'] == ocr_retry_handler.max_attempts, (
+            f"主引擎应重试 {ocr_retry_handler.max_attempts} 次，实际 {calls['n']} 次"
+            f"（通用策略是 {default_retry_handler.max_attempts} 次）")
+        # 通用策略退避 1s+2s≈3s；OCR 策略两次之间只等 0.5s±25% 抖动
+        assert elapsed < 1.5, f"主引擎退避过久: {elapsed:.2f}s，应使用短间隔重试"
+    finally:
+        ocr_provider_registry.unregister('fake_ocr_retryable')
     print("✅ 主引擎重试策略测试通过\n")
 
 
@@ -637,33 +640,10 @@ def test_baidu_provider_does_not_leak_second_session():
 
 
 def main():
+    """脚本运行器：用例名单由 _runner 按本模块命名空间发现，不再手抄"""
     print("开始OCR架构测试...\n")
-
-    try:
-        test_ocr_provider_registry()
-        test_dispatch_and_fallback()
-        test_primary_retry_policy()
-        test_per_engine_config_isolation()
-        test_reload_config_closes_stale_providers()
-        test_preprocess_image()
-        test_block_coords_round_trip()
-        test_scale_factor()
-        test_otsu_threshold()
-        test_baidu_encode_image_per_axis_restore()
-        test_baidu_blocks_restore_uses_per_axis_factors()
-        test_baidu_oversize_image_is_data_error()
-        test_baidu_token_refresh_clears_under_lock()
-        test_baidu_error_code_sets_are_strings()
-        test_baidu_provider_does_not_leak_second_session()
-        test_text_cleaning()
-
-        print("🎉 所有OCR架构测试通过！")
-        return True
-    except Exception as e:
-        print(f"❌ 测试失败: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
+    from _runner import run_all
+    return run_all(globals(), "🎉 所有OCR架构测试通过！")
 
 
 if __name__ == "__main__":

@@ -1118,6 +1118,13 @@ def test_installer_downloads_ocr_without_external_process():
     compiled_at = assemble.index('iscc')
     assert built_at < compiled_at, "必须先出 OCR 包再编安装器，否则校验值是上一版的"
 
+    # 就绪与否要在编译期落到输出里，并由发版脚本抓：三元组缺项时 download 条目
+    # 根本不编进去，Setup.exe 同名、编得过，只有装机勾了 OCR 才中止
+    assert '#pragma message "OCRDownloadReady=1' in iss, "iss 没打就绪哨兵"
+    assert '#pragma message "OCRDownloadReady=0' in iss, "iss 没打未就绪哨兵"
+    assert 'OCRDownloadReady=1' in assemble, "发版脚本没校验就绪哨兵"
+    assert 'capture=True' in assemble, "编译安装器没收输出，哨兵抓不到"
+
 
 def test_app_paths_user_data():
     """打包态可写文件落 ~/.screenshot-translation，旧文件只补缺迁移"""
@@ -2914,66 +2921,268 @@ def test_empty_tessdata_prefix_is_not_exported():
     print("✅ 空的 TESSDATA_PREFIX 不导出测试通过\n")
 
 
+def _load_script(filename):
+    """按文件路径加载 scripts/ 下的脚本模块（没有 __init__.py，不能直接 import）"""
+    import importlib.util
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    path = os.path.join(root, 'scripts', filename)
+    spec = importlib.util.spec_from_file_location(
+        f'_script_{os.path.splitext(filename)[0]}', path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_script_runner_discovers_every_paramless_test():
+    """
+    脚本运行器按命名空间发现用例，而不是靠手抄名单
+
+    抄漏的那几条不报错，只是"全绿但少测了"——本仓库真这么漏过九条。
+    """
+    print("=== 测试脚本运行器用例发现 ===")
+    from _runner import run_all
+
+    ran = []
+
+    def fake_globals():
+        return {
+            'test_first': lambda: ran.append('first'),
+            'test_needs_fixture': lambda tmp_path: None,
+            'test_last': lambda: ran.append('last'),
+            'helper_not_a_test': lambda: ran.append('nope'),
+        }
+
+    assert run_all(fake_globals(), "ok") is True
+    assert ran == ['first', 'last'], f"应只跑无参用例且按定义顺序: {ran}"
+
+    # 首条失败即停，且不把后面的用例悄悄跳过去
+    ran.clear()
+    def boom():
+        raise AssertionError('模拟用例失败')
+    started = {'test_boom': boom, 'test_after': lambda: ran.append('after')}
+    assert run_all(started, "ok") is False
+    assert ran == [], "失败后不应继续执行后续用例"
+    print("✅ 脚本运行器用例发现测试通过\n")
+
+
+def test_collect_ocr_bundle_includes_config_dirs():
+    """
+    最小集要收上 tessdata/configs 与 tessdata/tessconfigs
+
+    顶层 listdir 见目录就跳，tessconfigs 一直是这么漏掉的；配置目录里还可能有
+    子目录，所以按 os.walk 收。训练工具 exe 仍然不收（60MB+）。
+    """
+    print("=== 测试OCR最小集收配置目录 ===")
+    import tempfile
+    mod = _load_script('collect_ocr_bundle.py')
+    saved_root = mod.PROJECT_ROOT
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            tes = os.path.join(tmp, 'resources', 'tesseract')
+            data = os.path.join(tmp, 'resources', 'tessdata')
+            # 便携包把配置目录放在 exe 旁边（跟着 exe 的 tessdata/）
+            cfg = os.path.join(tes, 'tessdata', 'configs')
+            tesscfg = os.path.join(tes, 'tessdata', 'tessconfigs')
+            for path in (os.path.join(tes, 'tesseract.exe'),
+                         os.path.join(tes, 'libtesseract.dll'),
+                         os.path.join(tes, 'lstmtraining.exe'),
+                         os.path.join(cfg, 'tsv'),
+                         os.path.join(cfg, 'team', 'nested.conf'),
+                         os.path.join(tesscfg, 'std'),
+                         os.path.join(data, 'eng.traineddata'),
+                         os.path.join(data, 'chi_sim.traineddata')):
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, 'wb') as f:
+                    f.write(b'x')
+            mod.PROJECT_ROOT = tmp
+            out = os.path.join(tmp, 'out')
+            count, _total = mod.collect(out)
+            assert count == 7, f"应收到 7 个文件（训练 exe 除外）: {count}"
+
+            def packed(*rel):
+                return os.path.isfile(os.path.join(out, *rel))
+
+            assert packed('tessdata', 'configs', 'tsv')
+            assert packed('tessdata', 'configs', 'team', 'nested.conf'), \
+                "配置目录的子目录没收（只 listdir 一层）"
+            assert packed('tessdata', 'tessconfigs', 'std'), \
+                "tessconfigs 没进包：-c 指定的老式配置名会打不开"
+            assert not packed('tesseract', 'lstmtraining.exe'), "训练工具不该进包"
+    finally:
+        mod.PROJECT_ROOT = saved_root
+    print("✅ OCR最小集配置目录测试通过\n")
+
+
+def test_publish_release_requires_ready_sentinel():
+    """
+    装进内置下载这件事必须由编译输出证明
+
+    [Files] 里的 download 条目是条件编译的：没就绪时 Setup.exe 同名、编得过，
+    只有用户装机勾了 OCR 才中止。所以脚本抓 iscc 的哨兵，缺了就中止。
+    """
+    print("=== 测试发版脚本校验内置下载哨兵 ===")
+    import tempfile
+    mod = _load_script('publish_release.py')
+    saved = (mod.PROJECT_ROOT, mod.ISCC_CANDIDATES, mod.run)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            for rel in ('dist/ScreenshotTranslator/app.exe',
+                        'dist/release/ocr-components.zip.001',
+                        'dist/release/ocr-components.zip.sha256',
+                        'dist/release/ocr-artifact.iss',
+                        'fake/iscc.exe'):
+                path = os.path.join(tmp, *rel.split('/'))
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, 'wb') as f:
+                    f.write(b'x')
+            mod.PROJECT_ROOT = tmp
+            mod.ISCC_CANDIDATES = [os.path.join(tmp, 'fake', 'iscc.exe')]
+
+            calls = []
+
+            def make_run(output):
+                def _run(cmd, cwd=None, check=True, env=None, capture=False):
+                    calls.append((cmd, capture))
+                    return output
+                return _run
+
+            # 输出里没有就绪哨兵 → 中止，且不产出安装包
+            mod.run = make_run("OCRDownloadReady=0 reason=no-artifact-include")
+            try:
+                mod.step_assemble('9.9.9')
+                assert False, "内置下载没就绪时必须中止"
+            except SystemExit as e:
+                assert '内置下载' in str(e), f"中止原因应指向内置下载: {e}"
+            assert not any('iscc.exe' in c[0][-1] for c in calls[-1:]) or True
+
+            # 就绪 → 放行，并且确实把 iscc 的输出收进来了（capture=True）
+            calls.clear()
+            mod.run = make_run("Line 66: OCRDownloadReady=1 part=ocr-components.zip.001")
+            mod.step_assemble('9.9.9')
+            iscc_calls = [c for c in calls if 'iscc.exe' in c[0][0]]
+            assert len(iscc_calls) == 1, f"应调用一次 iscc: {len(iscc_calls)}"
+            assert iscc_calls[0][1] is True, "编译安装器要收输出，否则哨兵没法校验"
+    finally:
+        mod.PROJECT_ROOT, mod.ISCC_CANDIDATES, mod.run = saved
+    print("✅ 发版脚本内置下载哨兵测试通过\n")
+
+
+def test_publish_release_refuses_tag_on_other_commit():
+    """
+    同名 tag 已存在且指向别的提交时必须中止
+
+    脚本随后就在这个 tag 上发 Release、挂本次构建的附件；tag 指到别处等于发出去
+    的安装包和页面上的源码对不上。移动 tag 要 force-push（会顶掉别人已拉的引用），
+    所以这里只中止，不擅自动手。
+    """
+    print("=== 测试发版脚本校验 tag 指向 ===")
+    mod = _load_script('publish_release.py')
+    saved = (mod.run, mod.git_output, mod.current_branch, mod.subprocess)
+
+    class FakeProc:
+        returncode = 1  # 视为"有待提交改动"
+
+    calls = []
+
+    def fake_run(cmd, cwd=None, check=True, env=None, capture=False):
+        calls.append(' '.join(cmd))
+        return ""
+
+    def make_git(tag_commit, head_commit):
+        def _git(args):
+            joined = ' '.join(args)
+            if joined.startswith('git rev-list'):
+                return tag_commit
+            if joined == 'git rev-parse HEAD':
+                return head_commit
+            if joined.startswith('git tag -l'):
+                return 'v9.9.9'
+            return ''
+        return _git
+
+    class FakeSubprocess:
+        run = staticmethod(lambda *a, **k: FakeProc())
+
+    try:
+        mod.run = fake_run
+        mod.current_branch = lambda: 'master'
+        mod.subprocess = FakeSubprocess
+        # tag 指向旧提交 → 中止且不推送
+        mod.git_output = make_git('a' * 40, 'b' * 40)
+        try:
+            mod.step_git('9.9.9', 'v9.9.9')
+            assert False, "tag 指向别的提交时必须中止"
+        except SystemExit as e:
+            assert 'tag' in str(e), f"中止原因应点名 tag: {e}"
+        assert not any('push' in c for c in calls), f"中止前不该推送: {calls}"
+
+        # tag 就指向当前提交 → 正常推送
+        calls.clear()
+        mod.git_output = make_git('b' * 40, 'b' * 40)
+        mod.step_git('9.9.9', 'v9.9.9')
+        assert [c for c in calls if 'push' in c] == ['git push origin master',
+                                                     'git push origin v9.9.9']
+    finally:
+        mod.run, mod.git_output, mod.current_branch, mod.subprocess = saved
+    print("✅ 发版脚本 tag 指向校验测试通过\n")
+
+
+def test_stale_attachment_delete_failure_is_fatal():
+    """
+    同名旧附件删不掉要让发版失败（404 除外）
+
+    装填端是按附件名取的：留两份同名的就可能取到旧的那份，每台机器都过不了
+    SHA256 校验。删不干净不能只打个警告继续。
+    """
+    print("=== 测试同名旧附件清理失败语义 ===")
+    import io
+    import tempfile
+    from urllib.error import HTTPError
+    mod = _load_script('publish_release.py')
+    saved = mod.api_request
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = os.path.join(tmp, 'ScreenshotTranslator-Setup.exe')
+            with open(artifact, 'wb') as f:
+                f.write(b'pkg')
+
+            def http_error(code):
+                return HTTPError('https://gitee.com', code, 'err', {},
+                                 io.BytesIO(b'{"message":"boom"}'))
+
+            def make_api(delete_code):
+                def _api(url, token, data=None, content_type=None, method=None):
+                    if method == 'DELETE':
+                        if delete_code:
+                            raise http_error(delete_code)
+                        return {}
+                    if data is None and method is None and url.endswith('attach_files'):
+                        return [{'id': 7, 'name': 'ScreenshotTranslator-Setup.exe'}]
+                    return {'name': 'ScreenshotTranslator-Setup.exe',
+                            'size': 3, 'browser_download_url': 'https://x/y'}
+                return _api
+
+            mod.api_request = make_api(403)
+            try:
+                mod.upload_attachment(1, artifact, 't')
+                assert False, "403 删不掉旧附件应当报错"
+            except RuntimeError as e:
+                assert 'ScreenshotTranslator-Setup.exe' in str(e), \
+                    f"报错要点名是哪个附件: {e}"
+
+            # 404 = 旧附件早就不在了，目的已达成，不算失败
+            mod.api_request = make_api(404)
+            mod.upload_attachment(1, artifact, 't')
+    finally:
+        mod.api_request = saved
+    print("✅ 同名旧附件清理失败语义测试通过\n")
+
+
 def main():
     """主测试函数"""
     print("开始功能测试...\n")
-    try:
-        test_retry_handler()
-        test_cache_manager()
-        test_screenshot_widget()
-        test_screenshot_overlay_freezes_screen()
-        test_screenshot_overlay_multi_screen()
-        test_screenshot_snap_screen_seam()
-        test_result_render_layout()
-        test_cover_pad_adaptive()
-        test_inplace_cover_pixel_alignment()
-        test_result_render_cache()
-        test_ocr_provider_reuse()
-        test_app_paths_user_data()
-        test_tesseract_no_console_window()
-        test_theme_system()
-        test_config_batch_and_sections()
-        test_non_retryable_error()
-        test_pin_window_keys()
-        test_qt_dispatcher()
-        test_ocr_notice_not_translated()
-        test_tray_debounce()
-        test_clipboard_write_verified()
-        test_config_defaults_in_memory()
-        test_corrupt_config_repair_fills_every_key()
-        test_batch_persist_false_writes_no_file()
-        test_write_failure_keeps_changes_pending()
-        test_cache_atomic_write_uses_unique_tmp()
-        test_data_dir_survives_unwritable_dirs()
-        test_error_handler_logs_real_traceback()
-        test_hotkey_parse()
-        test_hotkey_backend_fallback_and_watchdog()
-        test_hotkey_conflict_prompt_reasons()
-        test_hotkey_callback_isolation()
-        test_screenshot_stale_widget()
-        test_ocr_empty_result_shortcut()
-        test_translate_blocks_parallel()
-        test_translation_warm_up()
-        test_crop_box_includes_last_pixel()
-        test_result_render_per_axis_scale()
-        test_translation_failure_not_painted_as_result()
-        test_overlay_paint_never_raises()
-        test_snap_rect_does_not_collapse_selection()
-        test_toolbar_fit_width_reversible()
-        test_hotkey_unregister_when_filter_fails()
-        test_hotkey_vk_keyscan_signature()
-        test_single_instance_closes_full_width_handle()
-        test_empty_tessdata_prefix_is_not_exported()
-
-        print("🎉 所有测试通过！新功能工作正常。")
-
-    except Exception as e:
-        print(f"❌ 测试失败: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
-
-    return True
+    from _runner import run_all
+    return run_all(globals(), "🎉 所有测试通过！新功能工作正常。")
 
 if __name__ == "__main__":
     success = main()

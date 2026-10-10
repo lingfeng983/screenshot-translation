@@ -69,19 +69,25 @@ def collect(out_dir):
             print(f"❌ 缺少语言数据 {src}")
             return 0, 0.0
 
-    # configs 是 tesseract 运行时可选配置目录，一并带上。
-    # 便携包的 configs 可能落在 resources/tessdata/configs，
-    # 也可能跟着 tesseract.exe 在 resources/tesseract/tessdata/configs
-    cfg_dir = next((d for d in (os.path.join(src_data, 'configs'),
-                                os.path.join(src_tes, 'tessdata', 'configs'))
-                   if os.path.isdir(d)), None)
-    if cfg_dir:
-        for name in os.listdir(cfg_dir):
-            src = os.path.join(cfg_dir, name)
-            if os.path.isfile(src):
-                _copy(src, os.path.join(out_dir, 'tessdata', 'configs', name))
-    else:
-        print("⚠ 未找到 tessdata/configs，识别时若指定 --psm 等参数可能失败")
+    # configs/tessconfigs 是 tesseract 的可选配置目录（-c 用的名字文件）。
+    # 便携包可能放在 resources/tessdata/ 下，也可能跟着 tesseract.exe 在
+    # resources/tesseract/tessdata/ 下，两处都认。
+    # 顶层 listdir 会把整个 tessdata/ 子目录跳掉，所以这里按目录名收而不是
+    # 指望第一步走到它们：tessconfigs 此前就是这么漏的（少它时 -c 指定的
+    # 老式配置名会直接报 " Cannot open config file"）。
+    for sub in ('configs', 'tessconfigs'):
+        root = next((d for d in (os.path.join(src_data, sub),
+                                 os.path.join(src_tes, 'tessdata', sub))
+                     if os.path.isdir(d)), None)
+        if root is None:
+            print(f"⚠ 未找到 tessdata/{sub}，用 -c 指定该目录里的配置名时可能失败")
+            continue
+        for dir_path, _dirs, names in os.walk(root):
+            rel = os.path.relpath(dir_path, root).replace(os.sep, '/')
+            dest_prefix = os.path.join(out_dir, 'tessdata', sub
+                                       if rel == '.' else f'{sub}/{rel}')
+            for name in names:
+                _copy(os.path.join(dir_path, name), os.path.join(dest_prefix, name))
 
     if not os.path.isfile(os.path.join(out_dir, 'tesseract', 'tesseract.exe')):
         print("❌ 没收到 tesseract.exe（resources/tesseract 里没有便携版主程序）")
