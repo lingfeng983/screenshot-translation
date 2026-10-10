@@ -2741,10 +2741,182 @@ def test_toolbar_fit_width_reversible():
     print("✅ 工具条宽度精简可逆测试通过\n")
 
 
+def test_hotkey_unregister_when_filter_fails():
+    """
+    RegisterHotKey 成功后半途抛错必须把系统热键摘掉
+
+    旧实现等事件过滤器装好才置 `_registered`：中间任何异常都会走
+    unregister()，而它看 `_registered` 还是 False 就直接放过——热键永久留在
+    系统表里，之后每次注册都撞"已被其它程序占用"，只能重启系统恢复。
+    """
+    print("=== 测试热键注册半途失败的回滚 ===")
+    import managers.hotkey_native as native_mod
+    from managers.hotkey_native import HOTKEY_ID, NativeHotkeyBackend
+    from PyQt5.QtWidgets import QApplication
+
+    class FakeUser32:
+        def __init__(self):
+            self.unregistered = []
+
+        def RegisterHotKey(self, hwnd, hotkey_id, modifiers, vk):
+            return 1
+
+        def GetLastError(self):
+            return 0
+
+        def UnregisterHotKey(self, hwnd, hotkey_id):
+            self.unregistered.append(hotkey_id)
+            return 1
+
+    QApplication.instance() or QApplication(sys.argv)
+    fake = FakeUser32()
+    backend = NativeHotkeyBackend(fake)
+
+    class BoomFilter:
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("模拟过滤器构造失败")
+
+    saved = native_mod._HotkeyEventFilter
+    native_mod._HotkeyEventFilter = BoomFilter
+    try:
+        assert backend.register('alt+z', lambda: None) is False
+        assert fake.unregistered == [HOTKEY_ID], \
+            f"注册成功后的半途异常必须把系统热键摘掉: {fake.unregistered}"
+        assert backend._registered is False
+    finally:
+        native_mod._HotkeyEventFilter = saved
+        backend.unregister()
+    print("✅ 热键注册半途失败的回滚测试通过\n")
+
+
+def test_hotkey_vk_keyscan_signature():
+    """
+    VkKeyScanW 的签名必须显式声明
+
+    ctypes 默认按 c_int 取返回值，而 VkKeyScanW 返回的是 SHORT：键位表里查不到
+    时的 -1 会被读成 0xFFFF，于是 `scan != -1` 成立，程序拿 0xFF 这个根本不
+    存在的虚拟键码去注册热键——注册"成功"，那个键却永远按不出来。
+    声明 argtypes 后入参必须是字符本身，不能再传 ord 值。
+    """
+    print("=== 测试 VkKeyScanW 签名声明 ===")
+    import ctypes
+    import managers.hotkey_native as native_mod
+    from managers.hotkey_native import _key_to_vk, user32
+
+    if sys.platform == 'win32':
+        handle = user32()
+        assert handle.VkKeyScanW.restype is ctypes.c_short, \
+            "restype 必须是 c_short，否则 -1 会被读成 0xFFFF"
+        assert handle.VkKeyScanW.argtypes == [ctypes.c_wchar], \
+            f"argtypes 应为 c_wchar: {handle.VkKeyScanW.argtypes}"
+
+    class FakeHandle:
+        def __init__(self):
+            self.args = []
+
+        def VkKeyScanW(self, ch):
+            self.args.append(ch)
+            return -1      # 键位表里查不到这个字符
+
+    fake = FakeHandle()
+    saved = native_mod._user32
+    native_mod._user32 = fake
+    try:
+        # 查不到时退回"字母数字取大写 ASCII"，且传的是字符不是 ord 值
+        assert _key_to_vk('z') == ord('Z')
+        assert fake.args == ['z'], f"必须传字符本身: {fake.args}"
+    finally:
+        native_mod._user32 = saved
+    print("✅ VkKeyScanW 签名声明测试通过\n")
+
+
+def test_single_instance_closes_full_width_handle():
+    """
+    后来的实例释放互斥量句柄时不能把它截断成 32 位
+
+    CreateMutexW 的返回是 64 位指针，CloseHandle 没有 argtypes 时 ctypes 按
+    C int 传，高位被砍掉：关的其实是个无效值，真句柄一直漏着，而每次
+    "程序已在运行"的那次启动都会留一个。
+    """
+    print("=== 测试单实例句柄释放 ===")
+    import ctypes
+    from managers.single_instance import SingleInstanceGuard
+
+    if sys.platform != 'win32':
+        print("非 Windows，跳过\n")
+        return
+
+    kernel32 = ctypes.windll.kernel32
+    name = f'Local\\ScreenshotTranslator.Test.{os.getpid()}.closehandle'
+    first = SingleInstanceGuard(name=name)
+    try:
+        assert first.acquire() is True, "首个实例应拿到互斥量"
+        assert first._handle, "守卫必须持有句柄直到进程结束"
+
+        second = SingleInstanceGuard(name=name)
+        assert second.acquire() is False, "同名互斥量应判为已在运行"
+        assert second._handle is None
+        assert kernel32.CloseHandle.argtypes == [ctypes.c_void_p], \
+            "CloseHandle 必须声明指针参数，否则 64 位句柄会被截断"
+
+        # 第三个实例走同一条关闭路径，不能被 ctypes 异常打断启动流程
+        assert SingleInstanceGuard(name=name).acquire() is False
+    finally:
+        if first._handle:
+            kernel32.CloseHandle(ctypes.c_void_p(first._handle))
+            first._handle = None
+    print("✅ 单实例句柄释放测试通过\n")
+
+
+def test_empty_tessdata_prefix_is_not_exported():
+    """
+    没定位到 tessdata 时不能把空串写进 TESSDATA_PREFIX
+
+    空前缀会让 tesseract 去找 "/eng.traineddata"（相对当前工作目录），而
+    什么都不设时它用的是 exe 自带的默认目录——探测失败时设个空串等于把一个
+    本来能用的引擎判死。
+    """
+    print("=== 测试空的 TESSDATA_PREFIX 不导出 ===")
+    import managers.ocr_providers.tesseract as tess_mod
+
+    saved_env = os.environ.get('TESSDATA_PREFIX')
+    saved_applied = tess_mod._applied_prefix
+    probe_dir = os.path.abspath(os.path.join(os.getcwd(), 'tessdata'))
+    try:
+        os.environ.pop('TESSDATA_PREFIX', None)
+        tess_mod._applied_prefix = None
+
+        tess_mod._apply_tessdata_prefix('')
+        assert 'TESSDATA_PREFIX' not in os.environ, \
+            "空前缀不该导出（tesseract 会去找相对路径下的语言包）"
+
+        tess_mod._apply_tessdata_prefix(probe_dir)
+        assert os.environ['TESSDATA_PREFIX'] == probe_dir
+        assert tess_mod._applied_prefix == probe_dir
+
+        # 后来者没探测到：清掉我们设的那份，别让旧目录继续生效
+        tess_mod._apply_tessdata_prefix('')
+        assert 'TESSDATA_PREFIX' not in os.environ, \
+            "自己设过的前缀应在探测失败时清掉"
+
+        # 用户环境里原有的前缀不归我们动
+        os.environ['TESSDATA_PREFIX'] = 'C:\\UserOwned\\tessdata'
+        tess_mod._applied_prefix = None
+        tess_mod._apply_tessdata_prefix('')
+        assert os.environ['TESSDATA_PREFIX'] == 'C:\\UserOwned\\tessdata', \
+            "不该清掉用户自己设的前缀"
+    finally:
+        tess_mod._applied_prefix = saved_applied
+        if saved_env is None:
+            os.environ.pop('TESSDATA_PREFIX', None)
+        else:
+            os.environ['TESSDATA_PREFIX'] = saved_env
+    print("✅ 空的 TESSDATA_PREFIX 不导出测试通过\n")
+
+
 def main():
     """主测试函数"""
     print("开始功能测试...\n")
-
     try:
         test_retry_handler()
         test_cache_manager()
@@ -2788,6 +2960,10 @@ def main():
         test_overlay_paint_never_raises()
         test_snap_rect_does_not_collapse_selection()
         test_toolbar_fit_width_reversible()
+        test_hotkey_unregister_when_filter_fails()
+        test_hotkey_vk_keyscan_signature()
+        test_single_instance_closes_full_width_handle()
+        test_empty_tessdata_prefix_is_not_exported()
 
         print("🎉 所有测试通过！新功能工作正常。")
 

@@ -127,9 +127,29 @@ class OCRManager(ProviderChainManager):
         except Exception as e:
             logger.error(f"加载OCR配置失败: {e}")
 
+    def close_providers(self):
+        """
+        关闭并清空已缓存的 provider 实例
+
+        云端 provider 持有 requests.Session（连接池）：只从字典里摘掉就得等 GC
+        才回收套接字，反复保存会攒出一串半开连接，退出时也一样留尾巴。
+        摘除在锁内、关闭在锁外——关闭连接不该把下一次 _get_provider 一起挡住。
+        正在用旧实例识别的线程最多失败这一次，降级链会带着新 provider 重试。
+        """
+        with self._provider_lock:
+            stale = list(self._providers.values())
+            self._providers.clear()
+        for provider in stale:
+            close = getattr(provider, 'close', None)
+            if close is not None:
+                try:
+                    close()
+                except Exception as e:
+                    logger.debug(f"关闭OCR提供者失败: {type(e).__name__}")
+
     def reload_config(self):
-        """重新加载配置（配置窗口保存后调用）"""
-        self._providers.clear()
+        """重新加载配置（配置窗口保存后调用）：被淘汰实例的连接池一起释放"""
+        self.close_providers()
         self._load_config()
 
     def set_ocr_type(self, ocr_type):

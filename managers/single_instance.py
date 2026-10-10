@@ -55,7 +55,7 @@ class SingleInstanceGuard:
                 或系统调用本身失败时都返回 True——守卫失灵不该让程序
                 连启动都启动不了。
         """
-        if self._handle:
+        if self._handle is not None:
             return True
         if os.environ.get(ALLOW_MULTI_ENV) == '1':
             logger.info(f"已允许多实例（{ALLOW_MULTI_ENV}=1）")
@@ -66,6 +66,10 @@ class SingleInstanceGuard:
         kernel32 = ctypes.windll.kernel32
         kernel32.CreateMutexW.restype = ctypes.c_void_p
         kernel32.GetLastError.restype = ctypes.c_int
+        # CloseHandle 的入参也必须声明：CreateMutexW 返回的是 64 位句柄，
+        # 没有 argtypes 时 ctypes 按 C int（32 位）传，句柄高位被砍掉，
+        # 关的其实是个无效值——真正的句柄永远漏着
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
         try:
             handle = kernel32.CreateMutexW(None, False, self.name)
         except Exception as e:
@@ -76,7 +80,10 @@ class SingleInstanceGuard:
             return True
 
         if kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
-            kernel32.CloseHandle(handle)
+            try:
+                kernel32.CloseHandle(handle)
+            except Exception as e:
+                logger.debug(f"关闭单实例句柄失败: {type(e).__name__}")
             logger.warning("检测到截图翻译已在运行，本进程不再启动")
             return False
 

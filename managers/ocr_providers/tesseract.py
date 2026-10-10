@@ -161,6 +161,32 @@ def _find_tessdata_path(exe=None, langs=None):
     return candidates[0] if candidates else ''
 
 
+# 本模块设过的主变量值：只清自己那一份，用户环境里原有的前缀不动
+_applied_prefix = None
+
+
+def _apply_tessdata_prefix(path):
+    """
+    通过环境变量把训练数据目录交给 tesseract
+
+    pytesseract 会按空白切分 config 字符串，用 --tessdata-dir 传含空格或引号的
+    路径会被截断，所以走环境变量。空值比不设更糟：tesseract 会去找
+    "/eng.traineddata"（相对当前工作目录），而什么都不设时它用的是 exe 自带的
+    默认目录——探测失败时设个空串等于把一个本来能用的引擎判死。
+
+    Args:
+        path (str): tessdata 目录，空串表示没定位到
+    """
+    global _applied_prefix
+    if path:
+        os.environ['TESSDATA_PREFIX'] = path
+        _applied_prefix = path
+    elif _applied_prefix is not None and \
+            os.environ.get('TESSDATA_PREFIX') == _applied_prefix:
+        os.environ.pop('TESSDATA_PREFIX', None)
+        _applied_prefix = None
+
+
 class TesseractProvider(OCRProvider):
     """本地 Tesseract OCR（离线、免费）"""
 
@@ -191,11 +217,10 @@ class TesseractProvider(OCRProvider):
                 else:
                     logger.info("未找到内置tesseract，将依赖系统PATH中的tesseract")
 
-                # 通过环境变量传递训练数据目录：pytesseract会按空白切分config字符串，
-                # 用 --tessdata-dir 传含空格或引号的路径会被截断
+                # 通过环境变量传递训练数据目录
                 self.tessdata_path = _find_tessdata_path(exe, self._lang_list())
-                os.environ['TESSDATA_PREFIX'] = self.tessdata_path
-                logger.info(f"使用的tessdata路径: {self.tessdata_path}")
+                _apply_tessdata_prefix(self.tessdata_path)
+                logger.info(f"使用的tessdata路径: {self.tessdata_path or '（未定位到，按引擎默认路径）'}")
                 self.exe_path = exe
 
             self._check_engine()

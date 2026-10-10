@@ -88,6 +88,11 @@ def user32():
         if sys.platform != 'win32':
             return None
         _user32 = ctypes.windll.user32
+        # 显式声明签名：默认 restype 是 c_int，而 VkKeyScanW 返回 SHORT，
+        # 键位表里查不到时的 -1 会被按 32 位补码读成 0xFFFF——判 != -1 不成立，
+        # 于是拿 0xFF 这个根本不存在的虚拟键码去注册热键（注册成功但永远按不出来）
+        _user32.VkKeyScanW.restype = ctypes.c_short
+        _user32.VkKeyScanW.argtypes = [ctypes.c_wchar]
     return _user32
 
 
@@ -162,7 +167,8 @@ def _key_to_vk(key_name):
     if len(key_name) == 1:
         handle = user32()
         if handle is not None:
-            scan = handle.VkKeyScanW(ord(key_name))
+            # argtypes 已声明为 c_wchar，这里必须传字符本身而不是 ord 值
+            scan = handle.VkKeyScanW(key_name)
             if scan != -1:
                 return scan & 0xFF
         if key_name.isascii() and key_name.isalnum():
@@ -287,11 +293,18 @@ class NativeHotkeyBackend:
                 logger.warning(self.last_error)
                 return False
 
-            self._filter = _HotkeyEventFilter(HOTKEY_ID, self._on_message)
-            app.installNativeEventFilter(self._filter)
+            # 系统这边已经占上了，先记账：此后任何一步抛错时 unregister()
+            # 才知道要去摘，否则这个热键永久留在系统表里，之后每次注册都撞
+            # ERROR_HOTKEY_ALREADY_REGISTERED
+            self._registered = True
             self._app = app
             self._callback = callback
-            self._registered = True
+
+            self._filter = _HotkeyEventFilter(HOTKEY_ID, self._on_message)
+            # installNativeEventFilter 是 void（PyQt 给 None），没有可校验的成败
+            # 信号：能不能收到 WM_HOTKEY 只能靠过滤器活着。Python 侧一丢引用
+            # Qt 就再也不回调，所以必须先存进 self 再安装
+            app.installNativeEventFilter(self._filter)
             self.last_error = ''
             return True
         except Exception as e:

@@ -97,6 +97,15 @@ class ProviderEmptyResultError(NonRetryableError):
     """
 
 
+class ProviderDataError(NonRetryableError):
+    """
+    本次要送的数据本身不合格（如图片超出接口硬限制且压不下去）
+
+    既不是配置缺失也不是接口故障：换引擎可能能吃下这张图，但在同一个引擎上
+    重试只会得到同样的拒绝。
+    """
+
+
 class ProviderRejectedError(NonRetryableError):
     """
     接口明确拒绝本次请求（4xx，除 429/408 这类瞬时码）

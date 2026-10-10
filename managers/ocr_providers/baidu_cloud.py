@@ -10,7 +10,6 @@
 """
 
 import base64
-import contextlib
 import io
 import json
 import logging
@@ -20,15 +19,17 @@ import time
 import requests
 
 from .base import OCRProvider
-from ..provider_common import ProviderConfigError
+from ..provider_common import ProviderConfigError, ProviderDataError
 from ..text_block import TextBlock
 
 logger = logging.getLogger('screenshot-translation')
 
 # 令牌类错误：清掉缓存重新取一次令牌即可恢复
-_TOKEN_ERROR_CODES = {216002, 216003, 216004, 216005, 216006}
+# 必须按字符串写：分类处用的是 str(error_code)，int 集合永远匹配不上，
+# 于是"换令牌再来一次"从来没发生过，偶发抖动也被当成确定性失败
+_TOKEN_ERROR_CODES = {'216002', '216003', '216004', '216005', '216006'}
 # 服务侧偶发（繁忙/内部错误）：交给重试层退避后再来
-_TRANSIENT_ERROR_CODES = {17, 18, 216300, 216301, 216302, 216303}
+_TRANSIENT_ERROR_CODES = {'17', '18', '216300', '216301', '216302', '216303'}
 # 百度接口对图片的硬限制：超了重试也不会变，只能改图或不重试
 _MAX_EDGE = 4096
 _MIN_EDGE = 15
@@ -70,19 +71,14 @@ class BaiduOCRProvider(OCRProvider):
         Args:
             config_manager: 配置管理器实例
         """
+        # 连接会话由基类建并记账（_owns_session）：这里再造一个会把基类那份
+        # 直接丢掉，而 close() 只关得到眼前这份——每次重载配置都漏一个 Session
         super().__init__(config_manager)
-        self.session = requests.Session()
-        self.timeout = 30
         # access_token 缓存：避免每次识别都请求一次令牌
         self._access_token = None
         self._token_expire_at = 0
         # 并发首识别时只让一个线程去取令牌，否则同一份密钥会打两次令牌接口
         self._token_lock = threading.Lock()
-
-    def close(self):
-        """释放连接池（管理器重建/重载配置时调用）"""
-        with contextlib.suppress(Exception):
-            self.session.close()
 
     def _get_access_token(self):
         """
@@ -168,7 +164,7 @@ class BaiduOCRProvider(OCRProvider):
         Raises:
             Exception: 密钥未设置或未识别到文本
         """
-        result, restore = self._post_image(self.GENERAL_URL, image)
+        result, (restore_x, restore_y) = self._post_image(self.GENERAL_URL, image)
         items = result.get('words_result') or []
         blocks = []
         for item in items:
@@ -176,10 +172,11 @@ class BaiduOCRProvider(OCRProvider):
             loc = item.get('location') or {}
             if not text or not loc:
                 continue
-            # restore：图被压过就送出去了，坐标要乘回原图尺度
+            # restore_x/y：图被压过就送出去了，坐标要按各自轴乘回原图尺度
+            # （细长条选区被顶到最小边时两轴缩放比不一样）
             blocks.append(TextBlock(
-                text, loc.get('left', 0) * restore, loc.get('top', 0) * restore,
-                loc.get('width', 0) * restore, loc.get('height', 0) * restore))
+                text, loc.get('left', 0) * restore_x, loc.get('top', 0) * restore_y,
+                loc.get('width', 0) * restore_x, loc.get('height', 0) * restore_y))
         logger.info(f"百度云OCR块级识别完成，{len(blocks)} 行")
         if not blocks:
             raise Exception("百度云OCR未识别到任何文本")
@@ -196,27 +193,35 @@ class BaiduOCRProvider(OCRProvider):
             image (PIL.Image.Image): 待送图
 
         Returns:
-            tuple: (base64 字符串, 坐标回乘系数)。系数 = 原图宽 / 实际送出的图宽，
-                调用方拿接口返回的坐标必须乘回，否则就地覆盖会整体错位
+            tuple: (base64 字符串, (x 回乘系数, y 回乘系数))。接口给的坐标是
+                按压缩后的图算的，调用方必须各自乘回原图尺度，否则就地覆盖
+                会整体错位
+
+        Raises:
+            ProviderDataError: 压满 5 轮仍超字节上限（换引擎可能能吃下）
         """
-        restore = 1.0
+        restore_x = restore_y = 1.0
         for _ in range(5):
+            width, height = image.size
             buffer = io.BytesIO()
             image.save(buffer, format='PNG')
             raw = buffer.getvalue()
             if (len(raw) <= _MAX_BYTES and max(image.size) <= _MAX_EDGE
                     and min(image.size) >= _MIN_EDGE):
-                return base64.b64encode(raw).decode('utf-8'), restore
+                return base64.b64encode(raw).decode('utf-8'), (restore_x, restore_y)
 
-            width, height = image.size
             scale = 0.7 if max(image.size) > _MAX_EDGE else 0.6
-            new_size = (max(_MIN_EDGE, int(width * scale)),
-                        max(_MIN_EDGE, int(height * scale)))
+            # 短边本来就低于下限（细长条选区，例如 10x1000 的行距截图）时，
+            # max() 会把它顶回去甚至撑大，两条轴的实际缩放比于是各不相同：
+            # 按同一个系数回乘会把行宽算错，覆盖框贴歪
+            new_size = (max(_MIN_EDGE, round(width * scale)),
+                        max(_MIN_EDGE, round(height * scale)))
             logger.info(f"图片超出百度OCR限制（{len(raw)} 字节, {image.size}），"
                         f"缩到 {new_size}")
             image = image.resize(new_size)
-            restore *= width / max(1, new_size[0])
-        raise ProviderConfigError("选区过大，压缩后仍不满足百度OCR的图片限制，请缩小选区")
+            restore_x *= width / max(1, new_size[0])
+            restore_y *= height / max(1, new_size[1])
+        raise ProviderDataError("选区过大，压缩后仍不满足百度OCR的图片限制，请缩小选区")
 
     def _post_image(self, url, image):
         """
@@ -227,18 +232,22 @@ class BaiduOCRProvider(OCRProvider):
             image (PIL.Image.Image): 待识别的图像
 
         Returns:
-            tuple: (响应 dict, 坐标回乘系数)
+            tuple: (响应 dict, (x 回乘系数, y 回乘系数))
 
         Raises:
-            ProviderConfigError: 密钥/额度/参数类确定性错误（重试无意义）
+            ProviderConfigError: 密钥类确定性错误（重试无意义）
+            ProviderDataError: 图片压不进接口限制
             Exception: 网络或服务侧偶发错误（交给重试层）
         """
         image_b64, restore = self._encode_image(image)
 
         for attempt in (0, 1):
             if attempt:
-                # 令牌类错误：清缓存重新取一次再打
-                self._access_token = None
+                # 令牌类错误：清缓存重新取一次再打。置空必须和取令牌用同一把锁，
+                # 否则并发的另一次识别可能刚好把新令牌写进来又被这里抹掉
+                with self._token_lock:
+                    self._access_token = None
+                    self._token_expire_at = 0
             token = self._get_access_token()
             try:
                 response = self.session.post(

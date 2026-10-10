@@ -441,6 +441,11 @@ class MainApp:
                     logger.debug("关闭翻译连接池")
                     self.translation_manager.close()
 
+                # OCR 侧同理：云端识别引擎自己持有 Session
+                if self.ocr_manager:
+                    logger.debug("关闭OCR连接池")
+                    self.ocr_manager.close_providers()
+
                 # 清理Qt应用
                 if self.app:
                     logger.debug("退出Qt应用")
