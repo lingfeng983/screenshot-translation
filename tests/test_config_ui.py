@@ -11,6 +11,9 @@
 5. 设置页排版：下拉框滚轮免疫、紧凑间距、标签右对齐、分组标题不压边框
 6. 设置窗口单实例
 7. 快捷键注册状态在设置页直接可见（被占用时给警示文案）
+8. 副作用与生命周期：测试按钮不写配置文件、构建失败的实例不缓存、环境变量密钥
+   不落明文、写盘失败点名告警
+9. 日志：调用栈里的凭证脱敏、日志文件不可写时降级为控制台
 
 默认全部离线可跑。两类用例要显式开启：
 - 真连翻译接口的（`ST_RUN_ONLINE=1`）
@@ -382,6 +385,133 @@ def test_config_window_reuses_single_instance(main_app, qapp):
     spin(qapp, duration_ms=50)
 
 
+# ---------------------------------------------------------------- 副作用与生命周期
+
+
+def test_test_translation_button_does_not_write_config(win, qapp, main_app, monkeypatch):
+    """
+    「测试翻译」只让未保存的表单值当场生效，不改用户的 config.ini
+
+    旧实现走 _save_form_fields()，测试一次就等于替用户点了一次保存：
+    刚粘进去的密钥、还没想好的语言组合全都落盘了。
+    """
+    from managers import app_paths
+
+    win.api_type_combo.setCurrentIndex(win.api_type_combo.findData('baidu'))
+    spin(qapp)
+    win._api_field_edits['baidu_app_id'].setText('1234567890')
+    win._api_field_edits['baidu_api_key'].setText('abcdef-secret')
+
+    submitted = []
+    from managers.thread_pool import thread_pool_manager
+    monkeypatch.setattr(thread_pool_manager, 'submit',
+                        lambda *a, **k: submitted.append(a) or object())
+
+    config_file = app_paths.config_file()
+    assert not os.path.exists(config_file), "用例前提：还没生成过配置文件"
+
+    win.test_button.click()
+    spin(qapp, duration_ms=100)
+
+    assert submitted, "测试按钮应提交一次真实请求任务"
+    assert not os.path.exists(config_file), \
+        f"点测试就写配置文件: {config_file}"
+    # 内存里必须已经生效，否则线程里的 provider 读不到刚填的密钥
+    cm = win.config_manager
+    assert cm.get_baidu_api_info() == ('1234567890', 'abcdef-secret'), \
+        "未保存的表单值应在内存中生效"
+
+
+def test_failed_config_window_construction_is_not_cached(main_app, qapp, monkeypatch):
+    """
+    构造半途抛错的设置窗口不能被当成可用实例
+
+    旧实现把整个 __init__ 包在 try 里吞掉异常，主程序随后缓存的是"半个窗口"，
+    之后每次打开设置都只是 show 一个缺控件的壳。
+    """
+    from main import ConfigWindow
+
+    def boom(self):
+        raise RuntimeError('模拟界面构建失败')
+
+    main_app.config_window = None
+    monkeypatch.setattr(ConfigWindow, '_init_ui', boom)
+    main_app.open_config_window()
+    spin(qapp, duration_ms=150)
+    assert main_app.config_window is None, \
+        "构建失败的窗口实例不应被缓存"
+
+    monkeypatch.undo()
+    main_app.open_config_window()
+    spin(qapp, duration_ms=200)
+    window = main_app.config_window
+    assert window is not None, "失败一次之后设置窗口再也打不开"
+    assert hasattr(window, 'theme_combo'), "重开的窗口缺少界面控件"
+    assert window.isVisible(), "重开的设置窗口应显示"
+    window.close()
+    spin(qapp, duration_ms=50)
+
+
+def test_env_secret_not_written_to_config(win, qapp, monkeypatch, tmp_path):
+    """
+    环境变量注入的密钥不回填进明文 config.ini
+
+    界面把环境值显示出来是为了让用户知道当前生效的是什么；点保存时原样写回
+    文件，等于把"只活在环境里"的凭证落成了随包可读的明文。
+    """
+    from managers import app_paths
+
+    env_value = 'sk-from-env-abcdef'
+    monkeypatch.setenv('LLM_API_KEY', env_value)
+    win.api_type_combo.setCurrentIndex(win.api_type_combo.findData('llm'))
+    spin(qapp)
+
+    edit = win._api_field_edits['llm_api_key']
+    assert edit.text() == env_value, "环境变量密钥应回填到界面"
+    assert '环境变量' in edit.placeholderText(), \
+        f"应标出值来自环境变量: {edit.placeholderText()}"
+    assert 'llm_api_key' in win._env_secret_values
+
+    win._save_form_fields()
+    content = _config_text(app_paths.config_file())
+    assert env_value not in content, "环境变量密钥被写进了明文配置"
+
+    # 显式重打过就是用户自己的值，按普通字段保存
+    edit.setText('sk-typed-by-user')
+    win._save_form_fields()
+    content = _config_text(app_paths.config_file())
+    assert 'sk-typed-by-user' in content, "手填密钥应正常落盘"
+    assert env_value not in content
+
+
+def _config_text(path):
+    if not os.path.exists(path):
+        return ''
+    with open(path, encoding='utf-8') as f:
+        return f.read()
+
+
+def test_save_reports_write_failure(win, qapp, main_app, no_modal_boxes, tmp_path):
+    """
+    写盘失败必须让用户看见，而不是照旧弹"保存成功"
+
+    ConfigManager 把磁盘异常兜成了日志（一处写入问题不该让设置窗口崩掉），
+    代价是界面的默认路径会以为一切正常——用户以为存住了，重启回到旧值。
+    """
+    cm = win.config_manager
+    # 父目录不存在：open 直接抛，走的正是真实失败路径
+    cm.config_file = str(tmp_path / 'no-such-dir' / 'config.ini')
+
+    win.target_lang_combo.setCurrentIndex(win.target_lang_combo.findData('ja'))
+    spin(qapp)
+    win._on_save()
+
+    assert no_modal_boxes and no_modal_boxes[-1] == "配置未能写入", \
+        f"写盘失败应点名告警: {no_modal_boxes}"
+    assert cm.get_target_lang() == 'ja', "内存值应已生效（本次运行内可用）"
+    assert not os.path.exists(cm.config_file)
+
+
 # ---------------------------------------------------------------- 设置页排版
 
 
@@ -691,6 +821,86 @@ def test_overlay_failure_and_stale_result(main_app, overlay):
     finally:
         manager._screenshot_widget = previous
     assert overlay._error == 'OCR 服务不可用', "过期选区的结果被误应用"
+
+
+# ---------------------------------------------------------------- 日志与降级
+
+
+def test_log_redaction_covers_tracebacks():
+    """
+    调用栈里的 URL 查询串也要脱敏
+
+    脱敏做在 handler 的 Filter 上拦不住 traceback：Filter 跑在
+    Formatter.format() 之前，那时 record.exc_text 还没渲染出来，异常消息里
+    带着完整请求 URL（签名参数、access_token 就在 query 里）会原样进日志文件。
+    """
+    import io
+    import logging
+    from main import _RedactingFormatter
+
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(_RedactingFormatter('%(levelname)s - %(message)s'))
+    log = logging.getLogger('redact-probe')
+    log.propagate = False
+    log.addHandler(handler)
+    try:
+        try:
+            raise ValueError(
+                "请求失败 https://api.example.com/v1/query?appid=123&sign=SECRET-VALUE")
+        except ValueError:
+            log.exception("翻译请求失败")
+        output = stream.getvalue()
+        assert 'Traceback (most recent call last)' in output, "调用栈本身不能丢"
+        assert 'SECRET-VALUE' not in output, f"调用栈里的凭证未脱敏: {output}"
+        assert 'api.example.com' in output, "脱敏不该把主机名一起抹掉"
+    finally:
+        log.removeHandler(handler)
+        handler.close()
+
+
+def test_logging_falls_back_to_console_when_log_unwritable(monkeypatch):
+    """
+    日志文件建不出来时降级成纯控制台，而不是让程序连启动都做不到
+
+    _setup_logging 在模块导入期就跑，数据目录连兜底 TEMP 都创建失败
+    （只读介质、权限收紧的环境）时抛出异常等于直接劝退用户。
+    """
+    import io
+    import logging
+    import main as main_module
+
+    root = logging.getLogger()
+    saved_handlers = list(root.handlers)
+    saved_level = root.level
+    try:
+        root.handlers.clear()
+        stderr_lines = io.StringIO()
+        monkeypatch.setattr(sys, 'stderr', stderr_lines)
+
+        def refuse(*args, **kwargs):
+            raise PermissionError(13, '日志目录不可写')
+
+        monkeypatch.setattr(main_module, 'RotatingFileHandler', refuse)
+        main_module._setup_logging()
+
+        assert [h for h in root.handlers
+                if isinstance(h, logging.FileHandler)] == [], \
+            "日志文件不可写时不该留下文件 handler"
+        console = [h for h in root.handlers
+                   if type(h) is logging.StreamHandler]
+        assert len(console) == 1, f"应降级为一个控制台 handler: {root.handlers}"
+        assert isinstance(console[0].formatter, main_module._RedactingFormatter), \
+            "控制台也得脱敏，否则等于把密钥原样打到命令行"
+        assert '日志文件不可写' in stderr_lines.getvalue(), \
+            f"降级要留痕: {stderr_lines.getvalue()}"
+    finally:
+        for handler in list(root.handlers):
+            if handler not in saved_handlers:
+                root.removeHandler(handler)
+                handler.close()
+        root.handlers.extend(saved_handlers)
+        root.setLevel(saved_level)
 
 
 # ---------------------------------------------------------------- 需显式开启

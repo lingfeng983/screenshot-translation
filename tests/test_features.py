@@ -1667,7 +1667,230 @@ def test_config_defaults_in_memory():
         assert broken.get_api_type() == 'edge_free'
         with open(path, encoding='utf-8') as f:
             assert '[Translation]' in f.read(), "坏配置未被修复"
+        assert os.path.exists(path + '.bak'), "修复前没留原文件备份"
+        with open(path + '.bak', encoding='utf-8') as f:
+            assert f.read() == '这不是配置文件', "备份里不是那份坏文件"
     print("✅ 默认配置只驻内存测试通过\n")
+
+
+def test_corrupt_config_repair_fills_every_key():
+    """
+    半截解析不能让修复后的文件缺键
+
+    configparser 抛错之前已经把能解析的部分塞进内存，而各段的默认值填充器
+    "见段即跳"。不先扔掉这个半成品，修出来的文件里 [Translation] 就只有用户
+    那一个键，其余键全部消失。
+    """
+    print("=== 测试坏配置修复补齐全部键 ===")
+    import tempfile
+    from config import ConfigManager
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, 'config.ini')
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write('[Translation]\napi_type = baidu\n这行没有等号\n')
+        ConfigManager(path)
+        with open(path, encoding='utf-8') as f:
+            content = f.read()
+        assert 'target_lang' in content, "已存在但残缺的段没被补默认值"
+        assert 'llm_model' in content, "半截解析让修复后的文件缺键"
+        for section in ('[Hotkey]', '[Startup]', '[UI]', '[Overlay]', '[OCR]'):
+            assert section in content, f"修复后的文件缺段: {section}"
+    print("✅ 坏配置修复补齐全部键测试通过\n")
+
+
+def test_batch_persist_false_writes_no_file():
+    """batch(persist=False) 只改内存：没点保存就不该动用户的配置文件"""
+    print("=== 测试批量上下文可只改内存 ===")
+    import tempfile
+    from config import ConfigManager
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, 'config.ini')
+        cm = ConfigManager(path)
+        writes = []
+        real_write = cm._write_config
+
+        def counting_write():
+            writes.append(1)
+            return real_write()
+
+        cm._write_config = counting_write
+        try:
+            with cm.batch(persist=False):
+                cm.set_theme('light')
+                cm.set_target_lang('en')
+            assert cm.get_theme() == 'light', "内存里的值必须生效"
+            assert cm.get_target_lang() == 'en'
+            assert not writes, "persist=False 仍然写盘了"
+            assert not os.path.exists(path), "没保存就不该有 config.ini"
+
+            # 挂着的"待落盘"标记要一起清掉，否则下一次"什么都没改"的保存也会
+            # 把这批没保存过的改动补写进文件
+            with cm.batch():
+                pass
+            assert not writes, "空批次被上一次 persist=False 的改动触发了写盘"
+            assert not os.path.exists(path), "没保存过就不该有 config.ini"
+
+            with cm.batch():
+                cm.set_theme('dark')
+            assert len(writes) == 1, "真正的保存仍然要落盘"
+            with open(path, encoding='utf-8') as f:
+                content = f.read()
+            assert 'theme = dark' in content
+        finally:
+            del cm._write_config
+    print("✅ 批量上下文只改内存测试通过\n")
+
+
+def test_write_failure_keeps_changes_pending():
+    """写盘失败不能让改动静默消失：标记留在，下次保存连带重写，且界面看得见"""
+    print("=== 测试配置写盘失败语义 ===")
+    import tempfile
+    from config import ConfigManager
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, 'config.ini')
+        cm = ConfigManager(path)
+        cm.set_theme('dark')
+        before = open(path, encoding='utf-8').read()
+        assert 'theme = dark' in before
+
+        real_replace = os.replace
+        try:
+            def failing_replace(src, dst):
+                raise OSError('磁盘已满')
+
+            os.replace = failing_replace
+            with cm.batch():
+                cm.set_theme('light')
+            assert cm.write_ok is False, "失败状态没记到 write_ok"
+            assert cm._pending_changes is True, "失败后不该把改动当成已落盘"
+            assert open(path, encoding='utf-8').read() == before, "失败时原文件被动了"
+            leftovers = [n for n in os.listdir(tmp) if n.endswith('.tmp')]
+            assert not leftovers, f"失败后残留临时文件: {leftovers}"
+
+            # 下一次保存（哪怕这次什么都没改）要把上次失败的改动一起补上
+            os.replace = real_replace
+            with cm.batch():
+                pass
+            assert cm.write_ok is True, "重试后应写成功"
+            assert 'theme = light' in open(path, encoding='utf-8').read()
+        finally:
+            os.replace = real_replace
+    print("✅ 配置写盘失败语义测试通过\n")
+
+
+def test_cache_atomic_write_uses_unique_tmp():
+    """缓存临时文件必须带进程与线程标识：共用 ".tmp" 时两个写者互相顶替"""
+    print("=== 测试缓存原子写临时名 ===")
+    import tempfile
+    from managers.cache_manager import CacheManager
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, 'cache.json')
+        manager = CacheManager(cache_file=path)
+        from datetime import datetime
+        manager._cache['k'] = {
+            'text': 'v', 'lang': 'zh', 'provider': 'edge_free',
+            'timestamp': datetime.now().isoformat()}
+        manager._pending_writes = 1
+
+        seen = []
+        real_replace = os.replace
+
+        def spy(src, dst):
+            seen.append(os.path.basename(src))
+            return real_replace(src, dst)
+
+        os.replace = spy
+        try:
+            manager._save_cache()
+        finally:
+            os.replace = real_replace
+
+        assert len(seen) == 1, f"没有走原子替换: {seen}"
+        assert seen[0] != 'cache.json.tmp', f"临时名仍是固定共享的: {seen[0]}"
+        assert str(os.getpid()) in seen[0], f"临时名没带进程标识: {seen[0]}"
+        assert not [n for n in os.listdir(tmp) if n.endswith('.tmp')]
+    print("✅ 缓存原子写临时名测试通过\n")
+
+
+def test_data_dir_survives_unwritable_dirs():
+    """连兜底目录都建不起来时不能抛：data_dir 在日志 handler 建立之前就会被调用"""
+    print("=== 测试数据目录兜底 ===")
+    import tempfile
+    from managers import app_paths
+
+    with tempfile.TemporaryDirectory() as tmp:
+        blocker = os.path.join(tmp, 'blocker')
+        with open(blocker, 'w', encoding='utf-8') as f:
+            f.write('占位文件：它下面的任何路径都建不出目录')
+
+        saved_frozen = app_paths._is_frozen
+        saved_root = app_paths.app_root
+        saved_temp = os.environ.get('TEMP')
+        try:
+            app_paths._is_frozen = lambda: False
+            app_paths.app_root = lambda: os.path.join(blocker, 'sub')
+            os.environ['TEMP'] = os.path.join(blocker, 'nope')
+            path = app_paths.data_dir()
+            assert path.endswith(app_paths.USER_DATA_DIR_NAME), path
+            assert not os.path.exists(path), "建不起来时不该谎报目录可用"
+        finally:
+            app_paths._is_frozen = saved_frozen
+            app_paths.app_root = saved_root
+            if saved_temp is None:
+                os.environ.pop('TEMP', None)
+            else:
+                os.environ['TEMP'] = saved_temp
+    print("✅ 数据目录兜底测试通过\n")
+
+
+def test_error_handler_logs_real_traceback():
+    """
+    错误处理必须记下真正的栈
+
+    sys.excepthook 那条路上没有活动异常，traceback.format_exc() 只会写出
+    "NoneType: None"，而真正的栈是 hook 的参数——不传进来就等于丢掉现场。
+    """
+    print("=== 测试错误处理保留调用栈 ===")
+    import io
+    import logging
+    from managers.error_handler import ErrorHandler
+
+    log = logging.getLogger('screenshot-translation')
+    buf = io.StringIO()
+    handler = logging.StreamHandler(buf)
+    handler.setFormatter(logging.Formatter('%(message)s'))
+    saved_propagate = log.propagate
+    log.addHandler(handler)
+    log.propagate = False
+    try:
+        try:
+            raise ValueError('底层炸了')
+        except ValueError as error:
+            ErrorHandler.handle_error(error, '截图', show_message=False)
+        out = buf.getvalue()
+        assert 'Traceback' in out and 'ValueError: 底层炸了' in out, out
+
+        buf.truncate(0)
+        buf.seek(0)
+        captured = []
+        try:
+            raise RuntimeError('钩子外的错')
+        except RuntimeError as error:
+            captured.append((error, error.__traceback__))
+        # 出了 except 块就没有活动异常，等价于 excepthook 的处境
+        error, tb = captured[0]
+        ErrorHandler.handle_error(error, '主应用', show_message=False, tb=tb)
+        out = buf.getvalue()
+        assert 'Traceback' in out and 'RuntimeError: 钩子外的错' in out, out
+        assert 'NoneType: None' not in out, "hook 场景把栈记成了空异常"
+    finally:
+        log.removeHandler(handler)
+        log.propagate = saved_propagate
+    print("✅ 错误处理调用栈测试通过\n")
 
 
 def test_hotkey_parse():
@@ -2545,6 +2768,12 @@ def main():
         test_tray_debounce()
         test_clipboard_write_verified()
         test_config_defaults_in_memory()
+        test_corrupt_config_repair_fills_every_key()
+        test_batch_persist_false_writes_no_file()
+        test_write_failure_keeps_changes_pending()
+        test_cache_atomic_write_uses_unique_tmp()
+        test_data_dir_survives_unwritable_dirs()
+        test_error_handler_logs_real_traceback()
         test_hotkey_parse()
         test_hotkey_backend_fallback_and_watchdog()
         test_hotkey_conflict_prompt_reasons()

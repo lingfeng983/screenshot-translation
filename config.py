@@ -9,6 +9,7 @@ import configparser
 import contextlib
 import logging
 import os
+import shutil
 import threading
 
 from managers import app_paths
@@ -36,23 +37,36 @@ class ConfigManager:
         # 批量写盘：配置窗口保存时几十个 setter 只需落盘一次
         self._batch_depth = 0
         self._pending_changes = False
+        # 最近一次落盘是否成功：写盘失败会被 _write_config 兜住（不能让设置
+        # 窗口直接崩），但用户必须知道改动没进文件
+        self.write_ok = True
         self._load_config()
 
     @contextlib.contextmanager
-    def batch(self):
+    def batch(self, persist=True):
         """
         批量修改上下文：块内的 setter 只改内存，退出时统一落盘一次
 
         配置窗口一次"保存"会接连调用十几个 setter，逐个写文件既慢又
         增加写坏文件的窗口期；套上本上下文后只写一次。
+
+        Args:
+            persist (bool): 退出时是否写盘。False 用于"测试翻译"这类只想让
+                未保存的表单值当场生效的场合——没点保存就改用户的配置文件
+                是不该发生的
         """
         self._batch_depth += 1
         try:
             yield self
         finally:
             self._batch_depth -= 1
-            if self._batch_depth == 0 and self._pending_changes:
-                self._write_config()
+            if self._batch_depth == 0:
+                if persist and self._pending_changes:
+                    self._write_config()
+                elif not persist:
+                    # 不落盘的这批改动只活在内存里，挂着的"待写盘"标记要一起丢掉，
+                    # 否则下次任何一次 save_config 会把它们偷偷补写到盘上
+                    self._pending_changes = False
 
     def _load_config(self):
         """
@@ -73,6 +87,14 @@ class ConfigManager:
                     self.save_config()
             except Exception as e:
                 logger.error(f"配置文件加载失败，回退默认配置: {e}")
+                # 先留一份再修：直接写回默认值会把用户那份"只是某行写坏了"的
+                # 文件彻底顶掉，键值再无处可查（固定名，允许覆盖——修好后这个
+                # 分支就进不来了，再进来说明用户又把文件弄坏了一次）
+                with contextlib.suppress(OSError):
+                    shutil.copy2(self.config_file, self.config_file + '.bak')
+                # 半截解析会留下几个"存在但缺键"的段，而各段的默认值填充器
+                # 见段即跳，修出来的文件会整段整段缺键；先扔掉半成品
+                self.config = configparser.ConfigParser()
                 self._set_defaults()
                 # 文件已存在但读坏了：用默认值把它修好，
                 # 否则每次启动都当成坏配置，用户此前的设置也再无机会恢复
@@ -243,11 +265,14 @@ class ConfigManager:
         写入后尽量收紧文件权限（POSIX 下 0o600）。config.ini 可能包含明文密钥，
         更安全的做法是通过环境变量注入密钥（读取侧已优先环境变量），
         并将 config.ini 排除出版本库与分发包。
+
+        Returns:
+            bool: 配置当前处于"已全部落盘"的状态（batch 里延后写盘时也算成功）
         """
         if self._batch_depth > 0:
             self._pending_changes = True
-            return
-        self._write_config()
+            return True
+        return self._write_config()
 
     def _write_config(self):
         """
@@ -256,8 +281,11 @@ class ConfigManager:
         直接覆盖原文件时，若写到一半被中断（退出、断电、杀进程）会留下
         半截文件，下次启动被当成损坏配置整份回退默认值——密钥与快捷键全丢。
         临时名带进程与线程标识：多实例共用固定 ".tmp" 会互相顶替。
+
+        Returns:
+            bool: 是否写成功。失败时保持"待落盘"标记，下一次保存会连带
+                这次的改动一起重写——吞掉失败等于让用户以为设置存住了
         """
-        self._pending_changes = False
         tmp_file = (f"{self.config_file}.{os.getpid()}.{threading.get_ident()}.tmp")
         with self._lock:
             try:
@@ -271,12 +299,17 @@ class ConfigManager:
                     # Windows 等平台 chmod 语义有限，失败不影响主流程
                     pass
                 os.replace(tmp_file, self.config_file)
+                self._pending_changes = False
+                self.write_ok = True
                 logger.debug(f"配置保存成功: {self.config_file}")
+                return True
             except Exception as e:
                 logger.error(f"配置保存失败: {e}")
+                self.write_ok = False
                 with contextlib.suppress(OSError):
                     if os.path.exists(tmp_file):
                         os.remove(tmp_file)
+                return False
 
     # 翻译API相关配置
     def get_api_type(self):
@@ -530,6 +563,32 @@ class ConfigManager:
     #
     # 密钥优先从环境变量读取，未设置时回退到config.ini。
     # config.ini 中的密钥为明文存储，请勿随项目分发，建议通过环境变量注入。
+
+    # 配置项 -> 对应环境变量名；设置界面据此判断某个值是"环境给的"还是
+    # "配置文件里的"，前者不能回写进明文 config.ini
+    SECRET_ENV_OPTIONS = {
+        'bing_api_key': 'BING_API_KEY',
+        'baidu_app_id': 'BAIDU_APP_ID',
+        'baidu_api_key': 'BAIDU_API_KEY',
+        'youdao_app_id': 'YOUDAO_APP_ID',
+        'youdao_api_key': 'YOUDAO_API_KEY',
+        'llm_api_key': 'LLM_API_KEY',
+    }
+
+    @classmethod
+    def is_env_secret(cls, option):
+        """
+        该配置项当前是否由环境变量提供（环境变量的值存在且非空）
+
+        Args:
+            option (str): Translation 段中的配置项名
+
+        Returns:
+            bool: True 表示值来自环境，不该被写回明文配置
+        """
+        env_name = cls.SECRET_ENV_OPTIONS.get(option)
+        return bool(env_name and os.environ.get(env_name))
+
     def _get_secret(self, env_name, option):
         """
         读取敏感配置项，优先使用环境变量

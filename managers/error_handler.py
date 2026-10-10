@@ -5,7 +5,7 @@
 负责统一处理错误和提供友好的错误提示
 """
 
-import traceback
+import sys
 import logging
 
 from PyQt5.QtWidgets import QMessageBox
@@ -47,7 +47,7 @@ class ErrorHandler:
         ErrorHandler._modal_allowed = False
 
     @staticmethod
-    def handle_error(error, module_name, show_message=True):
+    def handle_error(error, module_name, show_message=True, tb=None):
         """
         处理错误
 
@@ -55,13 +55,18 @@ class ErrorHandler:
             error (Exception): 错误对象
             module_name (str): 模块名称
             show_message (bool): 是否显示错误提示
+            tb (traceback 或 None): 调用栈。sys.excepthook 那条路上没有活动
+                异常，traceback.format_exc() 只会记成 "NoneType: None"，
+                真正的栈是 hook 的参数，必须由调用方递进来
 
         Returns:
             str: 错误信息
         """
-        # 记录错误日志
-        logger.error(f"{module_name}模块发生错误: {str(error)}")
-        logger.error(traceback.format_exc())
+        # exc_info 用三元组形式：既覆盖 hook 传栈的情况，也让 except 内的
+        # 调用照样带上当前活动异常的轨迹
+        logger.error(f"{module_name}模块发生错误: {str(error)}",
+                     exc_info=(type(error), error,
+                               tb if tb is not None else sys.exc_info()[2]))
 
         # 显示错误提示（可能被工作线程调用，QMessageBox 必须在主线程创建）
         if show_message:

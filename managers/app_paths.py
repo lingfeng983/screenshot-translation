@@ -70,16 +70,24 @@ def data_dir() -> str:
     - 源码态 → 项目根，沿用开发者本地的 config.ini 与日志，不动工作区
 
     Returns:
-        str: 已确保存在的目录路径
+        str: 目录路径；连兜底目录都建不起来时返回兜底路径本身（调用方要能
+            在"没有可写目录"的情况下继续跑，见 main.py 的 _setup_logging）
     """
     path = (os.path.join(os.path.expanduser('~'), USER_DATA_DIR_NAME)
             if _is_frozen() else app_root())
     try:
         os.makedirs(path, exist_ok=True)
+        return path
     except OSError as e:
+        # 本函数在 logging 配好之前就会被调用（日志文件路径就来自这里），
+        # 所以这里的 warning 走 logging.lastResort 打到 stderr
         logger.warning(f"数据目录创建失败，回退到临时目录: {e}")
-        path = os.path.join(os.environ.get('TEMP', os.getcwd()), USER_DATA_DIR_NAME)
+
+    path = os.path.join(os.environ.get('TEMP', os.getcwd()), USER_DATA_DIR_NAME)
+    try:
         os.makedirs(path, exist_ok=True)
+    except OSError as e:
+        logger.warning(f"兜底数据目录也建不起来: {e}")
     return path
 
 

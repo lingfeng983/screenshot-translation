@@ -180,7 +180,10 @@ class CacheManager:
 
     def _save_cache(self):
         """保存缓存到文件（原子写入，避免中断产生损坏文件）"""
-        tmp_file = f"{self.cache_file}.tmp"
+        # 临时名带进程与线程标识：多实例共用固定 ".tmp" 时，两个写者会互相
+        # 顶替同一个临时文件，失败方清理时还会把对方正在写的那份删掉
+        tmp_file = (f"{self.cache_file}.{os.getpid()}"
+                    f".{threading.get_ident()}.tmp")
         try:
             # 清理过期条目
             self._cleanup_expired()

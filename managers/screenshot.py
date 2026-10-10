@@ -179,10 +179,9 @@ class ScreenshotManager:
         try:
             # 统一通过调度器保证截图窗口在主线程创建
             qt_dispatcher.dispatch_to_main_thread(self._run_screenshot)
-        except Exception as e:
-            logger.error(f"启动截图流程失败: {e}")
-            import traceback
-            traceback.print_exc()
+        except Exception:
+            # 打包后没有控制台，print_exc 那路等于什么都没留
+            logger.exception("启动截图流程失败")
 
     def _run_screenshot(self):
         """
@@ -711,10 +710,8 @@ class ScreenshotWidget(QWidget):
                         f"（桌面原点 {self._desktop_rect.x()},{self._desktop_rect.y()}，"
                         f"抓拍倍率 {self._grab_scale:.3f}，"
                         f"冻结整屏: {'成功' if self._frozen_pixmap else '失败'}）")
-        except Exception as e:
-            logger.error(f"初始化截图窗口失败: {e}")
-            import traceback
-            traceback.print_exc()
+        except Exception:
+            logger.exception("初始化截图窗口失败")
 
     @staticmethod
     def _read_int_config(config_manager, option, default, lo, hi):
