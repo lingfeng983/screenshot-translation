@@ -192,17 +192,22 @@ class OverlayToolbar(QWidget):
         """
         宽度受限时按精简顺序隐藏次要按钮
 
+        每次调用都按当前可用宽度重算：工具条在同一个遮罩里会被多次摆放
+        （换选区、切模式），只做单向隐藏的话，第一次窄选区省掉的按钮
+        在后面的宽选区里也永远回不来。
+
         Args:
             max_width (int): 可用最大宽度
 
         Returns:
             int: 调整后的宽度
         """
-        for widget in list(self._trimmable):
+        for widget in self._trimmable:
+            widget.setVisible(True)
+        for widget in self._trimmable:
             if self.sizeHint().width() <= max_width:
                 break
             widget.setVisible(False)
-            self._trimmable.remove(widget)
         return self.sizeHint().width()
 
     def preferred_width(self):

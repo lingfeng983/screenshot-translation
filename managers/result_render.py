@@ -69,23 +69,26 @@ CARD_BODY_PX = 12
 CARD_BODY_WRAP_PX = CARD_BODY_PX
 
 
-def to_logical_blocks(blocks, scale):
+def to_logical_blocks(blocks, scale, scale_y=None):
     """
     把图像像素坐标的行块换算成遮罩用的逻辑坐标
 
     Args:
         blocks (list[TextBlock]): 图像像素坐标下的行块
-        scale (float): 逻辑坐标到图像物理像素的倍率（高分屏 > 1）
+        scale (float): 逻辑坐标到图像物理像素的横向倍率（高分屏 > 1）
+        scale_y (float 或 None): 纵向倍率；None时与横向一致。DPI 缩放信息缺失时
+            抓拍图的横纵倍率可以不同，用同一个倍率会把行块整体压扁或拉长
 
     Returns:
         list[TextBlock]: 逻辑坐标行块（文本保持不变）
     """
-    if not scale or scale == 1.0:
+    scale_y = scale if scale_y is None else scale_y
+    if not scale or not scale_y or (scale == 1.0 and scale_y == 1.0):
         return list(blocks)
     return [TextBlock(b.text, int(round(b.left / scale)),
-                      int(round(b.top / scale)),
+                      int(round(b.top / scale_y)),
                       int(round(b.width / scale)),
-                      int(round(b.height / scale))) for b in blocks]
+                      int(round(b.height / scale_y))) for b in blocks]
 
 
 def pil_to_qpixmap(image, dpr=1.0):
@@ -129,13 +132,15 @@ def warm_up_fonts():
         image = QImage(300, 60, QImage.Format_ARGB32)
         image.fill(Qt.transparent)
         painter = QPainter(image)
-        painter.setPen(QColor('#ffffff'))
-        for pixel_size in _WARM_UP_SIZES:
-            font = QFont(painter.font())
-            font.setPixelSize(pixel_size)
-            painter.setFont(font)
-            painter.drawText(2, min(58, pixel_size + 4), '译文字示例 sample 0123')
-        painter.end()
+        try:
+            painter.setPen(QColor('#ffffff'))
+            for pixel_size in _WARM_UP_SIZES:
+                font = QFont(painter.font())
+                font.setPixelSize(pixel_size)
+                painter.setFont(font)
+                painter.drawText(2, min(58, pixel_size + 4), '译文字示例 sample 0123')
+        finally:
+            painter.end()
     except Exception:
         return False
     return True
@@ -180,7 +185,7 @@ def card_content_size(painter, body_text, title=None, footer=None,
     return QSize(width, min(CARD_MAX_HEIGHT, max(60, height))), lines
 
 
-def dominant_colors(image, rect, scale=1.0):
+def dominant_colors(image, rect, scale=1.0, scale_y=None):
     """
     采样文本块的背景色与前景色
 
@@ -190,16 +195,18 @@ def dominant_colors(image, rect, scale=1.0):
     Args:
         image (PIL.Image.Image): 被裁剪的选区图像（RGB，物理像素）
         rect (QRect): 块在逻辑坐标下的矩形
-        scale (float): 逻辑坐标到图像物理像素的倍率（高分屏缩放）
+        scale (float): 逻辑坐标到图像物理像素的横向倍率（高分屏缩放）
+        scale_y (float 或 None): 纵向倍率；None时与横向一致
 
     Returns:
         tuple[QColor, QColor]: (背景色, 前景色)；采样失败时给安全的黑白对
     """
     try:
+        scale_y = scale if scale_y is None else scale_y
         width, height = image.size
-        physical = QRect(int(rect.x() * scale), int(rect.y() * scale),
+        physical = QRect(int(rect.x() * scale), int(rect.y() * scale_y),
                          max(1, int(rect.width() * scale)),
-                         max(1, int(rect.height() * scale)))
+                         max(1, int(rect.height() * scale_y)))
         outer = physical.adjusted(-4, -4, 4, 4)
         outer = outer.intersected(QRect(0, 0, width, height))
         ring = _border_pixels(image, outer)
@@ -497,7 +504,7 @@ def _block_bottom_limit(block, following, bounds):
     return max(block.bottom, limit)
 
 
-def _layout_cache_for(image, scale):
+def _layout_cache_for(image, scale, scale_y=None):
     """
     取本选区图的排版缓存；换了图就整体作废
 
@@ -506,17 +513,19 @@ def _layout_cache_for(image, scale):
 
     Args:
         image (PIL.Image.Image): 选区图像
-        scale (float): 逻辑坐标到图像像素的倍率
+        scale (float): 逻辑坐标到图像像素的横向倍率
+        scale_y (float 或 None): 纵向倍率；None时与横向一致
 
     Returns:
         dict: 以 (块矩形, 译文, 模式, 可借用高度) 为键的排版结果
     """
     global _LAYOUT_CACHE, _LAYOUT_OWNER, _LAYOUT_SCALE
 
+    scale_y = scale if scale_y is None else scale_y
     owner = _LAYOUT_OWNER() if _LAYOUT_OWNER is not None else None
-    if owner is not image or _LAYOUT_SCALE != scale:
+    if owner is not image or _LAYOUT_SCALE != (scale, scale_y):
         _LAYOUT_CACHE = {}
-        _LAYOUT_SCALE = scale
+        _LAYOUT_SCALE = (scale, scale_y)
         try:
             _LAYOUT_OWNER = weakref.ref(image)
         except TypeError:
@@ -524,7 +533,7 @@ def _layout_cache_for(image, scale):
     return _LAYOUT_CACHE
 
 
-def _layout_block(painter, image, rect, text, mode, scale, avail):
+def _layout_block(painter, image, rect, text, mode, scale, avail, scale_y=None):
     """
     单块的取色与排版（结果态每帧都要用到，代价高，按块缓存）
 
@@ -535,7 +544,7 @@ def _layout_block(painter, image, rect, text, mode, scale, avail):
     Returns:
         tuple: (背景色, 前景色, 字体, 行列表, 原文字号, 原文行高, 行高)
     """
-    bg, fg = dominant_colors(image, rect, scale)
+    bg, fg = dominant_colors(image, rect, scale, scale_y)
     base_px = int(rect.height() * 0.78)
     font, lines, _ = fit_text(painter, text, QRect(0, 0, rect.width(), avail), base_px)
     source_px = source_height = 0
@@ -550,7 +559,8 @@ def _layout_block(painter, image, rect, text, mode, scale, avail):
     return bg, fg, font, lines, source_px, source_height, line_height
 
 
-def paint_blocks(painter, image, blocks, texts, origin, mode, scale=1.0):
+def paint_blocks(painter, image, blocks, texts, origin, mode, scale=1.0,
+                 scale_y=None):
     """
     就地覆盖绘制
 
@@ -565,7 +575,8 @@ def paint_blocks(painter, image, blocks, texts, origin, mode, scale=1.0):
         texts (list[str]): 与 blocks 等长的译文
         origin (QPoint): 选区在屏幕上的原点（逻辑坐标）
         mode (str): MODE_ORIGINAL / MODE_BILINGUAL / MODE_TRANSLATED
-        scale (float): 逻辑坐标到图像像素的倍率
+        scale (float): 逻辑坐标到图像像素的横向倍率
+        scale_y (float 或 None): 纵向倍率；None时与横向一致
 
     Returns:
         list[QRect]: 实际绘制过的覆盖矩形（画布坐标）
@@ -573,15 +584,17 @@ def paint_blocks(painter, image, blocks, texts, origin, mode, scale=1.0):
     if mode == MODE_ORIGINAL or not image:
         return []
 
+    scale_y = scale if scale_y is None else scale_y
+
     pairs = [(b, t) for b, t in zip(blocks, texts) if (t or '').strip()]
     pairs.sort(key=lambda item: item[0].top)
 
     # 绘制范围：译文再长也不能超出选区本身（画布坐标）
     bounds = QRect(origin.x(), origin.y(),
                    int(image.width / max(1.0, scale)),
-                   int(image.height / max(1.0, scale)))
+                   int(image.height / max(1.0, scale_y)))
 
-    cache = _layout_cache_for(image, scale)
+    cache = _layout_cache_for(image, scale, scale_y)
 
     painted = []
     for index, (block, text) in enumerate(pairs):
@@ -597,7 +610,8 @@ def paint_blocks(painter, image, blocks, texts, origin, mode, scale=1.0):
                text, mode, avail)
         layout = cache.get(key)
         if layout is None:
-            layout = _layout_block(painter, image, rect, text, mode, scale, avail)
+            layout = _layout_block(painter, image, rect, text, mode, scale,
+                                   avail, scale_y)
             cache[key] = layout
         bg, fg, font, lines, source_px, source_height, line_height = layout
 

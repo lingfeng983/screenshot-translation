@@ -27,6 +27,22 @@ logger = logging.getLogger('screenshot-translation')
 # 先白等约 3 秒（1s+2s 退避）才降级，还多打一次请求（云端API是算额度/计费的）。
 translation_retry_handler = RetryHandler(max_attempts=2, base_delay=0.5)
 
+# 降级链全部失败时返回的标记前缀（不是译文，是给调用方判定的信号）
+TRANSLATION_FAILURE_PREFIX = '[翻译失败'
+
+
+def is_translation_failure(text):
+    """
+    判定字符串是"译文"还是"翻译失败的标记文本"
+
+    Args:
+        text (str): perform_translation 的返回值
+
+    Returns:
+        bool: True 表示整条链都没出译文
+    """
+    return isinstance(text, str) and text.startswith(TRANSLATION_FAILURE_PREFIX)
+
 
 class TranslationManager(ProviderChainManager):
     """
@@ -37,7 +53,7 @@ class TranslationManager(ProviderChainManager):
     # 链式调度基类配置
     _registry = provider_registry
     _default_provider_name = 'edge_free'
-    _failure_prefix = '[翻译失败'
+    _failure_prefix = TRANSLATION_FAILURE_PREFIX
 
     # 配置API全挂时依次尝试的免密钥接口（顺序即优先级）
     _FREE_FALLBACKS = ('edge_free', 'google_free')

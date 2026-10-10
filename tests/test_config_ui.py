@@ -423,6 +423,12 @@ def _run_tests(app, failures):
                     copied.append(text)
                     return True
 
+                @staticmethod
+                def set_text_later(text, on_done=None):
+                    copied.append(text)
+                    if on_done:
+                        on_done(True)
+
             real_clipboard = screenshot_mod.clipboard
             screenshot_mod.clipboard = SpyClipboard
             try:

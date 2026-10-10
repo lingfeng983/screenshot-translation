@@ -1008,9 +1008,10 @@ def test_pin_window_keys():
 
         class SpyClipboard:
             @staticmethod
-            def set_pixmap(px):
+            def set_pixmap_later(px, on_done=None):
                 calls.append(px)
-                return True
+                if on_done:
+                    on_done(True)
 
         real_clipboard = pin_window.clipboard
         pin_window.clipboard = SpyClipboard
@@ -1202,9 +1203,10 @@ def test_clipboard_write_verified():
 
     class SpyClipboard:
         @staticmethod
-        def set_text(text):
+        def set_text_later(text, on_done=None):
             copied.append(text)
-            return False
+            if on_done:
+                on_done(False)
 
     real_screenshot_clipboard = screenshot_mod.clipboard
     screenshot_mod.clipboard = SpyClipboard
@@ -1214,10 +1216,46 @@ def test_clipboard_write_verified():
         screenshot_mod.clipboard = real_screenshot_clipboard
     assert copied == ['你好'], f"复制未经过校验写入器: {copied}"
 
-    # ⑦ 真实剪贴板冒烟：写入后 ownsClipboard 必须立刻为 True。
+    # ⑦ 主线程走的是非阻塞版：前几次被占用时不 sleep，而是把重试排进事件循环
+    import time
+    app = _ensure_qt_app()
+    real_app = clipboard_mod.QApplication
+    real_delay = clipboard_mod._DELAY
+    results = []
+
+    class OccupyThenRelease:
+        """FakeClipboard 的事件循环版：写两次才生效"""
+
+        def __init__(self):
+            self.writes = 0
+
+        def setText(self, text):
+            self.writes += 1
+
+        def ownsClipboard(self):
+            return self.writes >= 2
+
+    fake = OccupyThenRelease()
+    clipboard_mod.QApplication = type(
+        'App', (), {'clipboard': staticmethod(lambda: fake)})
+    clipboard_mod._DELAY = 0
+    try:
+        clipboard_mod.set_text_later('译文', on_done=results.append)
+        deadline = time.time() + 2
+        while not results and time.time() < deadline:
+            app.processEvents()
+            time.sleep(0.005)
+    finally:
+        clipboard_mod.QApplication = real_app
+        clipboard_mod._DELAY = real_delay
+    assert results == [True], f"非阻塞重试没有最终写入成功: {results}"
+    assert fake.writes >= 2, f"未生效时没有排重试: {fake.writes} 次写入"
+
+    # ⑧ 真实剪贴板冒烟：写入后 ownsClipboard 必须立刻为 True。
     #    ownsClipboard 探测不打开剪贴板，第三方工具长期占住剪贴板时
     #    （剪贴板监视器挂着 OpenClipboard），写入会真实失败——此时如实
-    #    跳过而不是误报；机制本身由 ①~⑤ 的桩验证与 ⑥ 的接线验证守住。
+    #    跳过而不是误报；机制本身由 ①~⑤ 的桩验证、⑥⑦ 的接线与非阻塞
+    #    重试验证守住。
     from PyQt5.QtWidgets import QApplication
     _ensure_qt_app()
     clipboard = QApplication.clipboard()
@@ -1870,6 +1908,298 @@ def test_translation_warm_up():
     print("✅ 翻译链路预热测试通过\n")
 
 
+def test_crop_box_includes_last_pixel():
+    """
+    选区换算到抓拍图的裁剪框必须含右下角那一像素
+
+    QRect 的 right()/bottom() 是闭区间（= left+width-1），PIL 的裁剪框右下沿
+    却是开区间：拿 right()/bottom() 当右下沿会整块选区少裁一像素，
+    首尾字符被切掉半个，识别质量直接下降。横纵倍率不等时也要各自换算。
+    """
+    print("=== 测试选区裁剪框不缺右下角像素 ===")
+    from PIL import Image
+    from PyQt5.QtCore import QPoint
+
+    from managers.screenshot import ScreenshotWidget
+
+    _ensure_qt_app()
+    widget = ScreenshotWidget()
+    captured = []
+    try:
+        widget.region_selected.connect(lambda img, rect: captured.append(img))
+        # 合成一张"抓拍图"：横 2 倍、纵 1 倍（模拟 DPI 信息缺失时横纵不等比）
+        widget.full_screen = Image.new('RGB', (2000, 400), 'white')
+        widget._grab_scale = 2.0
+        widget._grab_scale_y = 1.0
+        widget._snap_window_rects = []
+        widget._snap_threshold = 0
+        widget.begin, widget.end = QPoint(100, 100), QPoint(300, 200)
+
+        widget._confirm_selection()
+
+        assert len(captured) == 1, f"没有发起识别: {len(captured)}"
+        image = captured[0]
+        assert (image.width, image.height) == (400, 100), \
+            f"裁剪尺寸应为选区×各自倍率 400x100，实际 {image.width}x{image.height}"
+        assert (widget._scale, widget._scale_y) == (2.0, 1.0), \
+            f"横纵倍率记录不对: {widget._scale} / {widget._scale_y}"
+    finally:
+        widget.close()
+
+    # 选区落到抓拍图之外时不能裁出空图继续跑识别
+    widget2 = ScreenshotWidget()
+    canceled = []
+    try:
+        widget2.screenshot_canceled.connect(lambda: canceled.append(1))
+        widget2.full_screen = Image.new('RGB', (100, 100), 'white')
+        widget2._grab_scale = 2.0
+        widget2._grab_scale_y = 2.0
+        widget2._snap_window_rects = []
+        widget2._snap_threshold = 0
+        widget2.begin, widget2.end = QPoint(80, 80), QPoint(95, 95)
+        widget2._confirm_selection()
+        assert canceled, "裁不出有效像素时应取消截图而不是继续"
+    finally:
+        widget2.close()
+    print("✅ 选区裁剪框测试通过\n")
+
+
+def test_result_render_per_axis_scale():
+    """行块坐标与取色必须按横纵各自倍率换算，不能拿横向倍率去除纵向"""
+    print("=== 测试结果绘制横纵倍率分离 ===")
+    from PIL import Image
+    from PyQt5.QtCore import QRect
+
+    import managers.result_render as rr
+    from managers.text_block import TextBlock
+
+    blocks = [TextBlock('Hello', 200, 100, 40, 20)]
+    same = rr.to_logical_blocks(blocks, 2.0)
+    assert (same[0].left, same[0].top, same[0].width, same[0].height) == \
+        (100, 50, 20, 10), f"等比换算不对: {same[0]}"
+
+    split = rr.to_logical_blocks(blocks, 2.0, 1.0)
+    assert (split[0].left, split[0].top, split[0].width, split[0].height) == \
+        (100, 100, 20, 20), f"纵向用了横向倍率: {split[0]}"
+
+    # 取色：把目标块（逻辑 100,100,20,20 → 物理 200,100,40,20）涂成蓝、其余涂白，
+    # 纵向若误用 2.0 倍率就会采样到物理 (200,200) 一带的白色
+    image = Image.new('RGB', (400, 400), 'white')
+    for y in range(100, 120):
+        for x in range(200, 240):
+            image.putpixel((x, y), (0, 0, 255))
+    bg, fg = rr.dominant_colors(image, QRect(100, 100, 20, 20), 2.0, 1.0)
+    assert fg.blue() > 200 and fg.red() < 60, \
+        f"纵向采样位置不对，取到的前景色是 {fg.name()}"
+    assert bg.red() > 200 and bg.green() > 200, f"背景色应取到白色: {bg.name()}"
+
+    # 缓存归属键必须包含纵向倍率，否则换了纵向倍率还会吃上一轮的取色结果
+    _ensure_qt_app()
+    cache_a = rr._layout_cache_for(image, 2.0, 1.0)
+    cache_a['probe'] = 1
+    cache_b = rr._layout_cache_for(image, 2.0, 2.0)
+    assert 'probe' not in cache_b, "纵向倍率变了必须作废排版缓存"
+    print("✅ 结果绘制横纵倍率分离测试通过\n")
+
+
+def test_translation_failure_not_painted_as_result():
+    """
+    降级链全失败返回的 "[翻译失败 …]" 标记不能被当译文贴上原文
+
+    单行选区时标记文本的"行数"正好等于块数，会顺着按行对齐通道贴回遮罩，
+    用户看到的就是一行像译文的报错；这里要么走可重试的失败卡片，
+    要么这一块留空，绝不允许标记文本进入展示。
+    """
+    print("=== 测试翻译失败标记不当译文展示 ===")
+    from managers.screenshot import ScreenshotManager
+    from managers.text_block import TextBlock
+    from managers.translation import TranslationManager, is_translation_failure
+
+    assert is_translation_failure(TranslationManager(None)._failure_prefix
+                                 + ' 网络超时] Hello')
+    assert not is_translation_failure('你好')
+    assert not is_translation_failure('')
+    assert not is_translation_failure(None)
+
+    manager = ScreenshotManager()
+    marker = '[翻译失败 网络超时] Hello'
+    assert manager._translation_failure_message(marker, []), "全失败应给出失败文案"
+    assert manager._translation_failure_message(marker, ['你好']) is None, \
+        "只要有一行真译文就不算失败"
+    assert manager._translation_failure_message('你好', []) is None
+    assert manager._translation_failure_message('', []) is None, \
+        "本来就没有内容时不算翻译失败"
+
+    class AllFailTranslation:
+        target_lang = 'zh'
+
+        def get_target_languages(self):
+            return [('zh', '中文')]
+
+        def perform_translation(self, text, force_refresh=False, target_lang=None,
+                                cancel_event=None, deadline=None):
+            return marker
+
+    manager.translation_manager = AllFailTranslation()
+    blocks = [TextBlock('Hello', 0, 0, 100, 20)]
+    texts = manager._translate_blocks(blocks, 'Hello', 'zh', False, whole=marker)
+    assert marker not in texts, f"失败标记被当译文返回了: {texts}"
+    assert manager._translation_failure_message(marker, texts) == \
+        '翻译失败：所有接口都没有返回译文'
+
+    # 逐块兜底也一样：单块失败留空，不把标记文本塞回展示
+    class OneBlockFails:
+        target_lang = 'zh'
+
+        def perform_translation(self, text, force_refresh=False, target_lang=None,
+                                cancel_event=None, deadline=None):
+            return marker if text == 'bad' else f'[译文]{text}'
+
+    manager.translation_manager = OneBlockFails()
+    blocks = [TextBlock('good', 0, 0, 100, 20), TextBlock('bad', 0, 30, 100, 20)]
+    texts = manager._translate_blocks(blocks, 'good\nbad', 'zh', False, whole='')
+    assert texts == ['[译文]good', ''], f"失败块应留空: {texts}"
+    assert manager._translation_failure_message('', texts) is None, \
+        "有一块成功就不该整体报失败"
+    print("✅ 翻译失败标记处理测试通过\n")
+
+
+def test_overlay_paint_never_raises():
+    """
+    绘制期异常不能让进程消失
+
+    Qt 不接 Python 异常：paintEvent 里抛出等于把整个程序带走，
+    既没有对话框也没有栈。这里断言异常被兜住并记进日志。
+    """
+    print("=== 测试遮罩绘制异常不外抛 ===")
+    import logging
+
+    from PIL import Image
+    from PyQt5.QtCore import QRect
+    from PyQt5.QtGui import QPixmap
+
+    import managers.result_render as result_render
+    import managers.screenshot as screenshot_mod
+    from managers.screenshot import ScreenshotWidget
+
+    _ensure_qt_app()
+    widget = ScreenshotWidget()
+    recorded = []
+
+    class SpyHandler(logging.Handler):
+        def emit(self, record):
+            if record.levelno >= logging.ERROR:
+                recorded.append(record.getMessage())
+
+    handler = SpyHandler()
+    # 模块用的是全局 logger，挂错对象就永远收不到
+    app_logger = logging.getLogger('screenshot-translation')
+    app_logger.addHandler(handler)
+    real_paint_blocks = result_render.paint_blocks
+    canvas = QPixmap(max(1, widget.width()), max(1, widget.height()))
+    try:
+        def boom(painter):
+            raise RuntimeError('绘制里故意抛的异常')
+
+        widget._paint = boom
+        widget.render(canvas)        # render 会走 paintEvent；不应抛出
+
+        # 结果态深处的异常也要被同一层兜住（内层 try 已合并进外层）
+        del widget._paint            # 丢掉实例属性，恢复类上的 _paint
+        widget._result = {'original_text': 'Hi', 'translated_text': '你好',
+                          'block_texts': ['你好'],
+                          'image': Image.new('RGB', (40, 20), 'white'),
+                          'blocks': [], 'region': QRect(0, 0, 40, 20)}
+        widget._result_rect = QRect(0, 0, 40, 20)
+        result_render.paint_blocks = lambda *a, **k: (_ for _ in ()).throw(
+            RuntimeError('覆盖绘制失败'))
+        canvas2 = QPixmap(max(1, widget.width()), max(1, widget.height()))
+        widget.render(canvas2)
+        assert canvas2.toImage().pixelColor(0, 0).isValid(), "遮罩一帧都没画出来"
+    finally:
+        result_render.paint_blocks = real_paint_blocks
+        app_logger.removeHandler(handler)
+        widget.close()
+    assert any('遮罩绘制失败' in m for m in recorded), f"异常未留痕: {recorded}"
+    print("✅ 遮罩绘制异常兜住测试通过\n")
+
+
+def test_snap_rect_does_not_collapse_selection():
+    """
+    磁吸不能把选区吸没
+
+    窄选区的左右两边可能落在同一条参考线的阈值内，四边各自独立吸附会互相
+    挤压出 0 宽（拖拽中表现为选区凭空消失）；现在吸完先校验尺寸，
+    不合格就整条不采纳，也不报告对应的参考线。
+    """
+    print("=== 测试磁吸不把窄选区压扁 ===")
+    from PyQt5.QtCore import QRect
+
+    from managers.screenshot import ScreenshotWidget
+
+    _ensure_qt_app()
+    widget = ScreenshotWidget()
+    try:
+        widget._screen_rects = [QRect(0, 0, 1920, 1080)]
+        widget.screen_width, widget.screen_height = 1920, 1080
+        # 一个窗口：左边 300、右边 310（窄到能同时吸住两边的线）
+        widget._snap_window_rects = [(300, 0, 310, 500)]
+        widget._snap_threshold = 15
+
+        # 正常选区该吸还是要吸：左边离 300 最近（差 3），右边 505 无线可吸
+        rect, guides = widget._snap_rect(QRect(303, 200, 200, 100))
+        assert rect.left() == 300, f"该吸到窗口左边却没吸: {rect} {guides}"
+        assert ('x', 300) in guides, f"吸附了却没报告参考线: {guides}"
+        assert rect.width() == 200, f"吸附改变了选区宽度: {rect}"
+
+        # 窄选区：两边都落在同一条线上，尺寸不能被改动
+        for width in (1, 2, 5):
+            rect, _ = widget._snap_rect(QRect(308, 200, width, 40))
+            assert (rect.width(), rect.height()) == (width, 40), \
+                f"{width}px 选区被吸改了尺寸: {rect}"
+
+        # 0 宽的退化选区：竖向线一条也不该激活
+        rect, guides = widget._snap_rect(QRect(308, 200, 0, 40))
+        assert rect.width() == 0, f"退化选区被吸出了宽度: {rect}"
+        assert not [g for g in guides if g[0] in ('x', 'x2')], \
+            f"0 宽选区不该激活竖向参考线: {guides}"
+        print("✅ 磁吸不压扁选区测试通过\n")
+    finally:
+        widget.close()
+
+
+def test_toolbar_fit_width_reversible():
+    """窄选区省掉的工具条按钮，换到宽选区时必须能回来"""
+    print("=== 测试工具条宽度精简可逆 ===")
+    from PyQt5.QtWidgets import QWidget
+
+    from managers.overlay_toolbar import OverlayToolbar
+
+    _ensure_qt_app()
+    host = QWidget()
+    toolbar = OverlayToolbar(host, [('zh', '中文'), ('en', 'English')])
+    try:
+        full = toolbar.preferred_width()
+        hidden_at_narrow = toolbar.fit_width(1)
+        assert hidden_at_narrow < full, "极窄时应该省掉按钮"
+        assert any(w.isHidden() for w in toolbar._trimmable), "没有按钮被隐藏"
+
+        back = toolbar.fit_width(full)
+        assert back == full, f"回到宽选区没恢复完整工具条: {back} != {full}"
+        assert not any(w.isHidden() for w in toolbar._trimmable), \
+            "省掉的按钮回不来：_trimmable 被单向消费了"
+
+        # 中间档位也要按当前宽度重算，而不是记住上一次的精简结果
+        mid = toolbar.fit_width((full + hidden_at_narrow) // 2)
+        assert mid <= (full + hidden_at_narrow) // 2, f"中间档没省够: {mid}"
+        assert toolbar.fit_width(full) == full
+        assert not any(w.isHidden() for w in toolbar._trimmable)
+    finally:
+        toolbar.deleteLater()
+        host.deleteLater()
+    print("✅ 工具条宽度精简可逆测试通过\n")
+
+
 def main():
     """主测试函数"""
     print("开始功能测试...\n")
@@ -1905,6 +2235,12 @@ def main():
         test_ocr_empty_result_shortcut()
         test_translate_blocks_parallel()
         test_translation_warm_up()
+        test_crop_box_includes_last_pixel()
+        test_result_render_per_axis_scale()
+        test_translation_failure_not_painted_as_result()
+        test_overlay_paint_never_raises()
+        test_snap_rect_does_not_collapse_selection()
+        test_toolbar_fit_width_reversible()
 
         print("🎉 所有测试通过！新功能工作正常。")
 

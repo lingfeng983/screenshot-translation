@@ -1055,8 +1055,31 @@ class ConfigWindow(QDialog):
             event (QCloseEvent): Qt关闭事件对象
         """
         logger.debug("配置窗口关闭事件触发")
+        self._revert_unsaved_theme()
         # 接受关闭事件，让窗口关闭
         event.accept()
+
+    def _revert_unsaved_theme(self):
+        """
+        没保存就关窗时撤掉主题预览
+
+        下拉框的"切换即预览"改的是进程级样式（app stylesheet），不落盘就关掉
+        窗口，界面会一直顶着预览主题跑，和配置里的值对不上——下次别的窗口
+        构造时用的也是这个错的主题。
+        """
+        try:
+            persisted = styles.normalize_theme(
+                self.config_manager.get_theme()
+                if self.config_manager else styles.DEFAULT_THEME)
+            if styles.current_theme() == persisted:
+                return
+            styles.set_current_theme(persisted)
+            app = QApplication.instance()
+            if app is not None:
+                styles.apply_app(app)
+            logger.info(f"主题预览未保存，已恢复为配置中的 {persisted}")
+        except Exception as e:
+            logger.warning(f"恢复主题失败: {e}")
 
 
 

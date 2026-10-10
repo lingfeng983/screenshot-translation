@@ -26,6 +26,7 @@ from .pin_window import PinWindow
 from .qt_dispatcher import get_qt_app, qt_dispatcher
 from .text_block import group_paragraphs
 from .thread_pool import thread_pool_manager
+from .translation import is_translation_failure
 
 import logging
 
@@ -337,7 +338,8 @@ class ScreenshotManager:
             updated['block_texts'] = self._translate_blocks(
                 payload['blocks'], payload['original_text'], target_lang,
                 force_refresh, whole=updated['translated_text'], token=token)
-            updated['error'] = None
+            updated['error'] = self._translation_failure_message(
+                updated['translated_text'], updated['block_texts'])
         except Exception as e:
             logger.error(f"重新翻译失败: {e}")
             updated['error'] = str(e)
@@ -400,6 +402,9 @@ class ScreenshotManager:
             payload['block_texts'] = self._translate_blocks(
                 blocks, original_text, target_lang, force_refresh,
                 whole=payload['translated_text'], token=token)
+            # 一条译文都没拿到时不能"展示原图"蒙过去：按失败处理，给可重试卡片
+            payload['error'] = self._translation_failure_message(
+                payload['translated_text'], payload['block_texts'])
         except Exception as e:
             error_handler.handle_error(e, "截图处理")
             payload['error'] = str(e)
@@ -448,6 +453,27 @@ class ScreenshotManager:
             logger.error(f"翻译失败: {e}")
             return ''
 
+    def _translation_failure_message(self, whole, block_texts):
+        """
+        判定本次到底有没有拿到可用译文
+
+        降级链全失败时 perform_translation 返回的是 "[翻译失败 …]" 标记文本，
+        原样贴回选区看起来就像译文；这里把它归为失败，改走可重试的失败卡片。
+
+        Args:
+            whole (str): 整段译文（可能是失败标记）
+            block_texts (list[str]): 行级译文
+
+        Returns:
+            str 或 None: 全部失败时给失败文案，任一处有真译文时返回None
+        """
+        candidates = [whole] + [t for t in (block_texts or []) if t]
+        if any(t.strip() and not is_translation_failure(t) for t in candidates):
+            return None
+        if any(is_translation_failure(t) for t in candidates):
+            return '翻译失败：所有接口都没有返回译文'
+        return None
+
     def _translate_blocks(self, blocks, full_text, target_lang, force_refresh=False,
                           whole=None, token=None):
         """
@@ -469,6 +495,9 @@ class ScreenshotManager:
 
         if whole is None:
             whole = self._translate_all(full_text, target_lang, force_refresh, token)
+        # 失败标记不参与按行对齐：单块选区时它"行数正好相等"，会被当译文贴上原文
+        if is_translation_failure(whole):
+            whole = ''
         lines = [line.strip() for line in (whole or '').splitlines() if line.strip()]
         if len(lines) == len(blocks):
             return lines
@@ -507,7 +536,10 @@ class ScreenshotManager:
             if token is not None and token.cancelled:
                 return ''
             try:
-                return self._translate_all(block.text, target_lang, force_refresh, token)
+                result = self._translate_all(
+                    block.text, target_lang, force_refresh, token)
+                # 失败标记贴到图上就是一行 "[翻译失败 …]"，用户会以为是译文
+                return '' if is_translation_failure(result) else result
             except Exception as e:
                 logger.warning(f"行块翻译失败: {e}")
                 return ''
@@ -592,6 +624,7 @@ class ScreenshotWidget(QWidget):
         self.screen_width = 0
         self.screen_height = 0
         self._grab_scale = 1.0
+        self._grab_scale_y = 1.0
         self._desktop_rect = QRect(0, 0, 0, 0)
         self._screen_rects = []
         self._cover_all_screens = False
@@ -610,7 +643,8 @@ class ScreenshotWidget(QWidget):
         self._result = None          # 最近一次成功的 payload
         self._result_rect = None     # 选区逻辑矩形（结果态绘制用）
         self._crop_pixmap = None     # 选区冻结背景，带 devicePixelRatio 供遮罩绘制
-        self._scale = 1.0            # 逻辑坐标 → 图像物理像素的倍率
+        self._scale = 1.0            # 逻辑坐标 → 图像物理像素的横向倍率
+        self._scale_y = 1.0          # 纵向倍率（DPI 缩放信息缺失时可与横向不同）
         self._blocks = []            # 逻辑坐标行块
         self._paragraphs = []        # [(屏幕矩形, [块下标]), ...]
         self._hover_paragraph = None  # 悬停命中的段落下标
@@ -634,10 +668,11 @@ class ScreenshotWidget(QWidget):
             # all_screens=True 不传 bbox 得到的就是整张虚拟桌面，与覆盖范围一致。
             self.full_screen = ImageGrab.grab(
                 all_screens=self._cover_all_screens)
-            # 高分屏下 ImageGrab 拿到的是物理像素，记下倍率供裁剪换算
+            # 高分屏下 ImageGrab 拿到的是物理像素，记下横纵倍率供裁剪换算
             if self.full_screen and self.screen_width:
                 self._grab_scale = self.full_screen.width / self.screen_width
                 scale_y = self.full_screen.height / max(1, self.screen_height)
+                self._grab_scale_y = scale_y
                 if abs(scale_y - self._grab_scale) > 0.02:
                     # 横纵倍率对不上：抓拍范围与遮罩范围不一致，裁剪框会整体偏移，
                     # 记下来便于排查（不中断截图）
@@ -743,7 +778,25 @@ class ScreenshotWidget(QWidget):
         绘制事件：柔和暗角 + 蓝色发光选区 + 角标记 + 尺寸气泡，
         结果态改为就地覆盖译文 + 工具条 + 气泡卡片
         """
-        painter = QPainter(self)
+        try:
+            painter = QPainter(self)
+        except Exception as e:
+            # 连画布都建不出来：留着空帧比抛出去好（异常会终止整个进程）
+            logger.error(f"遮罩创建画布失败: {e}")
+            return
+        if not painter.isActive():
+            logger.error("遮罩画布未能创建，本帧跳过绘制")
+            return
+        try:
+            self._paint(painter)
+        except Exception as e:
+            # paintEvent 里抛异常等于把进程带走（Qt 不接 Python 异常，也不打印栈）
+            logger.exception(f"遮罩绘制失败: {e}")
+        finally:
+            painter.end()
+
+    def _paint(self, painter):
+        """遮罩一帧的实际绘制内容（异常由 paintEvent 兜住）"""
         painter.setRenderHint(QPainter.Antialiasing, True)
 
         # 底层先铺冻结的整屏抓拍：遮罩必须是一张静止画面，否则背后自刷新的内容
@@ -756,11 +809,7 @@ class ScreenshotWidget(QWidget):
 
         if (self._loading or self._error or self._result is not None) \
                 and not self.is_selecting:
-            # 绘制期异常会让 Qt 直接终止进程（不会打印栈），这里兜住并留痕
-            try:
-                self._draw_result(painter)
-            except Exception as e:
-                logger.error(f"结果绘制失败: {e}")
+            self._draw_result(painter)
             return
 
         if not self.is_selecting:
@@ -805,8 +854,12 @@ class ScreenshotWidget(QWidget):
         """把冻结的整屏抓拍铺满遮罩（抓拍缺失时留空，退回透出实时桌面）"""
         if self._frozen_pixmap is None:
             return
-        # 位图带 devicePixelRatio，按逻辑坐标 1:1 贴回，不做重采样
-        painter.drawPixmap(0, 0, self._frozen_pixmap)
+        if abs(self._grab_scale_y - self._grab_scale) < 0.001:
+            # 位图带 devicePixelRatio，按逻辑坐标 1:1 贴回，不做重采样
+            painter.drawPixmap(0, 0, self._frozen_pixmap)
+        else:
+            # 横纵倍率不一致时 1:1 贴回会超出（或不足）遮罩高度，按遮罩缩放
+            painter.drawPixmap(self.rect(), self._frozen_pixmap)
 
     def _draw_frozen_region(self, painter, rect):
         """
@@ -925,7 +978,8 @@ class ScreenshotWidget(QWidget):
 
         threshold = self._snap_threshold
         new_rect = QRect(rect)
-        guides = []
+        x_guides = []
+        y_guides = []
 
         def _nearest(coord, lines):
             """返回阈值内最近的线位置，无则None"""
@@ -936,28 +990,38 @@ class ScreenshotWidget(QWidget):
                     best, best_d = line, d
             return best
 
-        # 左边
-        target = _nearest(rect.left(), xs)
-        if target is not None:
-            new_rect.moveLeft(target)
-            guides.append(('x', target))
-        # 右边（moveLeft 后以右边缘独立判断，避免两边同吸互相挤压）
-        target = _nearest(rect.right() + 1, xs)
-        if target is not None:
-            new_rect.moveRight(target - 1)
-            guides.append(('x2', target))
-        # 上边
-        target = _nearest(rect.top(), ys)
-        if target is not None:
-            new_rect.moveTop(target)
-            guides.append(('y', target))
-        # 下边
-        target = _nearest(rect.bottom() + 1, ys)
-        if target is not None:
-            new_rect.moveBottom(target - 1)
-            guides.append(('y2', target))
+        # 横向：左右一起吸再校验。窄选区两边可能吸到同一条线，塌成 0 宽的
+        # 选区还不如不吸（用户在拖拽中会看到选区凭空消失）
+        left_target = _nearest(rect.left(), xs)
+        right_target = _nearest(rect.right() + 1, xs)
+        candidate = QRect(rect)
+        if left_target is not None:
+            candidate.moveLeft(left_target)
+        if right_target is not None:
+            candidate.moveRight(right_target - 1)
+        if candidate.width() > 0:
+            new_rect = candidate
+            if left_target is not None:
+                x_guides.append(('x', left_target))
+            if right_target is not None:
+                x_guides.append(('x2', right_target))
 
-        return new_rect, guides
+        # 纵向同理
+        top_target = _nearest(rect.top(), ys)
+        bottom_target = _nearest(rect.bottom() + 1, ys)
+        candidate = QRect(new_rect)
+        if top_target is not None:
+            candidate.moveTop(top_target)
+        if bottom_target is not None:
+            candidate.moveBottom(bottom_target - 1)
+        if candidate.height() > 0:
+            new_rect = candidate
+            if top_target is not None:
+                y_guides.append(('y', top_target))
+            if bottom_target is not None:
+                y_guides.append(('y2', bottom_target))
+
+        return new_rect, x_guides + y_guides
 
     def _draw_size_bubble(self, painter, rect):
         """
@@ -1000,17 +1064,24 @@ class ScreenshotWidget(QWidget):
             payload (dict): 含 image/region/blocks/block_texts/original_text/
                 translated_text/languages/target_lang 的结果字典
         """
-        image = payload['image']
+        image = payload.get('image')
         region = QRect(payload['region'])
+        if image is None or region.width() <= 0 or region.height() <= 0:
+            # 没有底图就没法就地展示（取色、绘制范围都来自它）
+            self.show_failure(payload.get('error') or '选区图像不可用')
+            return
         scale = image.width / max(1, region.width())
+        scale_y = image.height / max(1, region.height())
 
         self._result = payload
         self._error = None
         self._loading = False
         self._result_rect = region
         self._scale = scale
+        self._scale_y = scale_y
         self._crop_pixmap = result_render.pil_to_qpixmap(image, dpr=scale)
-        self._blocks = result_render.to_logical_blocks(payload.get('blocks') or [], scale)
+        self._blocks = result_render.to_logical_blocks(
+            payload.get('blocks') or [], scale, scale_y)
         self._paragraphs = self._build_paragraphs()
         self._hover_paragraph = None
         self._pinned_paragraph = None
@@ -1092,7 +1163,12 @@ class ScreenshotWidget(QWidget):
         if rect is None:
             return
         if self._crop_pixmap is not None:
-            painter.drawPixmap(rect.topLeft(), self._crop_pixmap)
+            if abs(self._scale_y - self._scale) < 0.001:
+                # 横纵倍率一致：按逻辑尺寸 1:1 贴回，不做重采样
+                painter.drawPixmap(rect.topLeft(), self._crop_pixmap)
+            else:
+                # 横纵倍率不一致：贴回会拉变形或高度对不上，按目标矩形缩放
+                painter.drawPixmap(rect, self._crop_pixmap)
         else:
             # 结果未回投（加载/失败）时亮出选区原图：同一张冻结画面，避免透出实时桌面
             self._draw_frozen_region(painter, rect)
@@ -1116,7 +1192,8 @@ class ScreenshotWidget(QWidget):
             painter.setClipRect(rect)
             result_render.paint_blocks(
                 painter, payload.get('image'), self._blocks, texts,
-                rect.topLeft(), self._mode, scale=self._scale)
+                rect.topLeft(), self._mode, scale=self._scale,
+                scale_y=self._scale_y)
             painter.restore()
         self._draw_border(painter, rect)
 
@@ -1318,13 +1395,18 @@ class ScreenshotWidget(QWidget):
         复制当前文本到剪贴板
 
         剪贴板被其他程序占用时写入会静默失败，故走带生效校验的重试写入；
-        只有确认写入成功才记"已复制"，失败由 clipboard 模块记警告日志。
+        重试交给事件循环排（不在这Sleep），遮罩不会因为复制卡一下。
         """
         text = self._result_text()
         if not text:
             return
-        if clipboard.set_text(text):
-            logger.info("已复制翻译结果到剪贴板")
+
+        def done(ok):
+            """确认写入生效才记"已复制"，失败由 clipboard 模块记警告日志"""
+            if ok:
+                logger.info("已复制翻译结果到剪贴板")
+
+        clipboard.set_text_later(text, on_done=done)
 
     def _render_result_pixmap(self):
         """
@@ -1339,19 +1421,31 @@ class ScreenshotWidget(QWidget):
         image = payload['image']
         if image is None:
             return None
+        base = result_render.pil_to_qpixmap(image)
+        if base is None:
+            logger.error("结果图转换失败（PIL → QPixmap），放弃本次导出")
+            return None
+
         pixmap = QPixmap(image.width, image.height)
         pixmap.fill(Qt.transparent)
-
         painter = QPainter(pixmap)
-        painter.setRenderHint(QPainter.Antialiasing, True)
-        # 底图按需从 PIL 转换：常驻一份 1:1 QPixmap 等于把选区再存一遍
-        painter.drawPixmap(0, 0, result_render.pil_to_qpixmap(image))
-        texts = payload.get('block_texts') or []
-        if texts and self._mode != result_render.MODE_ORIGINAL:
-            result_render.paint_blocks(
-                painter, image, payload.get('blocks') or [], texts,
-                QPoint(0, 0), self._mode, scale=1.0)
-        painter.end()
+        if not painter.isActive():
+            logger.error("结果图画布创建失败，放弃本次导出")
+            return None
+        try:
+            painter.setRenderHint(QPainter.Antialiasing, True)
+            # 底图按需从 PIL 转换：常驻一份 1:1 QPixmap 等于把选区再存一遍
+            painter.drawPixmap(0, 0, base)
+            texts = payload.get('block_texts') or []
+            if texts and self._mode != result_render.MODE_ORIGINAL:
+                result_render.paint_blocks(
+                    painter, image, payload.get('blocks') or [], texts,
+                    QPoint(0, 0), self._mode, scale=1.0)
+        except Exception as e:
+            logger.exception(f"结果图合成失败: {e}")
+            return None
+        finally:
+            painter.end()
         return pixmap
 
     def _pin_result(self):
@@ -1501,10 +1595,24 @@ class ScreenshotWidget(QWidget):
             self._cancel_screenshot()
             return
 
-        # 全屏图是物理像素，选区是逻辑坐标，按缩放系数换算裁剪框
-        scale = self._grab_scale
-        box = (int(rect.left() * scale), int(rect.top() * scale),
-               int(rect.right() * scale), int(rect.bottom() * scale))
+        # 全屏图是物理像素，选区是逻辑坐标，按横纵缩放系数换算裁剪框。
+        # QRect 的 right()/bottom() 是闭区间（= left+width-1），PIL 的裁剪框
+        # 右/下沿是开区间：直接用 right()/bottom() 会少裁一像素，高分屏下
+        # 每边少掉的不止一像素，识别首尾字符就会被切掉
+        scale_x = self._grab_scale
+        scale_y = self._grab_scale_y
+        image_w, image_h = self.full_screen.size
+        box = (
+            max(0, min(image_w, int(round(rect.left() * scale_x)))),
+            max(0, min(image_h, int(round(rect.top() * scale_y)))),
+            max(0, min(image_w, int(round((rect.left() + rect.width()) * scale_x)))),
+            max(0, min(image_h, int(round((rect.top() + rect.height()) * scale_y)))),
+        )
+        if box[2] <= box[0] or box[3] <= box[1]:
+            # 缩放换算后落不到有效像素（例如选区贴在桌面最右/下沿之外）
+            logger.warning(f"选区换算到抓拍图后为空: {box}，取消截图")
+            self._cancel_screenshot()
+            return
         # crop 与原图共享像素缓冲，必须 copy 才能放下整屏图（1440p 约 11 MiB）
         screenshot = self.full_screen.crop(box).copy()
         self.full_screen = None
@@ -1518,6 +1626,7 @@ class ScreenshotWidget(QWidget):
         self._paragraphs = []
         self._result_rect = QRect(rect)
         self._scale = screenshot.width / max(1, rect.width())
+        self._scale_y = screenshot.height / max(1, rect.height())
         self._crop_pixmap = result_render.pil_to_qpixmap(screenshot, dpr=self._scale)
         self._loading = True
         self.region_selected.emit(screenshot, QRect(rect))

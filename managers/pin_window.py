@@ -117,7 +117,12 @@ class PinWindow(QWidget):
         elif event.matches(QKeySequence.Copy):
             # 注意用 QKeySequence.Copy：QKeyEvent 上没有 Copy 属性，
             # 写 event.Copy 会在任意按键时抛 AttributeError
-            if clipboard.set_pixmap(self._source):
-                logger.info("已复制钉住的图片到剪贴板")
+            def copied(ok):
+                """确认写入生效才记日志，占用失败由 clipboard 模块记警告"""
+                if ok:
+                    logger.info("已复制钉住的图片到剪贴板")
+
+            # 非阻塞重试：同步等待会在占用期间冻住钉图窗口
+            clipboard.set_pixmap_later(self._source, on_done=copied)
         else:
             super().keyPressEvent(event)
