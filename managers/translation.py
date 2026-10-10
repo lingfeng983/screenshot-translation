@@ -272,7 +272,9 @@ class TranslationManager(ProviderChainManager):
             for name in self._cache_names():
                 cached = cache_manager.get_cached_translation(
                     text, self._cache_key(name, lang))
-                if cached is not None:
+                if cached:
+                    # 空串不算命中：没有一种输入的正常译文是空的，而老版本
+                    # 确实把接口偶发的空结果缓存过，命中它只会次次显示空白
                     return cached
         except Exception as e:
             logger.warning(f"读取缓存失败: {e}")
@@ -357,12 +359,17 @@ class TranslationManager(ProviderChainManager):
                     return result, served
 
         # 2) 最后兜底：依次尝试免密钥的免费接口（Edge国内可直连，Google质量更好）
+        #    已经试过的引擎不再重复走：配置的降级API本身就可以填 edge_free，
+        #    只跟主API去重的话同一个引擎要在链上被跑两遍，时限白烧一半
+        tried = {provider_cls.name}
+        if self.fallback_api_type:
+            tried.add(self.fallback_api_type)
         for free_name in self._FREE_FALLBACKS:
             if not self._chain_open(deadline, cancel_event):
                 logger.warning("翻译链时限已用尽或被取消，跳过剩余兜底接口")
                 break
             free_cls = provider_registry.get(free_name)
-            if free_cls is None or free_cls is provider_cls:
+            if free_cls is None or free_name in tried:
                 continue
             logger.warning(f"所有配置API均失败，兜底尝试免费接口: {free_name}")
             result, served = self._translate_via(
@@ -372,6 +379,10 @@ class TranslationManager(ProviderChainManager):
             if served is not None:
                 return result, served
 
+        if not (result or '').strip():
+            # 走到这里每个引擎要么明确失败、要么只给出空串。空译文对用户来说
+            # 和失败没有区别，必须落成可重试的失败标记而不是让遮罩显示一片空
+            return f"{self._failure_prefix}] {text}", None
         return result, None
 
     def _translate_via(self, provider_cls, text, target_lang=None,
@@ -412,7 +423,14 @@ class TranslationManager(ProviderChainManager):
 
         result = self._run_provider(factory, call, failure_text, retry_handler,
                                     deadline=deadline, cancel_event=cancel_event)
-        return result, (provider_cls.name if not self._is_failure(result) else None)
+        if self._is_failure(result):
+            return result, None
+        if not (result or '').strip():
+            # 空串不是译文：接口偶发返回空结果时把它记成"这个引擎成功了"，
+            # 降级链就此止步，用户只看到一块空白而不是可重试的失败提示
+            logger.warning(f"provider {provider_cls.name} 返回空译文，继续降级")
+            return result, None
+        return result, provider_cls.name
 
     def test_translation(self, text="Hello, world!"):
         """

@@ -9,7 +9,7 @@ import requests
 from ..provider_common import (
     ProviderUnavailableError, describe_error, raise_for_status,
     wrap_request_error)
-from .base import TranslationProvider
+from .base import MICROSOFT_LANG_MAP, TranslationProvider
 
 
 class BingProvider(TranslationProvider):
@@ -41,7 +41,9 @@ class BingProvider(TranslationProvider):
             'Ocp-Apim-Subscription-Key': api_key,
             'Content-Type': 'application/json'
         }
-        params = {'api-version': '3.0', 'to': target}
+        # 必应/Azure 只认它自己的语种表：繁体中文送 zh-TW 会 400 Bad Request
+        params = {'api-version': '3.0',
+                  'to': MICROSOFT_LANG_MAP.get(target, target)}
 
         def translate_chunk(chunk):
             """翻译单个文本块"""

@@ -361,8 +361,11 @@ class BaseProvider:
             read = float(self.timeout)
         if deadline is not None:
             remaining = max(deadline - time.monotonic(), 0.0)
-            connect = min(connect, max(remaining, 0.1))
-            read = min(read, max(remaining, 0.1))
+            # requests 会把这两个数各自用满：连接等满 remaining 再读满
+            # remaining，一次请求就能把整条降级链拖到时限的两倍。连接失败
+            # 基本是网络/域名问题，先把它限到预算的一半，剩下的留给读取。
+            connect = min(connect, max(0.1, remaining * 0.5))
+            read = min(read, max(0.1, remaining))
         return connect, read
 
     def check_deadline(self):
@@ -433,37 +436,73 @@ class BaseProvider:
         return '\n'.join(cleaned)
 
     @staticmethod
-    def _chunk_text(text, max_length=4500):
+    def _chunk_text(text, max_length=4500, max_bytes=None):
         """
         按段落切分长文本，避免超出接口的单次请求上限
+
+        有些接口按字节限长而不是按字符限长（百度单条请求上限 6000 字节），
+        中文一个字在 UTF-8 里占 3 字节：只按 3000 字符切会整段请求被拒。
+        传 max_bytes 时字符数与字节数两条线都要满足。
 
         Args:
             text (str): 原始文本
             max_length (int): 单块最大字符数
+            max_bytes (int 或 None): 单块最大 UTF-8 字节数；None 表示不限字节
 
         Returns:
             list[str]: 文本块列表
         """
         text = text.strip()
-        if len(text) <= max_length:
+        if BaseProvider._fits(text, max_length, max_bytes):
             return [text]
 
         chunks, current = [], ''
         # 优先按段落切，段落太长再按句子切
         for para in text.split('\n'):
             candidate = f"{current}\n{para}" if current else para
-            if len(candidate) <= max_length:
+            if BaseProvider._fits(candidate, max_length, max_bytes):
                 current = candidate
                 continue
             if current:
                 chunks.append(current)
-            while len(para) > max_length:
-                chunks.append(para[:max_length])
-                para = para[max_length:]
+            while para and not BaseProvider._fits(para, max_length, max_bytes):
+                head, para = BaseProvider._split_prefix(para, max_length, max_bytes)
+                chunks.append(head)
             current = para
         if current:
             chunks.append(current)
         return chunks
+
+    @staticmethod
+    def _fits(text, max_length, max_bytes):
+        """单块是否同时满足字符数与字节数上限"""
+        if len(text) > max_length:
+            return False
+        return max_bytes is None or len(text.encode('utf-8')) <= max_bytes
+
+    @staticmethod
+    def _split_prefix(text, max_length, max_bytes):
+        """
+        切出不超过字符/字节上限的最长前缀
+
+        逐字符回退而不是按字节位置硬切：多字节字符被从中间切断之后，
+        那一段在下一个请求里就成乱码了。
+
+        Args:
+            text (str): 待切文本
+            max_length (int): 字符上限
+            max_bytes (int 或 None): UTF-8 字节上限
+
+        Returns:
+            tuple[str, str]: (前缀, 剩余部分)
+        """
+        head = text[:max_length]
+        while head and max_bytes is not None and len(head.encode('utf-8')) > max_bytes:
+            head = head[:-1]
+        if not head:
+            # 上限小到一个字符都装不下时仍要保证有进展，否则分块循环不会结束
+            head = text[:1]
+        return head, text[len(head):]
 
 
 class ProviderChainManager:

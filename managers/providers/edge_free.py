@@ -12,16 +12,15 @@ Edge 免费翻译提供者（微软翻译，国内可直连，无需API密钥）
 
 import requests
 
-from ..provider_common import ProviderUnavailableError, raise_for_status, wrap_request_error
-from .base import TranslationProvider
+from ..provider_common import (
+    ProviderUnavailableError, describe_error, raise_for_status,
+    wrap_request_error)
+from .base import MICROSOFT_LANG_MAP, TranslationProvider
 
 ENDPOINT = 'https://edge.microsoft.com/translate/translatetext'
 
 # 通用语言代码 -> 微软语言代码（微软用 zh-Hans/zh-Hant 表示简繁体中文）
-_TARGET_MAP = {
-    'zh': 'zh-Hans',
-    'zh-TW': 'zh-Hant',
-}
+_TARGET_MAP = MICROSOFT_LANG_MAP
 
 
 class EdgeFreeProvider(TranslationProvider):
@@ -70,19 +69,32 @@ class EdgeFreeProvider(TranslationProvider):
 
         raise_for_status(response, 'Edge免费翻译')
 
-        data = response.json()
+        data = self._parse_json(response)
         translated = self._extract_text(data)
         if not translated:
             raise ProviderUnavailableError(f"Edge翻译返回空结果: {str(data)[:200]}")
         return translated
 
     @staticmethod
+    def _parse_json(response):
+        """解析响应JSON：非JSON（如网关返回HTML）按可重试处理，而不是抛裸 ValueError"""
+        try:
+            return response.json()
+        except ValueError as e:
+            raise ProviderUnavailableError(
+                f"Edge翻译响应不是合法JSON: {describe_error(response.text, limit=120)}"
+            ) from e
+
+    @staticmethod
     def _extract_text(data):
         """从响应中提取译文：[{"translations": [{"text": "..."}]}]"""
         if not isinstance(data, list) or not data:
             return ''
-        translations = data[0].get('translations') or []
-        if not translations:
+        first = data[0]
+        if not isinstance(first, dict):
+            return ''
+        translations = first.get('translations') or []
+        if not translations or not isinstance(translations[0], dict):
             return ''
         return translations[0].get('text', '')
 

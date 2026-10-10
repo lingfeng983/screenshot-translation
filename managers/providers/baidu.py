@@ -24,11 +24,16 @@ class BaiduProvider(TranslationProvider):
         ('baidu_api_key', 'API密钥', True),
     )
 
-    # 百度目标语言代码映射
-    _target_map = {'zh-TW': 'cht'}
-    # 只有这几个码是瞬时的（并发超限、服务升级/不可用），重试有意义；
-    # 其余（签名错、appid 无效、额度用尽、语种不支持）重试必然重犯
-    _transient_codes = ('54005', '54008', '58000', '58001', '58002')
+    # 百度目标语言代码映射：界面上用通用 ISO 码，百度另有自己的一套
+    # （缺了这些映射时选日语/韩语/法语会直接吃 58001「译文语言方向不支持」）
+    _target_map = {'zh-TW': 'cht', 'ja': 'jp', 'ko': 'kor', 'fr': 'fra'}
+    # 百度单条请求的 UTF-8 字节上限是 6000，留出余量按 5000 切
+    _MAX_BYTES = 5000
+    # 官方只对这几个码给了"重试"的处置：52001 请求超时、52002 系统错误、
+    # 54003 访问频率受限、54005 长 query 请求频繁（建议 3s 后再试）。
+    # 其余都是确定性错误——52003 未授权用户、54001 签名错误、54004 余额不足、
+    # 58000 客户端IP非法、58001 语种不支持、58002 服务已关闭，重试必然重犯。
+    _transient_codes = ('52001', '52002', '54003', '54005')
 
     def translate(self, text, source='auto', target='zh'):
         """
@@ -85,7 +90,9 @@ class BaiduProvider(TranslationProvider):
                 raise ProviderUnavailableError(f"百度翻译返回空结果: {str(result)[:200]}")
             return chunk_result
 
-        return self._translate_chunks(text, translate_chunk, max_length=3000)
+        # 百度按 UTF-8 字节限长：中文一字 3 字节，只按 3000 字符切会被判超长
+        return self._translate_chunks(text, translate_chunk,
+                                      max_length=3000, max_bytes=self._MAX_BYTES)
 
     @staticmethod
     def _parse_json(response):

@@ -23,6 +23,13 @@ TARGET_LANGUAGES = [
     ('ru', '俄语'),
 ]
 
+# 微软系接口（Edge 免费端点与必应/Azure Translator）的语言代码：
+# 繁体中文必须写 zh-Hant，直接送 zh-TW 会被当成不支持的语种
+MICROSOFT_LANG_MAP = {
+    'zh': 'zh-Hans',
+    'zh-TW': 'zh-Hant',
+}
+
 
 class TranslationProvider(BaseProvider):
     """
@@ -57,7 +64,8 @@ class TranslationProvider(BaseProvider):
         """清理OCR常见噪声（兼容旧调用名，内部实现同 clean_text）"""
         return BaseProvider.clean_text(text)
 
-    def _translate_chunks(self, text, translate_chunk, max_length=4500):
+    def _translate_chunks(self, text, translate_chunk, max_length=4500,
+                          max_bytes=None):
         """
         通用分块翻译模板：切分长文本、逐块调用、按行拼接
 
@@ -68,12 +76,14 @@ class TranslationProvider(BaseProvider):
             text (str): 原始文本
             translate_chunk: 接收单块文本的翻译函数
             max_length (int): 单块最大字符数
+            max_bytes (int 或 None): 单块最大 UTF-8 字节数（按字节限长的接口用）
 
         Returns:
             str: 各块译文拼接结果
         """
         results = []
-        for chunk in self._chunk_text(text, max_length=max_length):
+        for chunk in self._chunk_text(text, max_length=max_length,
+                                      max_bytes=max_bytes):
             self.check_deadline()
             results.append(translate_chunk(chunk))
         return '\n'.join(results)

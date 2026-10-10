@@ -12,7 +12,8 @@ import logging
 import requests
 
 from ..provider_common import (
-    ProviderUnavailableError, raise_for_status, wrap_request_error)
+    ProviderUnavailableError, describe_error, raise_for_status,
+    wrap_request_error)
 from .base import TranslationProvider
 
 logger = logging.getLogger('screenshot-translation')
@@ -60,7 +61,8 @@ class GoogleFreeProvider(TranslationProvider):
                 raise wrap_request_error(e, 'Google免费翻译') from e
 
             raise_for_status(response, 'Google免费翻译')
-            data = response.json()
+            # dj=1 时响应必定是对象；结构对不上就按空结果降级
+            data = self._parse_json(response)
 
             sentences = data.get('sentences') or []
             translated = ''.join(s.get('trans', '') for s in sentences)
@@ -74,6 +76,21 @@ class GoogleFreeProvider(TranslationProvider):
             return translated
 
         return self._translate_chunks(text, translate_chunk)
+
+    @staticmethod
+    def _parse_json(response):
+        """解析响应JSON：非JSON（如网关返回HTML）按可重试处理，而不是抛裸 ValueError"""
+        try:
+            data = response.json()
+        except ValueError as e:
+            raise ProviderUnavailableError(
+                f"Google免费翻译响应不是合法JSON: "
+                f"{describe_error(response.text, limit=120)}"
+            ) from e
+        if not isinstance(data, dict):
+            raise ProviderUnavailableError(
+                f"Google免费翻译返回结构异常: {str(data)[:200]}")
+        return data
 
 
 def register(registry):
