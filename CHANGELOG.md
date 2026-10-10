@@ -2,7 +2,7 @@
 
 所有显著改动记录于此。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
-## [Unreleased]
+## [v1.4.0] — 2026-10-11
 
 ### 新增
 - **同一时间只允许一个实例**：`managers/single_instance.py` 用命名互斥体
