@@ -2,7 +2,7 @@
 
 所有显著改动记录于此。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
-## [Unreleased]
+## [v1.5.0] — 2026-10-11
 
 ### 修复
 - **译文模式用错了字号**：`painter.setFont(font)` 原先只写在双语分支里（画完原文行
