@@ -2,6 +2,18 @@
 
 所有显著改动记录于此。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [Unreleased]
+
+### 变更
+- **发布渠道从 Gitee 切换到 GitHub**：主仓库改为
+  `github.com/lingfeng983/screenshot-translation`（origin），Gitee 降级为镜像远程
+  （`git push gitee` 存档，不影响发版）。发版脚本 `scripts/publish_release.py`
+  改调 GitHub API（令牌取 `GITHUB_TOKEN` 环境变量，否则从 git credential
+  manager 读 Windows 凭证管理器里 github.com 的凭证，不再依赖 `.gitee_token`
+  文件）；安装包内 OCR 组件的内置下载地址与源码端 `scripts/setup_ocr.py` 的
+  下载源同步指向 GitHub Release，`setup_ocr.py` 不带参数时经 `latest/download`
+  取最新版附件
+
 ## [v1.5.0] — 2026-10-11
 
 ### 修复

@@ -5,7 +5,7 @@
 ## 🚀 快速开始
 
 ### 方式一：安装程序（推荐普通用户）
-从 [Releases](https://gitee.com/lingfeng983/screenshot-translation/releases) 下载
+从 [Releases](https://github.com/lingfeng983/screenshot-translation/releases) 下载
 `ScreenshotTranslator-Setup.exe`（约 30MB），双击安装：
 
 1. 安装时会问你是否**下载 OCR 离线识别组件**（默认勾选，约 85MB，从同一 Release 的
@@ -22,7 +22,7 @@
 #### 首次安装
 ```bash
 # 1. 克隆仓库
-git clone https://gitee.com/lingfeng983/screenshot-translation.git
+git clone https://github.com/lingfeng983/screenshot-translation.git
 cd screenshot-translation
 
 # 2. 安装依赖
@@ -32,16 +32,16 @@ pip install -r requirements.txt
 copy config.example.ini config.ini
 
 # 4. 下载 OCR 组件（Tesseract 运行最小集，约85MB，不入仓库，走 Release 附件）
-python scripts/setup_ocr.py --release v1.3.0
+python scripts/setup_ocr.py               # 默认取最新 Release；固定版本用 --release v1.5.0
 
 # 5. 启动
 python main.py
 ```
 
 > **OCR 组件分发方式**：仓库只保留源码；Tesseract 运行最小集（约 85MB）以
-> `ocr-components.zip.00N` 附件形式发布在 Gitee [Releases](https://gitee.com/lingfeng983/screenshot-translation/releases)。
-> 源码端 `scripts/setup_ocr.py --release <标签>` 下载、SHA256 校验并解压到 `resources/`——
-> Gitee 没有 `latest/download` 这种地址，标签必须写全；
+> `ocr-components.zip.00N` 附件形式发布在 GitHub [Releases](https://github.com/lingfeng983/screenshot-translation/releases)。
+> 源码端 `python scripts/setup_ocr.py` 下载、SHA256 校验并解压到 `resources/`——
+> 不带参数取最新 Release（`latest/download` 跳转），需要固定版本给 `--release <标签>`；
 > 离线环境可用 `python scripts/setup_ocr.py --local <分卷目录>`。
 > 安装程序走的是同一批附件，由 Setup 自己下载校验并解压到用户数据目录，
 > 全程不起外部进程（所以不会弹控制台窗口）。
@@ -303,7 +303,7 @@ ScreenshotTranslation/
 $env:ST_VERSION = "1.3.0"      # cmd: set ST_VERSION=1.3.0
 python -m PyInstaller screenshot-translator.spec --noconfirm
 
-# 2. 出 OCR 组件附件（安装时要从 Gitee Release 拉它）
+# 2. 出 OCR 组件附件（安装时要从 GitHub Release 拉它）
 python scripts/collect_ocr_bundle.py      # → dist/ocr-bundle（约225MB）
 python scripts/make_release_package.py    # → dist/release/ocr-components.zip.001 + .sha256（约85MB）
                                           #   同时写 ocr-artifact.iss：安装脚本编译期要的
@@ -319,7 +319,7 @@ iscc.exe /DMyAppVersion=1.3.0 /DMyAppOcrTag=v1.3.0 scripts\setup.iss
 > 上面三步 `python scripts/publish_release.py --version 1.3.0` 一条命令串完，
 > 顺带提交、打 tag、发 Release。编译安装脚本需要 Inno Setup 7（内置下载是 7 的能力）。
 
-Tesseract **不再打进 exe**：安装程序在装填阶段由 Setup 自己从 Gitee Release 附件下载
+Tesseract **不再打进 exe**：安装程序在装填阶段由 Setup 自己从 GitHub Release 附件下载
 `ocr-components.zip.001`，SHA256 由 Setup 校验、解压到
 `%USERPROFILE%\.screenshot-translation\resources\`，进度就在向导里，不起外部进程所以
 不会弹控制台窗口。同一标签已装过则跳过下载（靠 `ocr-version.txt` 标记）。

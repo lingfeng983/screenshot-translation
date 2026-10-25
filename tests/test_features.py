@@ -3147,7 +3147,7 @@ def test_stale_attachment_delete_failure_is_fatal():
                 f.write(b'pkg')
 
             def http_error(code):
-                return HTTPError('https://gitee.com', code, 'err', {},
+                return HTTPError('https://github.com', code, 'err', {},
                                  io.BytesIO(b'{"message":"boom"}'))
 
             def make_api(delete_code):
@@ -3156,7 +3156,7 @@ def test_stale_attachment_delete_failure_is_fatal():
                         if delete_code:
                             raise http_error(delete_code)
                         return {}
-                    if data is None and method is None and url.endswith('attach_files'):
+                    if data is None and method is None and url.endswith('/assets'):
                         return [{'id': 7, 'name': 'ScreenshotTranslator-Setup.exe'}]
                     return {'name': 'ScreenshotTranslator-Setup.exe',
                             'size': 3, 'browser_download_url': 'https://x/y'}

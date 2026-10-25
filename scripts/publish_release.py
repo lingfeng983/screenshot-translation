@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-一条命令出包 + 发版到 Gitee
+一条命令出包 + 发版到 GitHub
 
 流程：
     1. pytest 全量测试（--skip-tests 可跳过）
@@ -10,9 +10,9 @@
        release/ScreenshotTranslator-Setup.exe；再抽 OCR 最小集切成
        dist/release/ocr-components.zip.00N，作为安装包安装时要下载的 Release 附件
     4. CHANGELOG 的 [Unreleased] 段落就地改名为 [v版本] — 日期
-    5. git commit + tag + push（含 tag）
-    6. Gitee API 创建/更新 Release（取 [v版本] 段作为说明），并把安装包与
-       OCR 组件分卷作为附件上传（releases/{id}/attach_files，multipart）：
+    5. git commit + tag + push（含 tag；origin 推 GitHub，gitee 远程存在则镜像）
+    6. GitHub API 创建/更新 Release（取 [v版本] 段作为说明），并把安装包与
+       OCR 组件分卷作为附件上传（uploads.github.com，二进制 body）：
        同名旧附件要等新附件传成功才删，所以整条命令可以重复执行。
        origin 与发布目标仓库不一致时在第 1 步之前就中止。
        Setup.exe 与 ocr-components 分卷必须落在同一个 tag 下——安装包按
@@ -24,7 +24,8 @@
     python scripts/publish_release.py --version 1.2.0 --only-release   # 只更新发行版+重传附件
     python scripts/publish_release.py --version 1.2.0 --no-api   # 只推送，Release 手动建
 
-令牌：环境变量 GITEE_ACCESS_TOKEN，或项目根 .gitee_token 文件（已 gitignore）
+令牌：环境变量 GITHUB_TOKEN（PAT），否则从 git credential manager 取
+   github.com 的凭证（Windows 凭证管理器；git credential fill）。
 """
 
 import argparse
@@ -39,8 +40,9 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-GITEE_REPO = "lingfeng983/screenshot-translation"
-GITEE_API = "https://gitee.com/api/v5"
+GITHUB_REPO = "lingfeng983/screenshot-translation"
+GITHUB_API = "https://api.github.com"
+GITHUB_UPLOAD = "https://uploads.github.com"
 
 ISCC_CANDIDATES = [
     # 安装脚本用了 Inno 7 的内置下载（download 标志 + ExternalSize + Hash +
@@ -120,7 +122,7 @@ def step_assemble(version):
         # Setup 内置下载只取单个附件，多卷得回到老的合并路线，不能默默出一个
         # 勾了 OCR 就必然中止的安装包
         sys.exit(f"OCR 组件被切成了 {len(parts)} 卷：安装包只会下载第一卷，识别必然失败。"
-                 f"用 --part-size 放宽到单卷（Gitee 单附件上限 100MB），"
+                 f"用 --part-size 放宽到单卷（GitHub 单附件上限 2GB），"
                  f"或临时用 python scripts/setup_ocr.py --release v{version} 补装组件")
 
     iscc = next((p for p in ISCC_CANDIDATES if os.path.isfile(p)), None)
@@ -179,15 +181,15 @@ def check_origin():
     """
     确认 origin 就是发布目标仓库
 
-    脚本会直接在 GITEE_REPO 上建 Release、传附件、推 tag：在 fork 里跑这条
+    脚本会直接在 GITHUB_REPO 上建 Release、传附件、推 tag：在 fork 里跑这条
     命令，版本会发到上游去，而附件对应的源码提交在 origin 上根本不存在。
     """
     url = git_output(["git", "remote", "get-url", "origin"])
-    m = re.search(r"gitee\.com[:/](.+?)(?:\.git)?/?$", url)
+    m = re.search(r"github\.com[:/](.+?)(?:\.git)?/?$", url)
     if not m:
-        sys.exit(f"origin 不是一个 Gitee 仓库，无法发版：{url or '(未配置 origin)'}")
-    if m.group(1).lower() != GITEE_REPO.lower():
-        sys.exit(f"origin 是 {m.group(1)}，与发布目标 {GITEE_REPO} 不一致")
+        sys.exit(f"origin 不是一个 GitHub 仓库，无法发版：{url or '(未配置 origin)'}")
+    if m.group(1).lower() != GITHUB_REPO.lower():
+        sys.exit(f"origin 是 {m.group(1)}，与发布目标 {GITHUB_REPO} 不一致")
 
 
 def step_git(version, notes_title):
@@ -218,41 +220,59 @@ def step_git(version, notes_title):
     branch = current_branch()
     run(["git", "push", "origin", branch])
     run(["git", "push", "origin", tag])
+    # gitee 远程存在时镜像推送（老渠道存档；推送失败不拦 GitHub 发版）
+    if "gitee" in git_output(["git", "remote"]).split():
+        run(["git", "push", "gitee", branch], check=False)
+        run(["git", "push", "gitee", tag], check=False)
+        print("已镜像推送到 gitee 远程")
 
 
 def read_token():
-    token = os.environ.get("GITEE_ACCESS_TOKEN", "").strip()
+    """GitHub 令牌：GITHUB_TOKEN 环境变量优先，否则从 credential manager 取"""
+    token = os.environ.get("GITHUB_TOKEN", "").strip()
     if token:
         return token
-    path = os.path.join(PROJECT_ROOT, ".gitee_token")
-    if os.path.isfile(path):
-        with open(path, encoding="utf-8") as f:
-            return f.read().strip()
+    # git credential fill 走已配置的 helper（Windows 上即凭证管理器）；
+    # 回显会把令牌带进子进程管道，这里只取 password= 行且不打印
+    try:
+        proc = subprocess.run(
+            ["git", "credential", "fill"],
+            input="protocol=https\nhost=github.com\n\n",
+            capture_output=True, text=True, timeout=15,
+        )
+        if proc.returncode == 0:
+            for line in proc.stdout.splitlines():
+                if line.startswith("password="):
+                    return line[len("password="):].strip()
+    except (OSError, subprocess.TimeoutExpired):
+        pass
     return ""
 
 
 def api_request(url, token, data=None, content_type=None, method=None):
-    """Gitee v5 调用：表单参数走 urlencode，附件走 multipart，返回 JSON
+    """GitHub REST 调用：JSON 走请求体，附件走原始二进制，返回 JSON
 
-    令牌只走请求头（表单/分卷请求体里那份是接口要求的字段）：URL 查询串
-    会被代理和访问日志原样落盘，等于把私人令牌写到别人机器上。
+    令牌只放 Authorization 头：URL 查询串会被代理和访问日志原样落盘，
+    等于把私人令牌写到别人机器上。
     """
     import json
-    from urllib.parse import urlencode
     from urllib.request import Request, urlopen
-    body = None
-    if isinstance(data, dict):
-        body = urlencode(dict(data, access_token=token)).encode("utf-8")
-        content_type = "application/x-www-form-urlencoded"
+    if isinstance(data, (dict, list)):
+        import json as _json
+        body = _json.dumps(data).encode("utf-8")
+        content_type = "application/json"
     elif isinstance(data, (bytes, bytearray)):
-        # 附件上传的 multipart 报文由调用方拼好，原样发出
+        # 附件上传的二进制报文由调用方原样发出
         body = bytes(data)
     elif data is not None:
-        body = json.dumps(data).encode("utf-8")
-        content_type = "application/json"
+        body = str(data).encode("utf-8")
+    else:
+        body = None
     req = Request(url, data=body, method=method)
-    if token:
-        req.add_header("Authorization", f"Bearer {token}")
+    req.add_header("Authorization", f"Bearer {token}")
+    req.add_header("Accept", "application/vnd.github+json")
+    req.add_header("User-Agent", "publish-release/1.0")
+    req.add_header("X-GitHub-Api-Version", "2022-11-28")
     if content_type:
         req.add_header("Content-Type", content_type)
     with urlopen(req) as resp:
@@ -261,9 +281,14 @@ def api_request(url, token, data=None, content_type=None, method=None):
 
 
 def error_detail(exc):
-    """HTTP 错误体里的说明（Gitee 把原因放在 body，不在状态码里）"""
+    """HTTP 错误体里的说明（GitHub 把原因放在 body 的 message 字段）"""
     try:
-        return exc.read().decode("utf-8", "replace")[:300]
+        import json
+        payload = exc.read().decode("utf-8", "replace")[:300]
+        try:
+            return json.loads(payload).get("message", payload)
+        except ValueError:
+            return payload
     except Exception:
         return str(exc)
 
@@ -275,9 +300,8 @@ def get_release(tag, token):
     早先所有异常都吞成 None，令牌失效也会走到"创建"分支，
     最后报一个看不出根因的错。
     """
-    url = f"{GITEE_API}/repos/{GITEE_REPO}/releases/tags/{quote(tag)}"
+    url = f"{GITHUB_API}/repos/{GITHUB_REPO}/releases/tags/{quote(tag)}"
     try:
-        # 标签不存在时 Gitee 返回 200 + body "null"，不是 404，json.loads 出来是 None
         d = api_request(url, token) or {}
     except HTTPError as e:
         if e.code == 404:
@@ -293,33 +317,23 @@ def upload_attachment(rid, path, token):
     先删后传的话，上传一失败这个附件就没了，装填端只能报"附件不存在"；
     先传后删最坏是同时留两份，重复执行即收敛。
     """
-    import uuid
     name = os.path.basename(path)
-    url_base = f"{GITEE_API}/repos/{GITEE_REPO}/releases/{rid}/attach_files"
+    url_base = f"{GITHUB_API}/repos/{GITHUB_REPO}/releases/{rid}/assets"
     try:
         listed = api_request(url_base, token) or []
-        stale = [att["id"] for att in listed if att.get("name") == name]
+        stale = [a["id"] for a in listed if a.get("name") == name]
     except HTTPError as e:
-        # 上传的令牌在请求体里、列举的令牌在请求头里，两者认证方式不同：
-        # 列不出来就当没有旧附件，别把已经传得动的包堵死
+        # 列不出已有附件不拦上传：别把已经传得动的包堵死
         print(f"  ⚠ 列不出已有附件（HTTP {e.code}），跳过同名旧附件清理")
         stale = []
 
-    def part(field, value, filename=None):
-        line = f'Content-Disposition: form-data; name="{field}"'
-        if filename:
-            line += f'; filename="{filename}"'
-        raw = value if isinstance(value, bytes) else value.encode("utf-8")
-        return (f"--{bid}\r\n{line}\r\nContent-Type: application/octet-stream\r\n\r\n"
-                ).encode("utf-8") + raw + b"\r\n"
-
-    bid = uuid.uuid4().hex
     with open(path, "rb") as f:
-        payload = (part("access_token", token) + part("release_id", str(rid))
-                   + part("file", f.read(), name) + f"--{bid}--\r\n".encode())
-    resp = api_request(url_base, token, data=payload,
-                       content_type=f"multipart/form-data; boundary={bid}")
-    print(f"  已上传 {resp['name']}（{resp['size'] / 1048576:.1f} MB）")
+        payload = f.read()
+    upload_url = (f"{GITHUB_UPLOAD}/repos/{GITHUB_REPO}/releases/{rid}/assets"
+                  f"?name={quote(name)}")
+    resp = api_request(upload_url, token, data=payload,
+                       content_type="application/octet-stream")
+    print(f"  已上传 {resp['name']}（{resp.get('size', 0) / 1048576:.1f} MB）")
     print(f"  {resp['browser_download_url']}")
     undeleted = []
     for att_id in stale:
@@ -357,12 +371,12 @@ def collect_attachments():
 
 
 def step_release(version, notes, token, no_api):
-    print("\n=== 6/6 Gitee Release ===")
+    print("\n=== 6/6 GitHub Release ===")
     tag = f"v{version}"
     if no_api or not token:
         if not no_api:
-            print("⚠ 未找到 GITEE_ACCESS_TOKEN（环境变量或 .gitee_token 文件），转手动模式")
-        url = f"https://gitee.com/{GITEE_REPO}/releases/new?tag={tag}&title={tag}"
+            print("⚠ 未取到 GitHub 令牌（GITHUB_TOKEN 或 git credential manager），转手动模式")
+        url = f"https://github.com/{GITHUB_REPO}/releases/new?tag={tag}&title={tag}"
         notes_path = os.path.join(PROJECT_ROOT, f"release-notes-{tag}.md")
         with open(notes_path, "w", encoding="utf-8") as f:
             f.write(notes + "\n")
@@ -373,17 +387,14 @@ def step_release(version, notes, token, no_api):
     branch = current_branch()
     rel = get_release(tag, token)
     if rel is None:
-        # Gitee 建发行版必填的是 name（传 title 会 400 "name is missing"）
-        rel = api_request(f"{GITEE_API}/repos/{GITEE_REPO}/releases", token, {
+        rel = api_request(f"{GITHUB_API}/repos/{GITHUB_REPO}/releases", token, {
             "tag_name": tag, "name": tag, "body": notes,
-            "target_commitish": branch,
+            "target_commitish": branch, "draft": False, "prerelease": False,
         })
         print(f"Release 已创建 id={rel.get('id')}")
     else:
-        # 更新时 Gitee 要求 tag_name 与 body 一起重传
-        api_request(f"{GITEE_API}/repos/{GITEE_REPO}/releases/{rel['id']}", token, {
+        api_request(f"{GITHUB_API}/repos/{GITHUB_REPO}/releases/{rel['id']}", token, {
             "tag_name": tag, "name": tag, "body": notes,
-            "target_commitish": branch,
         }, method="PATCH")
         print(f"Release 已更新 id={rel.get('id')}")
 
@@ -391,7 +402,7 @@ def step_release(version, notes, token, no_api):
     print("上传附件：")
     for path in collect_attachments():
         upload_attachment(rid, path, token)
-    print(f"页面: https://gitee.com/{GITEE_REPO}/releases/tag/{tag}")
+    print(f"页面: https://github.com/{GITHUB_REPO}/releases/tag/{tag}")
 
 
 def run_release_step(version, notes, token, no_api):
@@ -405,17 +416,17 @@ def run_release_step(version, notes, token, no_api):
     except HTTPError as e:
         sys.exit(f"发版失败（HTTP {e.code}）：{error_detail(e)}")
     except URLError as e:
-        sys.exit(f"发版失败（连不上 Gitee）：{e.reason}")
+        sys.exit(f"发版失败（连不上 GitHub）：{e.reason}")
     except RuntimeError as e:
         sys.exit(f"发版失败：{e}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="一条命令出包+发版到 Gitee")
+    parser = argparse.ArgumentParser(description="一条命令出包+发版到 GitHub")
     parser.add_argument("--version", required=True, help="版本号，如 1.2.0（tag 自动加 v 前缀）")
     parser.add_argument("--skip-tests", action="store_true")
     parser.add_argument("--no-build", action="store_true", help="复用现有 dist/ 产物")
-    parser.add_argument("--no-api", action="store_true", help="不调 Gitee API，仅推送并打开手动发布页")
+    parser.add_argument("--no-api", action="store_true", help="不调 GitHub API，仅推送并打开手动发布页")
     parser.add_argument("--only-release", action="store_true",
                         help="只做第 6 步：按 CHANGELOG 现有 [v版本] 段更新发行版并重传附件")
     args = parser.parse_args()

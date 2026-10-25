@@ -156,7 +156,7 @@ def ocr_resources_dir() -> str:
     """
     OCR 组件（Tesseract 便携包 + tessdata）所在目录
 
-    打包态由安装程序在装填阶段从 Gitee Release 下载解压到这里
+    打包态由安装程序在装填阶段从 GitHub Release 下载解压到这里
     （~/.screenshot-translation/resources/）：225 MiB 的引擎不塞进 exe，
     安装包只装程序本体，可写目录里的组件也不会在覆盖升级时被删掉。
     源码态即项目 resources/。

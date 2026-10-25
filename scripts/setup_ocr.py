@@ -3,15 +3,17 @@
 """
 下载并恢复 OCR 组件（Tesseract 便携包 + tessdata 语言数据）
 
-从本仓库 Gitee Release 附件下载分卷 zip，合并校验后解压到项目 resources/。
+从本仓库 GitHub Release 附件下载分卷 zip，合并校验后解压到项目 resources/。
 大文件不入 git 仓库，克隆后运行本脚本一次即可让源码态跑离线识别。
 打包安装态不走这里：安装包（scripts/setup.iss）由 Setup 自己从同一批附件下载
 并解压到 ~/.screenshot-translation/resources/。本脚本是给源码态/手工补装用的。
 
-Gitee 没有 GitHub 那种 latest/download 地址，必须给明确标签。
+GitHub 提供 latest/download 跳转地址，默认取最新 Release；需要固定版本时给
+--release v标签。
 
 用法：
-    python scripts/setup_ocr.py --release v1.3.0
+    python scripts/setup_ocr.py                 # 取最新 Release 的附件
+    python scripts/setup_ocr.py --release v1.5.0
     python scripts/setup_ocr.py --local dist/release   # 用本地已打包的文件恢复（离线）
 """
 
@@ -25,7 +27,7 @@ import tempfile
 import zipfile
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-REPO_URL = 'https://gitee.com/lingfeng983/screenshot-translation.git'
+REPO_URL = 'https://github.com/lingfeng983/screenshot-translation.git'
 DEFAULT_LABEL = 'ocr-components'
 
 # 分卷数上限，防止探测循环失控
@@ -133,9 +135,12 @@ def restore_from_local(source_dir, label):
 
 
 def restore_from_release(release_tag, label):
-    """从 Gitee Release 附件恢复"""
-    base = f"{repo_base(REPO_URL)}/releases/download/{release_tag}"
-    print(f"从 Release {release_tag} 下载: {base}")
+    """从 GitHub Release 附件恢复（release_tag 为 None 时取 latest 跳转地址）"""
+    if release_tag:
+        base = f"{repo_base(REPO_URL)}/releases/download/{release_tag}"
+    else:
+        base = f"{repo_base(REPO_URL)}/releases/latest/download"
+    print(f"从 Release {'latest' if not release_tag else release_tag} 下载: {base}")
 
     tmp_dir = tempfile.mkdtemp(prefix='ocr-setup-')
     try:
@@ -221,7 +226,7 @@ def _merge_and_extract(parts):
 def main():
     parser = argparse.ArgumentParser(description="下载/恢复 OCR 组件")
     parser.add_argument('--release', default=None,
-                        help='Release 标签，如 v1.3.0（Gitee 没有 latest 下载地址）')
+                        help='Release 标签，如 v1.5.0（不给则取 latest 最新版）')
     parser.add_argument('--label', default=DEFAULT_LABEL,
                         help=f'附件包名前缀（默认 {DEFAULT_LABEL}）')
     parser.add_argument('--local', default=None,
@@ -230,11 +235,9 @@ def main():
 
     if args.local:
         ok = restore_from_local(args.local, args.label)
-    elif args.release:
-        ok = restore_from_release(args.release, args.label)
     else:
-        parser.error('要么给 --release <标签>（如 v1.3.0），要么给 --local <目录>')
-        return 1
+        # 不给 --release 就取 latest（GitHub 跳转地址）；--local 与 --release 互斥
+        ok = restore_from_release(args.release, args.label)
 
     return 0 if ok else 1
 

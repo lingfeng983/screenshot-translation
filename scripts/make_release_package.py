@@ -5,7 +5,7 @@
 
 把 dist/ocr-bundle/（scripts/collect_ocr_bundle.py 抽出的 Tesseract 运行最小集：
 便携版主程序 + 依赖 DLL + eng/chi_sim 语言数据）打成分卷文件（默认 ≤90MB/卷），
-供上传到 Gitee Release 附件（Gitee 单附件上限 100MB）。
+供上传到 GitHub Release 附件（GitHub 单附件上限 2GB）。
 
 安装程序（scripts/setup.iss）在装填阶段按固定包名 ocr-components 从这个仓库的
 Release 附件下载并解压到 ~/.screenshot-translation/resources/，所以包名不要带日期：
@@ -190,17 +190,17 @@ def make_package(out_dir, part_size_mb, label):
     print(f"\n✅ 已生成 {len(part_paths)} 个分卷 + 1 个校验文件，共 {total_size / 1024 / 1024:.1f} MB")
     for p in part_paths + [sha_path]:
         print(f"   {os.path.basename(p)}  ({os.path.getsize(p) / 1024 / 1024:.1f} MB)")
-    print(f"\n下一步：全部上传到 Gitee Release 附件（tag=v版本），")
+    print(f"\n下一步：全部上传到 GitHub Release 附件（tag=v版本），")
     print(f"克隆端运行 python scripts/setup_ocr.py --release v版本 自动下载恢复。")
     return part_paths + [sha_path, artifact_path]
 
 
 def main():
-    parser = argparse.ArgumentParser(description="打包OCR组件为Gitee Release分卷附件")
+    parser = argparse.ArgumentParser(description="打包OCR组件为GitHub Release分卷附件")
     parser.add_argument('--out', default=os.path.join(PROJECT_ROOT, 'dist', 'release'),
                         help='输出目录（默认 dist/release）')
     parser.add_argument('--part-size', type=int, default=90,
-                        help='单卷上限MB（默认90，Gitee附件上限100）')
+                        help='单卷上限MB（默认90；整包单卷时安装包才能内置下载）')
     parser.add_argument('--label', default=DEFAULT_LABEL,
                         help=f'包名（默认 {DEFAULT_LABEL}，装填器按此名找附件，勿加日期）')
     args = parser.parse_args()

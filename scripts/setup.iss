@@ -1,7 +1,7 @@
-﻿; 截图翻译（ScreenshotTranslator）标准安装包构建脚本
+; 截图翻译（ScreenshotTranslator）标准安装包构建脚本
 ;
 ; 安装包只装程序本体（onedir 目录形态）。OCR 组件（Tesseract 便携最小集，
-; 解压后约 225MB）不在包里：装填阶段由 Setup 自己从本仓库的 Gitee Release 附件
+; 解压后约 225MB）不在包里：装填阶段由 Setup 自己从本仓库的 GitHub Release 附件
 ; 下载（带进度、SHA256 由 Setup 校验）并解压到当前用户的
 ; ~/.screenshot-translation/resources/，程序运行时按该路径探测
 ; （managers/app_paths.py: ocr_resources_dir）。全程不起外部进程，
@@ -32,7 +32,7 @@
 #endif
 ; OCR 组件的下载来源仓库（本地联调可用 /DMyAppOcrRepo 指到镜像或 http 服务）
 #ifndef MyAppOcrRepo
-  #define MyAppOcrRepo "https://gitee.com/lingfeng983/screenshot-translation"
+  #define MyAppOcrRepo "https://github.com/lingfeng983/screenshot-translation"
 #endif
 #define MyAppPublisher "ScreenshotTranslation Project"
 #define MyAppExeName "ScreenshotTranslator.exe"
@@ -99,7 +99,7 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
-Name: "ocr"; Description: "下载 OCR 离线识别组件（约 85MB，来自本仓库 Gitee Release 附件）"; GroupDescription: "识别引擎（不勾选则只能用在线 OCR 或系统已装的 Tesseract）:"
+Name: "ocr"; Description: "下载 OCR 离线识别组件（约 85MB，来自本仓库 GitHub Release 附件）"; GroupDescription: "识别引擎（不勾选则只能用在线 OCR 或系统已装的 Tesseract）:"
 
 [Files]
 ; onedir 目录形态：exe + _internal（主分发形态，启动免解包）

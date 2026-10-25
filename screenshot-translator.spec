@@ -11,7 +11,7 @@ PyInstaller 打包配置（onedir 目录形态）
 onedir 不解包，启动只剩导入耗时，磁盘也不再生成 _MEI。
 
 OCR 组件（Tesseract 便携版，约 225 MiB）不随 exe 分发：安装包在装填阶段
-从 Gitee Release 附件下载并解压到 ~/.screenshot-translation/resources/
+从 GitHub Release 附件下载并解压到 ~/.screenshot-translation/resources/
 （由 scripts/setup.iss 的内置下载完成），exe 只负责运行时探测。
 """
 
