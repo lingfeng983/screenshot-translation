@@ -3317,6 +3317,46 @@ def test_error_handler_accepts_non_exception():
     print("✅ 错误处理器非异常入参测试通过\n")
 
 
+def test_publish_run_merges_child_stderr():
+    """
+    构建/编译子进程的 stderr 必须并入输出流
+
+    PyInstaller 与 iscc 把进度和 INFO 日志写在 stderr；调用方习惯整条命令
+    `2>&1`，PowerShell 会把那些日志变成错误记录，自动化据此把成功的发版判成
+    失败（实测发版跑完仍报 exit code 1）。日志不是错误，统一走 stdout 才能
+    让"退出码 0 = 成功"成立。
+    """
+    print("=== 测试发版脚本子进程 stderr 归并 ===")
+    import subprocess as sp
+
+    mod = _load_script('publish_release.py')
+    calls = []
+
+    class FakeResult:
+        returncode = 0
+        stdout = "OCRDownloadReady=1"
+
+    def fake_run(cmd, **kwargs):
+        calls.append(kwargs)
+        return FakeResult()
+
+    saved = mod.subprocess.run
+    try:
+        mod.subprocess.run = fake_run
+        mod.run(['fake-cmd'])                  # 直通分支
+        mod.run(['fake-cmd'], capture=True)    # 收输出分支
+    finally:
+        mod.subprocess.run = saved
+
+    plain, captured = calls
+    assert plain.get('stderr') == sp.STDOUT, \
+        "直通分支没把子进程 stderr 并入 stdout，PowerShell 会把 INFO 日志当错误"
+    assert plain.get('stdout') is None, "直通分支不该收走 stdout（要边跑边看）"
+    assert captured.get('stderr') == sp.STDOUT
+    assert captured.get('stdout') == sp.PIPE
+    print("✅ 发版脚本子进程 stderr 归并测试通过\n")
+
+
 def main():
     """主测试函数"""
     print("开始功能测试...\n")

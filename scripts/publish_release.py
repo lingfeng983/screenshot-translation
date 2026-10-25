@@ -59,6 +59,12 @@ def run(cmd, cwd=PROJECT_ROOT, check=True, env=None, capture=False):
     """
     执行子命令
 
+    子进程的 stderr 一律并入输出流（不 capture 时用 stderr=STDOUT，capture 时
+    stderr=PIPE）：PyInstaller / iscc 会把进度与 INFO 日志写在 stderr，而调用
+    方常把整条命令的 stderr 一起重定向（`python ... 2>&1`）——在 PowerShell
+    里那会变成一批错误记录，自动化据此把成功的发版判成失败。日志本身不是
+    错误，统一走 stdout 才是"成功=0"的干净语义。
+
     Args:
         capture (bool): 收走输出并原样回显，同时把文本返回给调用方判定
         （iscc 的输出是控制台码页，哨兵本身是 ASCII，解码失败也不影响判定）
@@ -66,14 +72,15 @@ def run(cmd, cwd=PROJECT_ROOT, check=True, env=None, capture=False):
     Returns:
         str: capture 时为合并后的输出，否则为空串
     """
-    print(f"$ {' '.join(cmd)}")
+    print(f"$ {' '.join(cmd)}", flush=True)
     if capture:
         result = subprocess.run(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, text=True, errors="replace")
         output = result.stdout or ""
-        print(output, end="")
+        print(output, end="", flush=True)
     else:
-        result = subprocess.run(cmd, cwd=cwd, env=env)
+        result = subprocess.run(cmd, cwd=cwd, env=env,
+                                stdout=None, stderr=subprocess.STDOUT)
         output = ""
     if check and result.returncode != 0:
         sys.exit(f"命令失败，退出码 {result.returncode}")
@@ -432,6 +439,18 @@ def run_release_step(version, notes, token, no_api):
 
 
 def main():
+    # 输出改成行缓冲：本脚本的进度行与子进程（pytest/PyInstaller/iscc）的
+    # 直写输出共用终端，缓冲会让父进程的进度行整段滞后到子进程之后，
+    # 日志顺序看起来像"发布完了才开始测试"
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except (AttributeError, ValueError):
+        pass
+    # 本脚本自己的告警也走 stdout：日志不是错误，stderr 一沾上就可能被调用方
+    # 的 `2>&1` 变成错误记录，把成功的发版判成失败
+    logging.basicConfig(stream=sys.stdout, level=logging.INFO,
+                        format="[%(levelname)s] %(message)s")
+
     parser = argparse.ArgumentParser(description="一条命令出包+发版到 GitHub")
     parser.add_argument("--version", required=True, help="版本号，如 1.2.0（tag 自动加 v 前缀）")
     parser.add_argument("--skip-tests", action="store_true")

@@ -2,6 +2,16 @@
 
 所有显著改动记录于此。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [Unreleased]
+
+### 修复
+- **发版脚本把构建日志写到 stderr，自动化会把成功判成失败**：PyInstaller/iscc 的
+  进度与 INFO 日志都在 stderr，调用方常整条命令 `2>&1`（PowerShell 会把 stderr
+  变成错误记录），v1.6.0 发版实测跑完仍被报成 `exit code 1`。`run()` 现在把子进程
+  stderr 并入 stdout（直通分支 `stderr=STDOUT`、收输出分支本就合并），脚本自身告警
+  也改走 stdout，并开启行缓冲让进度行与子进程输出顺序一致
+  （`scripts/publish_release.py`）；补一条回归断言两条分支都把 stderr 收进 stdout
+
 ## [v1.6.0] — 2026-10-26
 
 ### 修复
