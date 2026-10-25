@@ -2,7 +2,7 @@
 
 所有显著改动记录于此。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
-## [Unreleased]
+## [v1.6.0] — 2026-10-26
 
 ### 修复
 - **高分屏上保存/钉住的结果图只剩左上角**：结果图先 `setDevicePixelRatio` 再按物理
