@@ -412,7 +412,7 @@ class ConfigManager:
 
     def get_ocr_option(self, option, fallback=''):
         """
-        读取 [OCR] 段的配置项
+        读取 [OCR] 段的配置项（密钥类优先环境变量）
 
         Args:
             option (str): 配置项名
@@ -421,6 +421,11 @@ class ConfigManager:
         Returns:
             str: 配置值
         """
+        env_name = self.OCR_SECRET_ENV_OPTIONS.get(option)
+        if env_name:
+            env_value = os.environ.get(env_name)
+            if env_value:
+                return env_value
         return self.config.get('OCR', option, fallback=fallback)
 
     def set_ocr_option(self, option, value):
@@ -575,6 +580,12 @@ class ConfigManager:
         'llm_api_key': 'LLM_API_KEY',
     }
 
+    # [OCR] 段的密钥同理：云端 OCR 的 Secret Key 同样不该只以明文落盘
+    OCR_SECRET_ENV_OPTIONS = {
+        'baidu_ocr_api_key': 'BAIDU_OCR_API_KEY',
+        'baidu_ocr_secret_key': 'BAIDU_OCR_SECRET_KEY',
+    }
+
     @classmethod
     def is_env_secret(cls, option):
         """
@@ -587,6 +598,20 @@ class ConfigManager:
             bool: True 表示值来自环境，不该被写回明文配置
         """
         env_name = cls.SECRET_ENV_OPTIONS.get(option)
+        return bool(env_name and os.environ.get(env_name))
+
+    @classmethod
+    def is_env_ocr_secret(cls, option):
+        """
+        [OCR] 段配置项当前是否由环境变量提供
+
+        Args:
+            option (str): OCR 段中的配置项名
+
+        Returns:
+            bool: True 表示值来自环境，不该被写回明文配置
+        """
+        env_name = cls.OCR_SECRET_ENV_OPTIONS.get(option)
         return bool(env_name and os.environ.get(env_name))
 
     def _get_secret(self, env_name, option):

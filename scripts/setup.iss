@@ -223,10 +223,9 @@ Name: "{autodesktop}\{#MyAppNameZh}"; Filename: "{app}\{#MyAppExeName}"; Tasks: 
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#MyAppNameZh}}"; Flags: nowait postinstall skipifsilent
 
 [UninstallDelete]
-; 卸载时清掉装填阶段下载的识别组件（用户数据目录里的配置与缓存保留）
-Type: filesandordirs; Name: "{%USERPROFILE}\.screenshot-translation\resources\tesseract"
-Type: filesandordirs; Name: "{%USERPROFILE}\.screenshot-translation\resources\tessdata"
-Type: files; Name: "{%USERPROFILE}\.screenshot-translation\resources\ocr-version.txt"
-; 只剩空壳时把 resources 目录本身也收掉；非空（用户自己放过东西）就不碰
+; 只在目录已经空了时收掉空壳，**不删**下载下来的识别组件：
+; 组件装在当前用户目录、由所有版本共用，而 Inno 覆盖安装会先跑旧版的卸载
+; 程序——在这里删就等于每次升级都重新下载 85MB（ocr-version.txt 的"同标签
+; 跳过"优化也会一起失效）。真要清理，卸载后手工删该目录即可。
 Type: dirifempty; Name: "{%USERPROFILE}\.screenshot-translation\resources"
 

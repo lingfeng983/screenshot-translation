@@ -2,14 +2,22 @@
 # -*- coding: utf-8 -*-
 """
 必应翻译提供者（Azure Translator，需要API密钥）
+
+端点用官方 Azure Translator v3（api.cognitive.microsofttranslator.com）。
+早先写的 api.bing.microsofttranslator.com/v3 是 2018 年的旧版必应接口，
+早已下线；而 Azure 的资源分「区域」与「全球」两种，区域资源必须带
+Ocp-Apim-Subscription-Region 头，否则一律 401。区域因此做成可选项。
 """
 
 import requests
 
 from ..provider_common import (
-    ProviderUnavailableError, describe_error, raise_for_status,
-    wrap_request_error)
+    ProviderRejectedError, ProviderUnavailableError, describe_error,
+    raise_for_status, wrap_request_error)
 from .base import MICROSOFT_LANG_MAP, TranslationProvider
+
+# Azure Translator v3 的公开端点
+TRANSLATE_URL = 'https://api.cognitive.microsofttranslator.com/translate'
 
 
 class BingProvider(TranslationProvider):
@@ -19,6 +27,7 @@ class BingProvider(TranslationProvider):
     display_name = '必应翻译'
     config_fields = (
         ('bing_api_key', 'API密钥', True),
+        ('bing_region', '区域(可选，如 eastasia)', False),
     )
 
     def translate(self, text, source='auto', target='zh'):
@@ -35,13 +44,17 @@ class BingProvider(TranslationProvider):
         """
         api_key = self._require_key(
             self._get_secret('bing_api_key'), "必应翻译API密钥未设置")
+        # 非密钥项：环境变量 BING_REGION 也认，方便自建部署
+        region = (self._get_secret('bing_region') or '').strip()
 
-        url = "https://api.bing.microsofttranslator.com/v3/translate"
         headers = {
             'Ocp-Apim-Subscription-Key': api_key,
-            'Content-Type': 'application/json'
+            'Content-Type': 'application/json',
         }
-        # 必应/Azure 只认它自己的语种表：繁体中文送 zh-TW 会 400 Bad Request
+        if region:
+            # 区域/多服务资源必须带；全球资源带上也无害
+            headers['Ocp-Apim-Subscription-Region'] = region
+        # Azure 只认它自己的语种表：繁体中文送 zh-TW 会 400 Bad Request
         params = {'api-version': '3.0',
                   'to': MICROSOFT_LANG_MAP.get(target, target)}
 
@@ -50,11 +63,17 @@ class BingProvider(TranslationProvider):
             data = [{'text': chunk}]
             try:
                 response = self.session.post(
-                    url, headers=headers, params=params, json=data,
+                    TRANSLATE_URL, headers=headers, params=params, json=data,
                     timeout=self._http_timeout())
             except requests.RequestException as e:
                 raise wrap_request_error(e, '必应翻译') from e
 
+            if response.status_code == 401 and not region:
+                # 401 在没填区域时几乎都是区域资源：直接给可行动的原因，
+                # 而不是把 Azure 的英文响应体原样抛给用户
+                raise ProviderRejectedError(
+                    "必应翻译返回 401：密钥无效，或该资源需要填写“区域”"
+                    "（Azure 门户里资源的 Location，如 eastasia）")
             raise_for_status(response, '必应翻译')
             result = self._parse_json(response)
             # 必应业务错误可能返回 200 + dict（如 {"error": {...}}），需先校验结构

@@ -63,10 +63,14 @@ class ErrorHandler:
             str: 错误信息
         """
         # exc_info 用三元组形式：既覆盖 hook 传栈的情况，也让 except 内的
-        # 调用照样带上当前活动异常的轨迹
-        logger.error(f"{module_name}模块发生错误: {str(error)}",
-                     exc_info=(type(error), error,
-                               tb if tb is not None else sys.exc_info()[2]))
+        # 调用照样带上当前活动异常的轨迹。传入的若不是异常对象（有调用方
+        # 传字符串进来），按普通值日志记录，别拼出畸形的异常三元组。
+        if isinstance(error, BaseException):
+            exc_info = (type(error), error,
+                        tb if tb is not None else sys.exc_info()[2])
+        else:
+            exc_info = None
+        logger.error(f"{module_name}模块发生错误: {str(error)}", exc_info=exc_info)
 
         # 显示错误提示（可能被工作线程调用，QMessageBox 必须在主线程创建）
         if show_message:

@@ -29,6 +29,7 @@
 """
 
 import argparse
+import logging
 import os
 import re
 import shutil
@@ -43,6 +44,8 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GITHUB_REPO = "lingfeng983/screenshot-translation"
 GITHUB_API = "https://api.github.com"
 GITHUB_UPLOAD = "https://uploads.github.com"
+
+logger = logging.getLogger("publish-release")
 
 ISCC_CANDIDATES = [
     # 安装脚本用了 Inno 7 的内置下载（download 标志 + ExternalSize + Hash +
@@ -222,9 +225,16 @@ def step_git(version, notes_title):
     run(["git", "push", "origin", tag])
     # gitee 远程存在时镜像推送（老渠道存档；推送失败不拦 GitHub 发版）
     if "gitee" in git_output(["git", "remote"]).split():
-        run(["git", "push", "gitee", branch], check=False)
-        run(["git", "push", "gitee", tag], check=False)
-        print("已镜像推送到 gitee 远程")
+        mirrored = True
+        for ref in (branch, tag):
+            proc = subprocess.run(["git", "push", "gitee", ref],
+                                  cwd=PROJECT_ROOT, capture_output=True, text=True)
+            if proc.returncode != 0:
+                mirrored = False
+                logger.warning(f"gitee 镜像推送 {ref} 失败（不影响 GitHub 发版）："
+                               f"{(proc.stderr or '').strip()[:200]}")
+        if mirrored:
+            print("已镜像推送到 gitee 远程")
 
 
 def read_token():

@@ -4,7 +4,59 @@
 
 ## [Unreleased]
 
+### 修复
+- **高分屏上保存/钉住的结果图只剩左上角**：结果图先 `setDevicePixelRatio` 再按物理
+  像素绘制，而设了倍率的 QPixmap 上 QPainter 的坐标系是逻辑像素（= 物理 / 倍率），
+  于是内容被放大倍率倍、只有左上 `1/倍率²` 落在图内；150% 屏上保存出的 PNG 与
+  钉住的浮窗都只剩原选区左上部分。改为绘制完成后再声明倍率
+  （`managers/screenshot.py` 的 `_render_result_pixmap`），并补一条看像素的回归
+  （原来只断言倍率与尺寸，正是这个洞让问题漏了网）
+- **升级安装会重下 85MB OCR 组件**：`[UninstallDelete]` 在卸载时清掉
+  `resources\tesseract`、`tessdata` 与 `ocr-version.txt`，而 Inno 覆盖安装会先跑
+  旧版卸载程序，于是每次升级都重新下载、`ShouldFetchOcr` 的同标签跳过彻底失效。
+  卸载清单只保留"空了才收壳"的 `dirifempty`（`scripts/setup.iss`）；组件改为
+  卸载后保留，需要清理时手工删用户目录
+- **必应翻译指向已下线的旧端点**：`api.bing.microsofttranslator.com/v3` 是 2018 年
+  的旧接口，改为 Azure Translator v3 官方端点，并新增"区域"配置项——区域/多服务
+  资源不带 `Ocp-Apim-Subscription-Region` 一律 401，未填区域时把 401 翻译成
+  可照做的中文提示（`managers/providers/bing.py`）
+- **线程池收尾等待的竞态**：完成回调在 worker 线程直接 `discard` 记账集合，而
+  `wait_pending` 在锁内复制集合，退出时并发会抛 "Set changed size during
+  iteration"。回调改为持锁的 `_forget`（`managers/thread_pool.py`）
+- **云端 OCR 不守整链时限**：百度云 OCR 用裸 `timeout`（30 秒）且管理器从未把
+  deadline 下发给 provider，令牌重试 + 两次请求可把 40 秒的整链时限拖到数分钟。
+  `_recognize_via`/`_recognize_blocks_via` 现在把 deadline 写进 provider，
+  云端改用 `_http_timeout()` 按剩余预算夹取；同一 provider 的 HTTP 调用加锁
+  （Session 非线程安全）（`managers/ocr.py`、`managers/ocr_providers/baidu_cloud.py`）
+- **"测试翻译"失败会永久禁用按钮**：`thread_pool_manager.submit()` 返回 None 时
+  没有任何线程回填结果，按钮一直停在"测试中…"。现在当场复原并提示可重试
+  （`main.py`）
+- **空识别结果的判定会串台**：`_last_error`/`_last_error_provider` 是两个截图请求
+  共享的实例属性，并发时"图里没字"的定案判定可能读到另一次请求的异常类型。
+  错误与引擎改为随本次调用返回，`_empty_result_is_final()` 接受显式参数
+  （无参调用仍读属性，兼容旧调用方）（`managers/ocr.py`）
+- **切换 API/OCR 类型丢未保存输入**：点开下拉看看别的类型，回来时表单已被重建。
+  切换前把当前输入存成草稿、切回来恢复，保存成功后清空草稿（`main.py`）
+- **"测试翻译"顺手改掉遮罩参数**：`_save_form_fields(persist=False)` 也写入
+  `snap_threshold`/`dim_opacity`，内存值立刻影响下一次截图。遮罩参数改为只在
+  真正保存时写入（`main.py`）
+- **云端 OCR 密钥无法用环境变量注入**：`[OCR]` 段的 API Key/Secret Key 原先只能
+  明文落盘且会被界面回写。新增 `is_env_ocr_secret()`/环境变量覆盖
+  （`BAIDU_OCR_API_KEY`/`BAIDU_OCR_SECRET_KEY`），界面标出来源、未改动则跳过
+  写盘，与翻译密钥策略一致（`config.py`、`main.py`）
+- **保存时快捷键注册异常导致提示与实际不符**：`set_hotkey()` 抛异常会穿出批量
+  上下文，用户看到"保存配置失败"，而其他配置其实已经落盘。现在就地接住异常，
+  走"快捷键无效"的专用提示与回滚（`main.py`）
+- 次要：重试器 `max_attempts<=0` 抛 `raise None` 的 TypeError 改为明确错误；
+  `ErrorHandler.handle_error` 对非异常入参不再拼畸形 `exc_info`；
+  `setup_ocr.py` 同时给 `--local`/`--release` 时报冲突而不是静默选本地；
+  发版脚本 gitee 镜像推送失败时不再误报"已镜像推送"（`managers/retry_handler.py`、
+  `managers/error_handler.py`、`scripts/setup_ocr.py`、`scripts/publish_release.py`）
+
 ### 变更
+- **翻译连接会话按线程隔离**：共享的 `requests.Session` 被并行块翻译与配置页
+  测试从多个 worker 线程同时使用（requests 不保证线程安全）。改为每线程一条、
+  退出统一关闭，既消除竞态又保留连接复用（`managers/translation.py`）
 - **发布渠道从 Gitee 切换到 GitHub**：主仓库改为
   `github.com/lingfeng983/screenshot-translation`（origin），Gitee 降级为镜像远程
   （`git push gitee` 存档，不影响发版）。发版脚本 `scripts/publish_release.py`

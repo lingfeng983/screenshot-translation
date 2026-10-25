@@ -1473,10 +1473,6 @@ class ScreenshotWidget(QWidget):
 
         pixmap = QPixmap(image.width, image.height)
         pixmap.fill(Qt.transparent)
-        # 结果图是物理像素，钉屏窗口按 pixmap 的"逻辑尺寸"摆放：不声明倍率的话
-        # 高分屏上钉出来的图会比原选区大 (倍率-1) 倍
-        if self._scale > 1.0:
-            pixmap.setDevicePixelRatio(self._scale)
         painter = QPainter(pixmap)
         if not painter.isActive():
             logger.error("结果图画布创建失败，放弃本次导出")
@@ -1495,6 +1491,12 @@ class ScreenshotWidget(QWidget):
             return None
         finally:
             painter.end()
+        # 倍率必须在画完之后声明：setDevicePixelRatio 会改变 QPainter 的坐标系
+        # （逻辑坐标 = 物理像素 / 倍率），先声明再按物理坐标绘制会把内容放大
+        # 倍率倍、只剩左上 1/倍率² 的区域落在图内——150% 屏上保存/钉住的图
+        # 就只剩原选区左上角那一块。绘制期间不声明，内容才是 1:1 物理像素。
+        if self._scale > 1.0:
+            pixmap.setDevicePixelRatio(self._scale)
         return pixmap
 
     def _pin_result(self):

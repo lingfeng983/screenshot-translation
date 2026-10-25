@@ -233,10 +233,12 @@ def main():
                         help='从本地目录恢复（离线模式），如 dist/release')
     args = parser.parse_args()
 
+    if args.local and args.release:
+        parser.error('--local 与 --release 只能给一个（--local 用于离线目录）')
     if args.local:
         ok = restore_from_local(args.local, args.label)
     else:
-        # 不给 --release 就取 latest（GitHub 跳转地址）；--local 与 --release 互斥
+        # 不给 --release 就取 latest（GitHub 跳转地址）
         ok = restore_from_release(args.release, args.label)
 
     return 0 if ok else 1

@@ -599,6 +599,53 @@ def test_request_timeout_shares_remaining_budget():
     print("✅ 剩余时限分配测试通过\n")
 
 
+def test_bing_uses_azure_endpoint_and_region_header():
+    """
+    必应必须走 Azure Translator v3 官方端点，并支持区域头
+
+    老的 api.bing.microsofttranslator.com/v3 是 2018 年的旧接口，早已下线；
+    区域/多服务资源不带 Ocp-Apim-Subscription-Region 则一律 401。
+    """
+    print("=== 测试必应端点与区域头 ===")
+    from unittest import mock
+
+    from managers.providers.bing import TRANSLATE_URL, BingProvider
+
+    assert 'api.cognitive.microsofttranslator.com/translate' in TRANSLATE_URL, \
+        f"必应端点不是 Azure 官方地址: {TRANSLATE_URL}"
+    assert 'bing.microsofttranslator.com' not in TRANSLATE_URL, \
+        "不应再指向已下线的旧必应接口"
+
+    provider = BingProvider()
+    secrets = {'bing_api_key': 'test-key', 'bing_region': 'eastasia'}
+
+    def fake_secret(option, env_name=None):
+        return secrets.get(option, '')
+
+    provider._get_secret = fake_secret
+    resp = mock.Mock()
+    resp.status_code = 200
+    resp.text = ''
+    resp.json.return_value = [{'translations': [{'text': '你好'}]}]
+    provider.session = mock.Mock()
+    provider.session.post.return_value = resp
+
+    provider.translate('hi', 'auto', 'zh')
+    args, kwargs = provider.session.post.call_args
+    assert args[0] == TRANSLATE_URL
+    assert kwargs['headers'].get('Ocp-Apim-Subscription-Region') == 'eastasia', \
+        "区域资源缺 Ocp-Apim-Subscription-Region 会 401"
+    assert kwargs['params']['api-version'] == '3.0'
+
+    # 不填区域时不能凭空带空头
+    secrets['bing_region'] = ''
+    provider.session.post.reset_mock()
+    provider.translate('hi', 'auto', 'zh')
+    _, kwargs = provider.session.post.call_args
+    assert 'Ocp-Apim-Subscription-Region' not in kwargs['headers']
+    print("✅ 必应端点与区域头测试通过\n")
+
+
 def main():
     """脚本运行器：用例名单由 _runner 按本模块命名空间发现，不再手抄"""
     print("开始翻译架构测试...\n")

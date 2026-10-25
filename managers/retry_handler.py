@@ -120,7 +120,9 @@ class RetryHandler:
             # 惰性降级：只有真正需要降级时才执行，避免调用方在传参时被提前求值
             return fallback_result() if callable(fallback_result) else fallback_result
         else:
-            # 重新抛出最后一个异常
+            # 重新抛出最后一个异常；max_attempts<=0 时从未尝试过，不能 raise None
+            if last_exception is None:
+                raise RuntimeError("重试器未执行任何尝试（max_attempts 必须为正）")
             raise last_exception
 
     @staticmethod

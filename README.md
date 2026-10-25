@@ -323,6 +323,8 @@ Tesseract **不再打进 exe**：安装程序在装填阶段由 Setup 自己从 
 `ocr-components.zip.001`，SHA256 由 Setup 校验、解压到
 `%USERPROFILE%\.screenshot-translation\resources\`，进度就在向导里，不起外部进程所以
 不会弹控制台窗口。同一标签已装过则跳过下载（靠 `ocr-version.txt` 标记）。
+**卸载不会删除**这批组件（它们装在用户目录、由所有版本共用；卸载时删掉会让每次
+覆盖升级都重新下载 85MB），需要清理时手工删除 `%USERPROFILE%\.screenshot-translation\resources\`。
 代价是安装时要联网，好处是安装包从 105MB 降到 30MB，225MB 的二进制不跟着每个包跑。
 
 打包时自动裁剪无用依赖：Qt 的 QML/场景图/Vulkan 插件与翻译文件、PIL 的

@@ -79,6 +79,10 @@ class BaiduOCRProvider(OCRProvider):
         self._token_expire_at = 0
         # 并发首识别时只让一个线程去取令牌，否则同一份密钥会打两次令牌接口
         self._token_lock = threading.Lock()
+        # 请求串行化：provider 实例按类缓存在 OCR 管理器里、被多个线程共用，
+        # 而 requests.Session 不是文档保证线程安全的。识别本身是串行的
+        # （一次截图一个请求），这把锁只在两次截图并发时生效，代价可忽略。
+        self._request_lock = threading.Lock()
 
     def _get_access_token(self):
         """
@@ -112,7 +116,9 @@ class BaiduOCRProvider(OCRProvider):
                         'client_id': api_key,
                         'client_secret': secret_key,
                     },
-                    timeout=self.timeout,
+                    # 用 _http_timeout 而不是裸 timeout：整条识别链只有一个
+                    # deadline，预算快用完时不该再按 30 秒去等令牌
+                    timeout=self._http_timeout(),
                 )
                 response.raise_for_status()
                 data = response.json()
@@ -250,14 +256,16 @@ class BaiduOCRProvider(OCRProvider):
                     self._token_expire_at = 0
             token = self._get_access_token()
             try:
-                response = self.session.post(
-                    url,
-                    # access_token 放 body：放 query 时异常文本里的完整 URL
-                    # 会把令牌带进本地日志与代理日志
-                    data={'image': image_b64, 'access_token': token},
-                    headers={'Content-Type': 'application/x-www-form-urlencoded'},
-                    timeout=self.timeout,
-                )
+                # 串行化同一 provider 实例上的 HTTP 调用（Session 非线程安全）
+                with self._request_lock:
+                    response = self.session.post(
+                        url,
+                        # access_token 放 body：放 query 时异常文本里的完整 URL
+                        # 会把令牌带进本地日志与代理日志
+                        data={'image': image_b64, 'access_token': token},
+                        headers={'Content-Type': 'application/x-www-form-urlencoded'},
+                        timeout=self._http_timeout(),
+                    )
                 response.raise_for_status()
                 result = response.json()
             except (requests.RequestException, json.JSONDecodeError) as e:

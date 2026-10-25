@@ -9,6 +9,7 @@
 """
 
 import logging
+import threading
 import time
 
 import requests
@@ -92,8 +93,12 @@ class TranslationManager(ProviderChainManager):
         self.timeout = (self._CONNECT_TIMEOUT, self._READ_TIMEOUT)
         # 单次翻译（含降级与重试）的整体时限；调用方传入 deadline 时以它为准
         self.chain_deadline = self._CHAIN_DEADLINE
-        # 复用连接，避免每次请求重建 TCP+TLS
-        self.session = requests.Session()
+        # 复用连接，避免每次请求重建 TCP+TLS；但 requests.Session 不保证
+        # 线程安全（并行块翻译与配置页测试会从多个 worker 线程同时用），
+        # 所以按线程各留一条，互不干扰
+        self._session_local = threading.local()
+        self._sessions = set()
+        self._session_lock = threading.Lock()
         self._closed = False
 
         # 加载配置
@@ -228,15 +233,40 @@ class TranslationManager(ProviderChainManager):
             logger.exception(f"翻译失败: {e}")
             return error_handler.handle_translation_error(e)
 
+    @property
+    def session(self):
+        """当前线程复用的连接会话（每个线程一条，Session 非线程安全）"""
+        return self._session_for_thread()
+
+    def _session_for_thread(self):
+        """
+        取当前线程的连接会话，没有就建一条并登记（退出时统一关闭）
+
+        Returns:
+            requests.Session: 当前线程专用会话
+        """
+        session = getattr(self._session_local, 'session', None)
+        if session is None:
+            session = requests.Session()
+            self._session_local.session = session
+            with self._session_lock:
+                if not self._closed:
+                    self._sessions.add(session)
+        return session
+
     def close(self):
-        """释放复用的连接池（退出清理时调用，可重复调用）"""
+        """释放所有线程的连接池（退出清理时调用，可重复调用）"""
         if self._closed:
             return
         self._closed = True
-        try:
-            self.session.close()
-        except Exception as e:
-            logger.debug(f"关闭翻译连接池失败: {e}")
+        with self._session_lock:
+            sessions = list(self._sessions)
+            self._sessions.clear()
+        for session in sessions:
+            try:
+                session.close()
+            except Exception as e:
+                logger.debug(f"关闭翻译连接池失败: {e}")
 
     # ---- 缓存 ----
 

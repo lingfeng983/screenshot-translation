@@ -1108,6 +1108,20 @@ def test_installer_downloads_ocr_without_external_process():
     assert 'Check: ShouldFetchOcr' in iss
     assert 'ocr-version.txt' in iss
 
+    # 卸载/升级不能删下载下来的识别组件：Inno 覆盖安装会先跑旧版卸载程序，
+    # 在这里删就等于每次升级都重新下载 85MB（标签跳过逻辑一并失效）
+    uninstall = iss.split('[UninstallDelete]')[1]
+    uninstall = uninstall.split('\n[')[0]
+    directives = [line for line in uninstall.splitlines()
+                  if line.strip() and not line.strip().startswith(';')]
+    joined = '\n'.join(directives)
+    assert 'resources\\tesseract' not in joined, \
+        "卸载清单仍在删 tesseract，升级会重新下载组件"
+    assert 'resources\\tessdata' not in joined, \
+        "卸载清单仍在删 tessdata，升级会重新下载组件"
+    assert 'ocr-version.txt' not in joined, \
+        "卸载清单仍在删版本标记，标签跳过逻辑会失效"
+
     packager = read('scripts', 'make_release_package.py')
     for define in ('MyAppOcrPartName', 'MyAppOcrSize', 'MyAppOcrSha', 'MyAppOcrParts'):
         assert f'#define {define}' in packager, f"出包脚本没写 {define}，iss 编译期拿不到"
@@ -3176,6 +3190,131 @@ def test_stale_attachment_delete_failure_is_fatal():
     finally:
         mod.api_request = saved
     print("✅ 同名旧附件清理失败语义测试通过\n")
+
+
+def test_result_pixmap_keeps_full_selection_on_hidpi():
+    """
+    150% 屏上导出图必须是完整选区的 1:1 物理像素
+
+    结果图给 QPixmap 声明 devicePixelRatio 后，QPainter 的坐标系变成逻辑像素
+    （= 物理 / 倍率）：若先声明再按物理坐标绘制，内容会被放大倍率倍，导出图
+    只剩原选区左上 1/倍率²。只断言倍率与尺寸发现不了这个问题，必须看像素。
+    """
+    print("=== 测试高分屏导出图内容完整 ===")
+    from PIL import Image
+
+    from managers.screenshot import ScreenshotWidget
+
+    _ensure_qt_app()
+    widget = ScreenshotWidget()
+    try:
+        widget._scale = widget._scale_y = 1.5
+        image = Image.new('RGB', (300, 150), 'white')
+        # 只在右下角放一个蓝块：内容被放大/裁剪时它会消失
+        for y in range(130, 150):
+            for x in range(280, 300):
+                image.putpixel((x, y), (0, 0, 255))
+        widget._result = {'image': image, 'blocks': [], 'block_texts': []}
+
+        pixmap = widget._render_result_pixmap()
+        assert pixmap is not None, "结果图合成失败"
+        assert abs(pixmap.devicePixelRatio() - 1.5) < 1e-6, \
+            f"结果图未声明倍率: {pixmap.devicePixelRatio()}"
+
+        out = pixmap.toImage()
+        corner = out.pixelColor(290, 140)
+        assert (corner.red(), corner.green(), corner.blue()) == (0, 0, 255), \
+            "导出图右下角内容丢失：绘制期间声明设备倍率会把内容整体放大"
+    finally:
+        widget.close()
+    print("✅ 高分屏导出图内容完整测试通过\n")
+
+
+def test_wait_pending_survives_concurrent_completion():
+    """wait_pending 与完成回调并发时不能抛集合被修改的异常"""
+    print("=== 测试线程池收尾等待并发安全 ===")
+    import threading
+
+    from managers.thread_pool import ThreadPoolManager
+
+    pool = ThreadPoolManager(max_workers=3)
+    assert pool.initialize() is True
+    errors = []
+
+    def submitter():
+        for _ in range(80):
+            pool.submit(lambda: 1)
+
+    def waiter():
+        for _ in range(300):
+            try:
+                pool.wait_pending(timeout=0.001)
+            except Exception as e:      # 修复前是 "Set changed size during iteration"
+                errors.append(e)
+
+    t1 = threading.Thread(target=submitter)
+    t2 = threading.Thread(target=waiter)
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+    try:
+        pool.shutdown(wait=False, timeout=0.1)
+    finally:
+        pass
+    assert not errors, f"收尾等待与完成回调并发时报错: {errors}"
+    print("✅ 线程池收尾等待并发安全测试通过\n")
+
+
+def test_ocr_secret_env_override(tmp_path):
+    """云端 OCR 密钥支持环境变量注入，且不当作普通配置项读写"""
+    print("=== 测试 OCR 密钥环境变量 ===")
+    import os as _os
+
+    from config import ConfigManager
+
+    key = 'BAIDU_OCR_API_KEY'
+    saved = _os.environ.get(key)
+    try:
+        _os.environ[key] = 'env-secret'
+        cm = ConfigManager(str(tmp_path / 'config.ini'))
+        assert cm.is_env_ocr_secret('baidu_ocr_api_key') is True
+        assert cm.get_ocr_option('baidu_ocr_api_key') == 'env-secret', \
+            "读取应按环境变量优先"
+        assert cm.is_env_ocr_secret('tesseract_langs') is False, \
+            "非密钥项不该走环境变量通道"
+    finally:
+        if saved is None:
+            _os.environ.pop(key, None)
+        else:
+            _os.environ[key] = saved
+    print("✅ OCR 密钥环境变量测试通过\n")
+
+
+def test_retry_handler_zero_attempts():
+    """max_attempts 为 0 时应抛明确错误，而不是 raise None 的 TypeError"""
+    print("=== 测试重试器零尝试保护 ===")
+    from managers.retry_handler import RetryHandler
+
+    handler = RetryHandler(max_attempts=0)
+    try:
+        handler.execute_with_retry(lambda: 1)
+        assert False, "零次尝试不该返回结果"
+    except RuntimeError as e:
+        assert '尝试' in str(e), f"错误信息应说明原因: {e}"
+    except TypeError as e:
+        assert False, f"零次尝试抛了 TypeError（raise None）: {e}"
+    print("✅ 重试器零尝试保护测试通过\n")
+
+
+def test_error_handler_accepts_non_exception():
+    """传入非异常对象时只记日志，不拼畸形 exc_info"""
+    print("=== 测试错误处理器非异常入参 ===")
+    from managers.error_handler import ErrorHandler
+
+    text = ErrorHandler.handle_error('纯文本错误', '测试', show_message=False)
+    assert '纯文本错误' in text
+    print("✅ 错误处理器非异常入参测试通过\n")
 
 
 def main():

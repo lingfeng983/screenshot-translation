@@ -39,7 +39,7 @@ smoke = pytest.mark.skipif(not SMOKE, reason='会注册全局热键：ST_RUN_SMO
 EXPECTED_API_FIELDS = {
     'baidu': ('baidu_app_id', 'baidu_api_key'),
     'youdao': ('youdao_app_id', 'youdao_api_key'),
-    'bing': ('bing_api_key',),
+    'bing': ('bing_api_key', 'bing_region'),
     'libretranslate': ('libretranslate_url',),
     'llm': ('llm_base_url', 'llm_api_key', 'llm_model'),
     'edge_free': (),
@@ -967,3 +967,69 @@ def test_main_entry_point_starts():
             proc.wait(timeout=8)
         except subprocess.TimeoutExpired:
             proc.kill()
+
+
+def test_test_button_recovers_when_pool_rejects(win, qapp, monkeypatch):
+    """线程池拒收任务时，测试按钮必须当场复原，不能永久停在“测试中…”"""
+    import main as main_mod
+
+    class RejectingPool:
+        def submit(self, *args, **kwargs):
+            return None
+
+    monkeypatch.setattr(main_mod, 'thread_pool_manager', RejectingPool())
+    win.test_button.setEnabled(True)
+    win._on_test_translation()
+    assert win.test_button.isEnabled(), "任务没提交成功，按钮却仍是禁用态"
+    assert '无法启动' in win.test_result_label.text(), \
+        f"没有给出可行动提示: {win.test_result_label.text()!r}"
+
+
+def test_api_type_switch_keeps_unsaved_input(win, qapp):
+    """切到别的 API 类型再切回来，尚未保存的输入不能丢"""
+    combo = win.api_type_combo
+    combo.setCurrentIndex(combo.findData('llm'))
+    spin(qapp)
+    win._api_field_edits['llm_model'].setText('my-draft-model')
+
+    combo.setCurrentIndex(combo.findData('baidu'))
+    spin(qapp)
+    combo.setCurrentIndex(combo.findData('llm'))
+    spin(qapp)
+    assert win._api_field_edits['llm_model'].text() == 'my-draft-model', \
+        "切走再切回来把用户没保存的输入丢了"
+
+
+def test_ocr_type_switch_keeps_unsaved_input(win, qapp):
+    """OCR 引擎切换同理：未保存的字段值要保留"""
+    combo = win.ocr_type_combo
+    combo.setCurrentIndex(combo.findData('baidu_cloud'))
+    spin(qapp)
+    win._ocr_field_edits['baidu_ocr_api_key'].setText('draft-key')
+
+    combo.setCurrentIndex(combo.findData('tesseract'))
+    spin(qapp)
+    combo.setCurrentIndex(combo.findData('baidu_cloud'))
+    spin(qapp)
+    assert win._ocr_field_edits['baidu_ocr_api_key'].text() == 'draft-key', \
+        "切走再切回来把云端 OCR 的输入丢了"
+
+
+def test_test_translation_does_not_write_overlay(win):
+    """点“测试翻译”不该改掉本次会话的遮罩参数（只有保存才写）"""
+    cm = win.config_manager
+    cm.set_overlay_option('snap_threshold', '12')
+    cm.set_overlay_option('dim_opacity', '90')
+    win.snap_slider.setValue(40)
+    win.dim_slider.setValue(150)
+
+    win._save_form_fields(persist=False)
+    assert cm.get_overlay_option('snap_threshold') == '12', \
+        "测试翻译顺手改了磁吸阈值"
+    assert cm.get_overlay_option('dim_opacity') == '90', \
+        "测试翻译顺手改了暗角透明度"
+
+    win._save_form_fields(persist=True)
+    assert cm.get_overlay_option('snap_threshold') == '40', "真正保存时应当写入"
+    assert cm.get_overlay_option('dim_opacity') == '150'
+

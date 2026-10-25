@@ -176,6 +176,7 @@ class MainApp:
             except Exception as cleanup_error:
                 logger.error(f"清理过程中出错: {cleanup_error}")
             self._force_exit(0)
+            return
 
         # 使用统一的错误处理（栈由 hook 传进去：这里没有活动异常）
         error_handler.handle_error(exc_value, "主应用", tb=exc_traceback)
@@ -631,6 +632,9 @@ class ConfigWindow(QDialog):
         self._api_field_edits = {}
         # 当前显示的环境变量密钥（字段名 -> 值），保存时据此跳过回写
         self._env_secret_values = {}
+        # 切换 API 类型时暂存尚未保存的输入：切走再切回来不能变回旧值
+        self._api_drafts = {}
+        self._last_api_type = None
 
         api_group.setLayout(api_layout)
         layout.addWidget(api_group)
@@ -665,6 +669,10 @@ class ConfigWindow(QDialog):
         self.ocr_fields_layout = _new_form()
         ocr_layout.addRow(self.ocr_fields_layout)
         self._ocr_field_edits = {}
+        # OCR 侧同样保留未保存输入与"来自环境变量"的密钥标记
+        self._ocr_drafts = {}
+        self._ocr_env_secret_values = {}
+        self._last_ocr_type = None
 
         ocr_group.setLayout(ocr_layout)
         layout.addWidget(ocr_group)
@@ -863,6 +871,13 @@ class ConfigWindow(QDialog):
     def _on_api_type_changed(self, index):
         """API类型切换时，重新生成该API的配置字段"""
         try:
+            new_type = self.api_type_combo.currentData()
+            # 切走前把当前类型的未保存输入留成草稿：用户填了一半的密钥/地址
+            # 不会因为点开下拉看看别的类型就消失
+            if self._last_api_type and self._api_field_edits:
+                self._api_drafts[self._last_api_type] = {
+                    name: edit.text() for name, edit in self._api_field_edits.items()}
+
             # 清空旧字段
             while self.api_fields_layout.rowCount():
                 self.api_fields_layout.removeRow(0)
@@ -870,15 +885,18 @@ class ConfigWindow(QDialog):
             self._env_secret_values = {}
 
             provider_cls = self._current_provider()
+            self._last_api_type = new_type
             if provider_cls is None:
                 return
 
+            draft = self._api_drafts.get(new_type) or {}
             # 按provider声明动态生成输入框
             for field_name, label, is_password in provider_cls.config_fields:
                 edit = QLineEdit()
                 if is_password:
                     edit.setEchoMode(QLineEdit.Password)
-                value = self._load_field_value(field_name)
+                value = (draft[field_name] if field_name in draft
+                         else self._load_field_value(field_name))
                 edit.setText(value)
                 # 环境变量提供的密钥不回填进明文 config.ini：界面标出来源，
                 # 用户没动它就跳过写入（显式重打过的值仍按普通字段保存）
@@ -970,8 +988,11 @@ class ConfigWindow(QDialog):
 
             self.test_button.setEnabled(False)
             self.test_result_label.setText("测试中…")
-            thread_pool_manager.submit(
-                self._run_test_translation, api_type, target_lang)
+            if thread_pool_manager.submit(
+                    self._run_test_translation, api_type, target_lang) is None:
+                # 线程池已关闭或拒收：没有任何线程会回填结果，按钮必须当场复原
+                self.test_button.setEnabled(True)
+                self.test_result_label.setText("❌ 后台任务无法启动，请稍后重试")
         except Exception as e:
             logger.error(f"测试翻译失败: {e}")
             self.test_result_label.setText(f"❌ {str(e)[:60]}")
@@ -1016,12 +1037,20 @@ class ConfigWindow(QDialog):
             for field_name, edit in self._api_field_edits.items():
                 self._save_field_value(field_name, edit.text().strip())
             for field_name, edit in self._ocr_field_edits.items():
-                self.config_manager.set_ocr_option(field_name, edit.text().strip())
-            # 截图遮罩滑条
-            self.config_manager.set_overlay_option(
-                'snap_threshold', str(self.snap_slider.value()))
-            self.config_manager.set_overlay_option(
-                'dim_opacity', str(self.dim_slider.value()))
+                value = edit.text().strip()
+                env_value = self._ocr_env_secret_values.get(field_name)
+                if env_value is not None and value == env_value:
+                    # 同翻译密钥：环境变量给的值本来就不在 config.ini 里，
+                    # 原样保存等于把明文密钥写进可被读到的文件
+                    continue
+                self.config_manager.set_ocr_option(field_name, value)
+            if persist:
+                # 遮罩参数只在真正"保存"时写入：点"测试翻译"不该顺手改掉
+                # 本次会话后续截图的遮罩观感（内存配置会立刻影响下一次截图）
+                self.config_manager.set_overlay_option(
+                    'snap_threshold', str(self.snap_slider.value()))
+                self.config_manager.set_overlay_option(
+                    'dim_opacity', str(self.dim_slider.value()))
 
     def _current_ocr_provider(self):
         """获取当前选中的OCR provider类，未找到时返回None"""
@@ -1031,22 +1060,41 @@ class ConfigWindow(QDialog):
     def _on_ocr_type_changed(self, index):
         """OCR引擎切换时，重新生成该引擎的配置字段"""
         try:
+            new_type = self.ocr_type_combo.currentData()
+            # 同 API 侧：切走前暂存未保存输入，切回来能继续填
+            if self._last_ocr_type and self._ocr_field_edits:
+                self._ocr_drafts[self._last_ocr_type] = {
+                    name: edit.text() for name, edit in self._ocr_field_edits.items()}
+
             # 清空旧字段
             while self.ocr_fields_layout.rowCount():
                 self.ocr_fields_layout.removeRow(0)
             self._ocr_field_edits = {}
+            self._ocr_env_secret_values = {}
 
             provider_cls = self._current_ocr_provider()
+            self._last_ocr_type = new_type
             if provider_cls is None:
                 return
 
+            draft = self._ocr_drafts.get(new_type) or {}
             # 按provider声明动态生成输入框，值从 [OCR] 配置段读取
             for field_name, label, is_password in provider_cls.config_fields:
                 edit = QLineEdit()
                 if is_password:
                     edit.setEchoMode(QLineEdit.Password)
-                if self.config_manager:
-                    edit.setText(self.config_manager.get_ocr_option(field_name))
+                if field_name in draft:
+                    value = draft[field_name]
+                elif self.config_manager:
+                    value = self.config_manager.get_ocr_option(field_name)
+                else:
+                    value = ''
+                edit.setText(value)
+                # 云端 OCR 密钥同样支持环境变量注入，且不回写进明文配置
+                if (value and self.config_manager
+                        and self.config_manager.is_env_ocr_secret(field_name)):
+                    self._ocr_env_secret_values[field_name] = value
+                    edit.setPlaceholderText('值来自环境变量，保持不变则不写入配置文件')
                 self._ocr_field_edits[field_name] = edit
                 self.ocr_fields_layout.addRow(f"{label}:", edit)
         except Exception as e:
@@ -1064,6 +1112,7 @@ class ConfigWindow(QDialog):
             target_lang = self.target_lang_combo.currentData() or 'zh'
             hotkey = self.hotkey_edit.text()
             hotkey_ok = True
+            hotkey_error = ''
 
             # 所有配置写入放进批量上下文：十几次 setter 只落盘一次
             with self.config_manager.batch():
@@ -1083,13 +1132,25 @@ class ConfigWindow(QDialog):
                 # 启动行为
                 self.config_manager.set_minimize_to_tray(
                     self.minimize_to_tray_check.isChecked())
-                # 全局快捷键：注册成功后由 set_hotkey 负责写配置，失败则不落盘
+                # 全局快捷键：注册成功后由 set_hotkey 负责写配置，失败则不落盘。
+                # 这里必须自己接住异常：让异常穿出 with 块会跳过"快捷键无效"的
+                # 提示路径，用户看到的是笼统的"保存配置失败"，而其他配置其实
+                # 已经随批量上下文落盘了——提示与实际状态对不上。
                 if self.main_app.hotkey_manager:
-                    hotkey_ok = self.main_app.hotkey_manager.set_hotkey(hotkey)
+                    try:
+                        hotkey_ok = self.main_app.hotkey_manager.set_hotkey(hotkey)
+                    except Exception as e:
+                        hotkey_ok = False
+                        hotkey_error = f"快捷键 {hotkey} 注册异常：{e}"
+                        logger.error(hotkey_error)
                 else:
                     # 快捷键管理器不可用（启动降级场景），无法校验注册结果，仅记录
                     logger.warning(f"快捷键管理器不可用，未校验直接保存快捷键: {hotkey}")
                     self.config_manager.set_global_hotkey(hotkey)
+
+            # 保存成功：草稿里的值已经写进配置，清掉避免下次切回来又盖回旧输入
+            self._api_drafts.clear()
+            self._ocr_drafts.clear()
 
             # 同步翻译管理器
             if self.main_app.translation_manager:
@@ -1104,9 +1165,10 @@ class ConfigWindow(QDialog):
 
             if not hotkey_ok:
                 # 配置已全部落盘、管理器已同步，只有热键保持原值
-                fail_reason = getattr(
-                    self.main_app.hotkey_manager, 'last_error', '') or \
-                    f"快捷键 {hotkey} 注册失败，已保留原快捷键。"
+                fail_reason = (hotkey_error
+                               or getattr(self.main_app.hotkey_manager,
+                                          'last_error', '')
+                               or f"快捷键 {hotkey} 注册失败，已保留原快捷键。")
                 # 输入框要跟着回滚：留着刚输入的组合就等于告诉用户"改成了"，
                 # 而实际生效的还是配置里那个
                 self.hotkey_edit.setText(self.config_manager.get_global_hotkey())

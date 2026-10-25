@@ -97,10 +97,22 @@ class ThreadPoolManager:
             logger.exception(f"提交任务到线程池失败: {e}")
             return None
 
-        # 回调在 add 之后注册：future 已结束时会立即执行，等于当场摘掉记账
-        future.add_done_callback(self._pending.discard)
+        # 回调在 add 之后注册：future 已结束时会立即执行，等于当场摘掉记账。
+        # 回调必须同样持锁：wait_pending 在锁内复制集合，若 worker 线程直接
+        # discard，复制过程中集合被改动会抛 "Set changed size during iteration"
+        future.add_done_callback(self._forget)
         logger.debug(f"任务已提交到线程池: {getattr(func, '__name__', repr(func))}")
         return future
+
+    def _forget(self, future):
+        """
+        任务结束后从记账集合里摘除（在 worker 线程执行，必须持锁）
+
+        Args:
+            future (concurrent.futures.Future): 已结束的任务
+        """
+        with self.lock:
+            self._pending.discard(future)
 
     def wait_pending(self, timeout=None):
         """
