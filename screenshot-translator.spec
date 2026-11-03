@@ -10,16 +10,24 @@ PyInstaller 打包配置（onedir 目录形态）
 用户等不及就会任务管理器杀掉）临时目录整份留在磁盘上。
 onedir 不解包，启动只剩导入耗时，磁盘也不再生成 _MEI。
 
-OCR 组件（Tesseract 便携版，约 225 MiB）不随 exe 分发：安装包在装填阶段
-从 GitHub Release 附件下载并解压到 ~/.screenshot-translation/resources/
-（由 scripts/setup.iss 的内置下载完成），exe 只负责运行时探测。
+OCR 组件（RapidOCR 的 PP-OCRv6 检测/识别/方向分类模型，约 30 MiB）随 exe
+一起分发：装在 _internal/rapidocr/models/ 下，运行时由 ONNX Runtime 在本进程
+内推理，既不需要系统装 Tesseract，也不再从 Release 下载任何东西。
 """
 
 import os
 import re
-from PyInstaller.utils.hooks import collect_submodules
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 block_cipher = None
+
+# PyInstaller 的隔离子进程会先导入 Qt 绑定、再导入 onnxruntime，本机组合下这个
+# 顺序会访问冲突（见 scripts/pyi_preload/sitecustomize.py）。把垫片目录塞进
+# PYTHONPATH，子进程启动时自动先加载 onnxruntime。只影响构建期，不进产物。
+_preload_dir = os.path.join(SPECPATH, 'scripts', 'pyi_preload')
+os.environ['PYTHONPATH'] = os.pathsep.join(
+    [_preload_dir]
+    + [p for p in os.environ.get('PYTHONPATH', '').split(os.pathsep) if p])
 
 # 随包分发的只读资源（onedir 下落在 _internal/resources/...）
 datas = [
@@ -28,10 +36,17 @@ datas = [
     ('config.example.ini', '.'),
 ]
 
+# RapidOCR 的模型、默认配置与语言字典不是 py 模块，静态分析收不到；
+# 只收 yaml 与 models/，不要把 pytorch 分支的架构配置等无关文件带进来
+datas += collect_data_files('rapidocr', includes=['*.yaml', 'models/*'])
+
 # 隐藏导入：pystray 的 Windows 后端与键盘库按需动态加载
 # 插件包（翻译API / OCR引擎）只在运行时按目录扫描发现，静态分析看不到引用，
 # 不显式收集的话产物里一个 provider 都没有，翻译与OCR全部失效
 # （PIL._tkinter_finder 不收：它一进来就 import tkinter，而 tkinter 在 excludes 里）
+# RapidOCR 的 onnxruntime 后端不列 hiddenimport：它是 `from .onnxruntime import`
+# 的函数级导入，静态分析能收到；显式列出来反而会让 PyInstaller 的隔离子进程
+# 在导入 PyQt5 之后再导入 onnxruntime，触发本机 Qt 的访问冲突直接崩掉
 hiddenimports = [
     'pystray._win32',
 ] + collect_submodules('managers.providers') + collect_submodules('managers.ocr_providers')
@@ -83,14 +98,33 @@ a = Analysis(
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
-    runtime_hooks=[],
+    # 必须在 PyQt5 的内置运行时钩子之前导入 onnxruntime（见脚本内注释）
+    runtime_hooks=[os.path.join(SPECPATH, 'scripts', 'rt_preload_onnx.py')],
     excludes=[
         # 排除明显不需要的大模块，减小体积
         'tkinter',
         'matplotlib',
-        'numpy',
         'pandas',
         'scipy',
+        # RapidOCR 只走 ONNX Runtime：其它推理后端在本项目里都不装，
+        # 显式排除防止静态分析顺着可选分支把它们（及其依赖）带进产物
+        'torch',
+        'paddle',
+        'paddleocr',
+        'tensorflow',
+        'openvino',
+        'mnn',
+        'tensorrt',
+        'rapidocr.inference_engine.paddle',
+        'rapidocr.inference_engine.torch',
+        'rapidocr.inference_engine.pytorch',
+        'rapidocr.inference_engine.openvino',
+        'rapidocr.inference_engine.mnn',
+        'rapidocr.inference_engine.tensorrt',
+        # requests 走系统 OpenSSL，不用 pyOpenSSL 后端
+        'cryptography',
+        'cffi',
+        '_cffi_backend',
         'PyQt5.QtBluetooth',
         'PyQt5.QtNetwork',
         'PyQt5.QtSql',
@@ -126,8 +160,14 @@ _QT_UNUSED = {
     'qt5designer.dll', 'qt5quick3d.dll', 'qt5quick3druntimerender.dll',
     # WebGL 平台插件，只链接上面被剔除的 Qt5Quick；光栅 QWidget 永远不会加载它
     'qwebgl.dll',
-    # OpenGL 软件渲染兜底；Windows 自带 opengl32.dll，QWidget 光栅绘制不需要它
-    'opengl32sw.dll',
+    # 硬件/软件 OpenGL 兜底；Windows 自带 opengl32.dll，QWidget 光栅绘制不需要它
+    'opengl32sw.dll', 'libegl.dll', 'libglesv2.dll', 'd3dcompiler_47.dll',
+    # 图像格式插件：只读写 PNG/JPEG（PNG 编解码在 Qt5Gui 内，不需要插件）
+    'qtiff.dll', 'qwebp.dll',
+    # 本项目不建数据库、不解析 SVG/TIFF
+    'qsqlite.dll', 'qt5sql.dll', 'qt5svg.dll',
+    # OpenCV 的视频 IO 后端（约 29MB）：只做图像解码与几何变换，永不打开摄像头/视频
+    'opencv_videoio_ffmpeg500_64.dll',
 }
 _DROP_DIR_PREFIXES = (
     os.path.join('pyqt5', 'qt5', 'translations').lower(),
@@ -136,6 +176,11 @@ _DROP_DIR_PREFIXES = (
     os.path.join('pyqt5', 'qt5', 'plugins', 'scenegraph').lower(),
     os.path.join('pyqt5', 'qt5', 'plugins', 'vk').lower(),
     os.path.join('pyqt5', 'qt5', 'plugins', 'renderplugins').lower(),
+    os.path.join('pyqt5', 'qt5', 'plugins', 'assetimporters').lower(),
+    os.path.join('pyqt5', 'qt5', 'plugins', 'renderers').lower(),
+    os.path.join('pyqt5', 'qt5', 'plugins', 'geoservices').lower(),
+    # OpenCV 自带的 Haar 分类器、示例数据等，本项目一个都用不到
+    os.path.join('cv2', 'data').lower(),
 )
 # Pillow 的图片格式扩展：本应用只读写 PNG/JPEG（截屏与保存结果）
 _PIL_UNUSED_PREFIX = ('_avif', '_webp', '_webpmux', '_imagingtk', '_fpdf')

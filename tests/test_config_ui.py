@@ -41,14 +41,8 @@ EXPECTED_API_FIELDS = {
     'youdao': ('youdao_app_id', 'youdao_api_key'),
     'bing': ('bing_api_key', 'bing_region'),
     'libretranslate': ('libretranslate_url',),
-    'llm': ('llm_base_url', 'llm_api_key', 'llm_model'),
     'edge_free': (),
     'google_free': (),
-}
-EXPECTED_OCR_FIELDS = {
-    'tesseract': ('tesseract_langs',),
-    'baidu_cloud': ('baidu_ocr_api_key', 'baidu_ocr_secret_key'),
-    'mock': (),
 }
 
 
@@ -92,8 +86,6 @@ def isolated_data_dir(tmp_path, monkeypatch):
                         lambda: os.path.join(root, 'translation_cache.json'))
     monkeypatch.setattr(app_paths, 'log_file',
                         lambda: os.path.join(root, 'screenshot_translation.log'))
-    monkeypatch.setattr(app_paths, 'ocr_resources_dir',
-                        lambda: os.path.join(root, 'resources'))
     # 翻译缓存是模块级单例，导入时就绑定了路径，只能改它的字段
     from managers import cache_manager as cache_module
     cache_module.cache_manager.cache_file = os.path.join(
@@ -123,18 +115,6 @@ def no_modal_boxes():
     yield log
     (QMessageBox.information, QMessageBox.critical,
      QMessageBox.warning) = originals
-
-
-@pytest.fixture(autouse=True)
-def restore_theme(qapp):
-    """主题切换是进程级 stylesheet，用例跑完必须还回去"""
-    from managers import styles
-
-    before = styles.current_theme()
-    yield
-    if styles.current_theme() != before:
-        styles.set_current_theme(before)
-        styles.apply_app(qapp)
 
 
 @pytest.fixture()
@@ -190,7 +170,7 @@ def test_translation_api_combo_lists_every_provider(win):
 
 
 def test_target_lang_and_fallback_defaults(win):
-    assert win.target_lang_combo.count() == 9, "目标语言应为9种"
+    assert win.target_lang_combo.count() == 2, "目标语言应为中文/英文两种"
     assert win.target_lang_combo.currentData() == 'zh'
     assert win.fallback_api_combo.count() == len(EXPECTED_API_FIELDS) + 1, \
         "降级API应为 不降级 + 每个provider 一项"
@@ -216,86 +196,50 @@ def test_switching_translation_api_builds_declared_fields(win, qapp, name):
         masked = edit.echoMode() == QLineEdit.Password
         assert masked == bool(is_password), f"{name}.{field_name} 密码遮蔽错误"
 
-    if name == 'llm':
-        assert win._api_field_edits['llm_base_url'].text(), "llm_base_url 未载入默认值"
     if name == 'libretranslate':
         assert 'libretranslate' in win._api_field_edits['libretranslate_url'].text(), \
             "libretranslate_url 未载入默认值"
-
-
-@pytest.mark.parametrize('name', sorted(EXPECTED_OCR_FIELDS))
-def test_switching_ocr_engine_builds_declared_fields(win, qapp, name):
-    from managers.ocr_providers import ocr_provider_registry
-
-    combo = win.ocr_type_combo
-    idx = combo.findData(name)
-    assert idx >= 0, f"{name} 不在 OCR 下拉框"
-    combo.setCurrentIndex(idx)
-    spin(qapp)
-
-    assert tuple(win._ocr_field_edits.keys()) == EXPECTED_OCR_FIELDS[name], \
-        f"{name} OCR 字段与 config_fields 不符"
-    assert combo.itemText(idx) == ocr_provider_registry.display_name_of(name), \
-        "OCR 显示名与 provider 声明不符"
 
 
 # ---------------------------------------------------------------- 保存与持久化
 
 
 def test_save_writes_config_and_syncs_managers(win, qapp, main_app, no_modal_boxes):
-    win.api_type_combo.setCurrentIndex(win.api_type_combo.findData('llm'))
+    win.api_type_combo.setCurrentIndex(win.api_type_combo.findData('baidu'))
     spin(qapp)
-    win._api_field_edits['llm_base_url'].setText('https://api.deepseek.com/v1')
-    win._api_field_edits['llm_model'].setText('deepseek-chat')
-    win.target_lang_combo.setCurrentIndex(win.target_lang_combo.findData('ja'))
-    win.ocr_type_combo.setCurrentIndex(win.ocr_type_combo.findData('baidu_cloud'))
-    spin(qapp)
+    win._api_field_edits['baidu_app_id'].setText('app-id-1')
+    win._api_field_edits['baidu_api_key'].setText('key-1')
+    win.target_lang_combo.setCurrentIndex(win.target_lang_combo.findData('en'))
 
     win._on_save()
 
     assert no_modal_boxes and no_modal_boxes[-1] == "保存成功", \
         f"应弹出保存成功提示: {no_modal_boxes}"
     cm = win.config_manager
-    assert cm.get_api_type() == 'llm'
-    assert cm.get_target_lang() == 'ja'
-    assert cm.get_ocr_type() == 'baidu_cloud'
-    assert cm.get_llm_base_url() == 'https://api.deepseek.com/v1'
-    assert cm.get_llm_model() == 'deepseek-chat'
+    assert cm.get_api_type() == 'baidu'
+    assert cm.get_target_lang() == 'en'
+    assert cm.get_baidu_api_info() == ('app-id-1', 'key-1')
     # 管理器要立刻跟上，不然改完设置得重启才生效
-    assert main_app.translation_manager.api_type == 'llm'
-    assert main_app.translation_manager.target_lang == 'ja'
-    assert main_app.ocr_manager.ocr_type == 'baidu_cloud'
+    assert main_app.translation_manager.api_type == 'baidu'
+    assert main_app.translation_manager.target_lang == 'en'
+    assert main_app.ocr_manager.ocr_type == 'rapidocr', \
+        "OCR 引擎应固定为本地 RapidOCR"
 
 
-def test_theme_switch_changes_real_rendering(win, qapp, main_app, no_modal_boxes):
-    from managers import styles
+def test_fixed_light_theme_without_theme_controls(win, qapp):
+    """界面固定浅色：设置页不再有主题切换，也不再带标题栏“？”按钮"""
+    from PyQt5.QtCore import Qt
 
-    assert win.theme_combo.count() == len(styles.available_themes()), "主题下拉项数量不符"
+    assert not hasattr(win, 'theme_buttons'), "设置页仍残留主题切换控件"
+    assert '#f2f4f8' in win.styleSheet(), "浅色主题未应用到设置窗口"
+    assert not (win.windowFlags() & Qt.WindowContextHelpButtonHint), \
+        "设置窗口仍带上下文帮助（？）按钮"
 
-    def panel_lightness():
-        image = win.grab().toImage()
-        return None if image.isNull() else image.pixelColor(image.width() // 2, 200).lightness()
-
-    win.theme_combo.setCurrentIndex(win.theme_combo.findData('light'))
-    spin(qapp)
-    assert styles.current_theme() == 'light', "主题未切换到浅色"
-    assert '#f2f4f8' in qapp.styleSheet(), "浅色主题未应用到全局样式"
-    light_value = panel_lightness()
-
-    win.theme_combo.setCurrentIndex(win.theme_combo.findData('dark'))
-    spin(qapp)
-    assert styles.current_theme() == 'dark'
-    dark_value = panel_lightness()
-
-    # 拿到像素就必须是真的换了色，而不是两套主题画出一样的灰
-    if light_value is not None and dark_value is not None:
-        assert light_value > 180, f"浅色主题面板仍偏暗: {light_value}"
-        assert dark_value < 120, f"深色主题面板不够暗: {dark_value}"
-
-    win.theme_combo.setCurrentIndex(win.theme_combo.findData('light'))
-    spin(qapp)
-    win._on_save()
-    assert win.config_manager.get_theme() == 'light', "主题未保存到配置"
+    image = win.grab().toImage()
+    if not image.isNull():
+        lightness = image.pixelColor(
+            image.width() // 2, 200).lightness()
+        assert lightness > 180, f"界面不是浅色: lightness={lightness}"
 
 
 def test_extension_provider_custom_fields_persist(win, qapp, main_app):
@@ -446,7 +390,7 @@ def test_failed_config_window_construction_is_not_cached(main_app, qapp, monkeyp
     spin(qapp, duration_ms=200)
     window = main_app.config_window
     assert window is not None, "失败一次之后设置窗口再也打不开"
-    assert hasattr(window, 'theme_combo'), "重开的窗口缺少界面控件"
+    assert hasattr(window, 'api_type_combo'), "重开的窗口缺少界面控件"
     assert window.isVisible(), "重开的设置窗口应显示"
     window.close()
     spin(qapp, duration_ms=50)
@@ -462,15 +406,15 @@ def test_env_secret_not_written_to_config(win, qapp, monkeypatch, tmp_path):
     from managers import app_paths
 
     env_value = 'sk-from-env-abcdef'
-    monkeypatch.setenv('LLM_API_KEY', env_value)
-    win.api_type_combo.setCurrentIndex(win.api_type_combo.findData('llm'))
+    monkeypatch.setenv('BING_API_KEY', env_value)
+    win.api_type_combo.setCurrentIndex(win.api_type_combo.findData('bing'))
     spin(qapp)
 
-    edit = win._api_field_edits['llm_api_key']
+    edit = win._api_field_edits['bing_api_key']
     assert edit.text() == env_value, "环境变量密钥应回填到界面"
     assert '环境变量' in edit.placeholderText(), \
         f"应标出值来自环境变量: {edit.placeholderText()}"
-    assert 'llm_api_key' in win._env_secret_values
+    assert 'bing_api_key' in win._env_secret_values
 
     win._save_form_fields()
     content = _config_text(app_paths.config_file())
@@ -502,13 +446,13 @@ def test_save_reports_write_failure(win, qapp, main_app, no_modal_boxes, tmp_pat
     # 父目录不存在：open 直接抛，走的正是真实失败路径
     cm.config_file = str(tmp_path / 'no-such-dir' / 'config.ini')
 
-    win.target_lang_combo.setCurrentIndex(win.target_lang_combo.findData('ja'))
+    win.target_lang_combo.setCurrentIndex(win.target_lang_combo.findData('en'))
     spin(qapp)
     win._on_save()
 
     assert no_modal_boxes and no_modal_boxes[-1] == "配置未能写入", \
         f"写盘失败应点名告警: {no_modal_boxes}"
-    assert cm.get_target_lang() == 'ja', "内存值应已生效（本次运行内可用）"
+    assert cm.get_target_lang() == 'en', "内存值应已生效（本次运行内可用）"
     assert not os.path.exists(cm.config_file)
 
 
@@ -536,8 +480,8 @@ def test_settings_combos_ignore_wheel_but_page_still_scrolls(win, qapp):
     assert control.currentIndex() != 1, "对照组滚轮未改变下拉值，事件构造无效"
     control.deleteLater()
 
-    for combo in (win.theme_combo, win.api_type_combo, win.target_lang_combo,
-                  win.fallback_api_combo, win.ocr_type_combo):
+    for combo in (win.api_type_combo, win.target_lang_combo,
+                  win.fallback_api_combo):
         before = combo.currentIndex()
         wheel_down(combo)
         assert combo.currentIndex() == before, \
@@ -550,7 +494,7 @@ def test_settings_combos_ignore_wheel_but_page_still_scrolls(win, qapp):
         vbar.setValue(0)
         spin(qapp, duration_ms=50)
         before_scroll = vbar.value()
-        wheel_down(win.theme_combo)
+        wheel_down(win.api_type_combo)
         assert vbar.value() > before_scroll, \
             f"滚轮未转交滚动区: {before_scroll} -> {vbar.value()}"
 
@@ -584,7 +528,7 @@ def test_group_titles_have_their_own_line_above_the_frame(win):
         assert title_rect.bottom() <= frame_rect.top(), \
             f"{group.title()} 标题压在内容框上: {title_rect} vs {frame_rect}"
         checked += 1
-    assert checked >= 6, f"检查到的分组太少: {checked}"
+    assert checked >= 4, f"检查到的分组太少: {checked}"
 
 
 class _StubHotkeyManager:
@@ -665,7 +609,7 @@ def test_settings_layout_is_compact_and_labels_right_aligned(win):
             f"{group.title()} 行距过大: {form.verticalSpacing()}"
         assert form.labelAlignment() & Qt.AlignRight, \
             f"{group.title()} 标签未右对齐"
-    assert group_count >= 6, f"分组数量异常: {group_count}"
+    assert group_count >= 4, f"分组数量异常: {group_count}"
 
     texts = [b.text() for b in win.findChildren(QPushButton)]
     assert '测试翻译' in texts and '保存' in texts, \
@@ -741,8 +685,18 @@ def test_overlay_toolbar_offers_three_modes_and_actions(overlay):
     toolbar = overlay._toolbar
     assert toolbar is not None, "工具条未创建"
     texts = [b.text() for b in toolbar.findChildren(QPushButton)]
-    for expect in ('原文', '双语', '译文', '复制', '钉住', '保存', '重译', '×'):
+    for expect in ('原文', '双语', '译文', '钉住', '重译', '×'):
         assert expect in texts, f"工具条缺少 {expect}: {texts}"
+    for button, tip in (
+            (toolbar.text_original_button, '提取原文到剪贴板'),
+            (toolbar.text_translated_button, '提取译文到剪贴板'),
+            (toolbar.save_original_button, '保存原图'),
+            (toolbar.save_translated_button, '保存译图'),
+            (toolbar.copy_original_image_button, '复制原图到剪贴板'),
+            (toolbar.copy_translated_image_button, '复制译图到剪贴板')):
+        assert button.toolTip() == tip, f"按钮提示不符: {button.toolTip()}"
+        assert not button.text(), "图标按钮不应再带文字"
+        assert not button.icon().isNull(), f"{tip} 图标为空"
     assert toolbar.current_mode() == rr.MODE_TRANSLATED
     assert toolbar.current_language() == 'zh'
 
@@ -988,31 +942,67 @@ def test_test_button_recovers_when_pool_rejects(win, qapp, monkeypatch):
 def test_api_type_switch_keeps_unsaved_input(win, qapp):
     """切到别的 API 类型再切回来，尚未保存的输入不能丢"""
     combo = win.api_type_combo
-    combo.setCurrentIndex(combo.findData('llm'))
+    combo.setCurrentIndex(combo.findData('libretranslate'))
     spin(qapp)
-    win._api_field_edits['llm_model'].setText('my-draft-model')
+    win._api_field_edits['libretranslate_url'].setText('https://example.test/translate')
 
     combo.setCurrentIndex(combo.findData('baidu'))
     spin(qapp)
-    combo.setCurrentIndex(combo.findData('llm'))
+    combo.setCurrentIndex(combo.findData('libretranslate'))
     spin(qapp)
-    assert win._api_field_edits['llm_model'].text() == 'my-draft-model', \
-        "切走再切回来把用户没保存的输入丢了"
+    assert win._api_field_edits['libretranslate_url'].text() == \
+        'https://example.test/translate', "切走再切回来把用户没保存的输入丢了"
 
 
-def test_ocr_type_switch_keeps_unsaved_input(win, qapp):
-    """OCR 引擎切换同理：未保存的字段值要保留"""
-    combo = win.ocr_type_combo
-    combo.setCurrentIndex(combo.findData('baidu_cloud'))
-    spin(qapp)
-    win._ocr_field_edits['baidu_ocr_api_key'].setText('draft-key')
+def test_toolbar_icon_actions_emit_kind(overlay, qapp):
+    """图标按钮要带出对象类型：原/译 各自触发对应动作"""
+    overlay.show_result(_result_payload())
+    toolbar = overlay._toolbar
+    seen = []
+    toolbar.text_copy_clicked.connect(lambda kind: seen.append(('text', kind)))
+    toolbar.image_save_clicked.connect(lambda kind: seen.append(('save', kind)))
+    toolbar.image_copy_clicked.connect(lambda kind: seen.append(('copy', kind)))
 
-    combo.setCurrentIndex(combo.findData('tesseract'))
-    spin(qapp)
-    combo.setCurrentIndex(combo.findData('baidu_cloud'))
-    spin(qapp)
-    assert win._ocr_field_edits['baidu_ocr_api_key'].text() == 'draft-key', \
-        "切走再切回来把云端 OCR 的输入丢了"
+    for button in (toolbar.text_original_button,
+                   toolbar.text_translated_button,
+                   toolbar.save_original_button,
+                   toolbar.save_translated_button,
+                   toolbar.copy_original_image_button,
+                   toolbar.copy_translated_image_button):
+        button.click()
+
+    assert seen == [
+        ('text', 'original'), ('text', 'translated'),
+        ('save', 'original'), ('save', 'translated'),
+        ('copy', 'original'), ('copy', 'translated'),
+    ], f"图标按钮未带出正确对象类型: {seen}"
+
+
+def test_toolbar_text_actions_copy_requested_kind(overlay):
+    """提取原文/译文分别复制各自整段文本"""
+    import managers.screenshot as screenshot_mod
+
+    overlay.show_result(_result_payload())
+    copied = []
+
+    class SpyClipboard:
+        @staticmethod
+        def set_text_later(text, on_done=None):
+            copied.append(text)
+            if on_done:
+                on_done(True)
+
+    real = screenshot_mod.clipboard
+    screenshot_mod.clipboard = SpyClipboard
+    try:
+        overlay._copy_text_kind('original')
+        overlay._copy_text_kind('translated')
+    finally:
+        screenshot_mod.clipboard = real
+
+    payload = _result_payload()
+    assert copied == [payload['original_text'], payload['translated_text']], \
+        f"提取的文本内容不符: {copied}"
 
 
 def test_test_translation_does_not_write_overlay(win):

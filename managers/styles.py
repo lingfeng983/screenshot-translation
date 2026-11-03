@@ -3,137 +3,49 @@
 """
 统一界面样式（QSS）
 
-内置两套主题，QSS 由调色板解析生成：
-- dark  ：深色底 + 蓝色强调（默认）
-- light ：浅色/白色底 + 蓝色强调
-
-主题选择持久化在 config.ini 的 [UI] theme，配置窗口可实时切换预览。
-使用方式：
-    styles.set_current_theme('light')
+界面固定使用浅色（白色）风格，QSS 由调色板解析生成：
     app.setStyleSheet(styles.style_sheet())
     styles.apply_to(dialog)          # 单独给某窗口应用
 
 说明：截图遮罩、结果卡片、遮罩工具条是"浮在屏幕内容之上"的深色件，
-风格独立于本主题，不随主题切换（浅色底上白色卡片会看不清）。
+颜色独立于本调色板（浅色底上白色卡片会看不清）。
 """
 
 import logging
 
 logger = logging.getLogger('screenshot-translation')
 
-# 主题标识与显示名（配置界面下拉框顺序）
-THEME_DARK = 'dark'
-THEME_LIGHT = 'light'
-DEFAULT_THEME = THEME_DARK
-
-_THEME_LABELS = (
-    (THEME_DARK, '深色'),
-    (THEME_LIGHT, '浅色（白色）'),
-)
-
-# 各主题调色板
-_PALETTES = {
-    THEME_DARK: {
-        'window_bg': '#151a23',    # 窗口底色
-        'panel_bg': '#1e2430',     # 分组面板/弹出层底色
-        'input_bg': '#262d3b',     # 输入框底色
-        'input_hover': '#2f3848',  # 输入框/按钮悬停
-        'input_pressed': '#28303e',  # 按钮按下
-        'text': '#e5eaf2',         # 主文字
-        'text_sub': '#8b95a7',     # 次要文字
-        'border': '#333d4f',       # 边框
-        'track': '#333d4f',        # 滑条轨道
-        'accent': '#3b82f6',       # 强调蓝
-        'accent_hover': '#60a5fa',
-        'accent_pressed': '#2f6fd8',
-        'danger': '#f87171',       # 需要用户处理的异常状态文字
-        'selection_text': '#ffffff',
-    },
-    THEME_LIGHT: {
-        'window_bg': '#f2f4f8',
-        'panel_bg': '#ffffff',
-        'input_bg': '#ffffff',
-        'input_hover': '#f6f8fc',
-        'input_pressed': '#eef2f8',
-        'text': '#1e2430',
-        'text_sub': '#667085',
-        'border': '#d8dee9',
-        'track': '#e2e8f0',
-        'accent': '#2563eb',
-        'accent_hover': '#1d4ed8',
-        'accent_pressed': '#1e40af',
-        'danger': '#d92d20',       # 需要用户处理的异常状态文字
-        'selection_text': '#ffffff',
-    },
+_LIGHT_PALETTE = {
+    'window_bg': '#f2f4f8',
+    'panel_bg': '#ffffff',
+    'input_bg': '#ffffff',
+    'input_hover': '#f6f8fc',
+    'input_pressed': '#eef2f8',
+    'text': '#1e2430',
+    'text_sub': '#667085',
+    'border': '#d8dee9',
+    'track': '#e2e8f0',
+    'accent': '#2563eb',
+    'accent_hover': '#1d4ed8',
+    'accent_pressed': '#1e40af',
+    'danger': '#d92d20',       # 需要用户处理的异常状态文字
+    'selection_text': '#ffffff',
 }
 
-_current_theme = DEFAULT_THEME
-
-# 兼容常量：深色主题的关键色（结果卡片标题等沿用）
-ACCENT = _PALETTES[THEME_DARK]['accent']
-ACCENT_HOVER = _PALETTES[THEME_DARK]['accent_hover']
-BG_DARK = _PALETTES[THEME_DARK]['window_bg']
-BG_PANEL = _PALETTES[THEME_DARK]['panel_bg']
-BG_INPUT = _PALETTES[THEME_DARK]['input_bg']
-TEXT_MAIN = _PALETTES[THEME_DARK]['text']
-TEXT_SUB = _PALETTES[THEME_DARK]['text_sub']
-BORDER = _PALETTES[THEME_DARK]['border']
+# 遮罩/结果卡片等深色浮层的强调色（不随浅色界面变化）
+ACCENT = '#3b82f6'
+ACCENT_HOVER = '#60a5fa'
+BG_DARK = '#151a23'
+BG_PANEL = '#1e2430'
+BG_INPUT = '#262d3b'
+TEXT_MAIN = '#e5eaf2'
+TEXT_SUB = '#8b95a7'
+BORDER = '#333d4f'
 
 
-def available_themes():
-    """可选主题列表 [(标识, 显示名), ...]，供配置界面下拉框使用"""
-    return list(_THEME_LABELS)
-
-
-def normalize_theme(name):
-    """
-    把任意输入规范成合法主题标识
-
-    Args:
-        name (str): 主题标识（大小写/空白不敏感）
-
-    Returns:
-        str: 合法主题标识；无法识别时返回默认主题
-    """
-    value = str(name or '').strip().lower()
-    return value if value in _PALETTES else DEFAULT_THEME
-
-
-def current_theme():
-    """当前生效的主题标识"""
-    return _current_theme
-
-
-def set_current_theme(name):
-    """
-    设置当前生效主题（进程级，供窗口构造时生成 QSS）
-
-    Args:
-        name (str): 主题标识
-
-    Returns:
-        str: 实际生效的主题标识
-    """
-    global _current_theme
-    normalized = normalize_theme(name)
-    if normalized != _current_theme:
-        logger.info(f"界面主题切换: {_current_theme} -> {normalized}")
-    _current_theme = normalized
-    return _current_theme
-
-
-def style_sheet(theme=None):
-    """
-    生成指定主题的 QSS
-
-    Args:
-        theme (str 或 None): 主题标识；None 用当前主题
-
-    Returns:
-        str: QSS 样式表
-    """
-    palette = _PALETTES[normalize_theme(theme or _current_theme)]
-    return _build_style_sheet(palette)
+def style_sheet():
+    """生成界面 QSS"""
+    return _build_style_sheet(_LIGHT_PALETTE)
 
 
 def _build_style_sheet(p):
@@ -321,38 +233,36 @@ QMessageBox {{ background-color: {p['window_bg']}; }}
 """
 
 
-def apply_to(widget, theme=None):
+def apply_to(widget):
     """
     把样式应用到指定窗口/对话框
 
     Args:
         widget: Qt 窗口对象
-        theme (str 或 None): 主题标识；None 用当前主题
 
     Returns:
         bool: 是否应用成功
     """
     try:
-        widget.setStyleSheet(style_sheet(theme))
+        widget.setStyleSheet(style_sheet())
         return True
     except Exception as e:
         logger.warning(f"应用样式失败: {e}")
         return False
 
 
-def apply_app(app, theme=None):
+def apply_app(app):
     """
     把样式应用到整个应用（所有窗口与弹出框共用）
 
     Args:
         app (QApplication): 应用实例
-        theme (str 或 None): 主题标识；None 用当前主题
 
     Returns:
         bool: 是否应用成功
     """
     try:
-        app.setStyleSheet(style_sheet(theme))
+        app.setStyleSheet(style_sheet())
         return True
     except Exception as e:
         logger.warning(f"应用全局样式失败: {e}")

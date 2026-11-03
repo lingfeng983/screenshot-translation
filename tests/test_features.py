@@ -598,37 +598,6 @@ def test_screenshot_overlay_multi_screen():
             time.sleep(0.02)
     print("✅ 遮罩多屏覆盖测试通过\n")
 
-def test_tesseract_no_console_window():
-    """Tesseract 子进程必须带 no-window 标志：无控制台的 exe 里否则会闪终端窗口"""
-    print("=== 测试 Tesseract 子进程不弹控制台窗口 ===")
-    import subprocess
-    import sys
-
-    from managers.ocr_providers.tesseract import (
-        _HiddenSpawnSubprocess, _no_window_flags)
-
-    calls = []
-
-    class FakeSubprocess:
-        PIPE = 'pipe-const'
-
-        def run(self, args, **kwargs):
-            calls.append(kwargs)
-            return 'ok'
-
-    proxy = _HiddenSpawnSubprocess(FakeSubprocess(), 0x08000000)
-    proxy.run(['tesseract'], stdout=proxy.PIPE)
-    assert calls and calls[0].get('creationflags') == 0x08000000, "未注入 no-window 标志"
-    assert proxy.PIPE == 'pipe-const', "常量未透传"
-
-    if sys.platform == 'win32':
-        import pytesseract
-        assert _no_window_flags() == getattr(subprocess, 'CREATE_NO_WINDOW', 0)
-        assert isinstance(pytesseract.pytesseract.subprocess, _HiddenSpawnSubprocess), \
-            "pytesseract 未被代理，打包后翻译时会闪出终端窗口"
-    print("✅ Tesseract 子进程窗口抑制测试通过\n")
-
-
 def test_result_render_layout():
     """就地覆盖排版：借用的向下空间受下一行与选区下沿约束"""
     print("=== 测试译文就地覆盖排版 ===")
@@ -766,25 +735,20 @@ def _skip(reason):
     print(f"⏭ 跳过：{reason}")
 
 
-def _tesseract_unavailable_reason():
+def _rapidocr_unavailable_reason():
     """
-    Tesseract 引擎/训练数据不可用时的原因（可用时返回 None）
+    RapidOCR 组件不可用时的原因（可用时返回 None）
 
-    本用例的价值就在于用真引擎验真像素，引擎不在时跳过而不是假装通过。
+    本用例的价值就在于用真引擎验真像素，组件不在时跳过而不是假装通过。
     """
     try:
-        from managers.ocr_providers import tesseract as tess_mod
+        from managers.ocr_providers.rapidocr import _load_engine
     except Exception as e:
-        return f"无法导入 Tesseract provider: {e}"
-    if not tess_mod.pytesseract_available:
-        return "pytesseract 未安装"
+        return f"无法导入 RapidOCR provider: {e}"
     try:
-        langs = tess_mod.TesseractProvider(None).get_available_languages()
+        _load_engine()
     except Exception as e:
-        return f"Tesseract 引擎不可用: {e}"
-    missing = {'eng', 'chi_sim'} - set(langs)
-    if missing:
-        return f"训练数据缺少 {sorted(missing)}: {langs}"
+        return f"RapidOCR 引擎不可用: {e}"
     return None
 
 
@@ -850,10 +814,11 @@ def _match_block(blocks, box):
 
 def test_inplace_cover_pixel_alignment():
     """
-    就地覆盖的像素级回归：真实渲染像素 + 真实 Tesseract + 真实绘制
+    就地覆盖的像素级回归：真实渲染像素 + 真实 RapidOCR + 真实绘制
 
     守住三件用户直接看得见的事：
-    1. 对齐：识别块相对实心字迹的偏差 ≤2px（坐标回映射漏算留白会偏到 6px）；
+    1. 框准：识别块盖住实心字迹，四边留白不超过行高的 30%（RapidOCR 检测框
+       自带一圈留白；缩放或偏移映射错了会偏到整行高度量级）；
     2. 盖住：原文的**每一个可见像素**（含抗锯齿彩边）都落在绘制出的覆盖块里，
        不能从边上露出——这是就地覆盖的底线；
     3. 外扩：大字号行的横向外扩确实放宽了（固定 2px 会在大字号上露边）。
@@ -862,7 +827,7 @@ def test_inplace_cover_pixel_alignment():
     因此可在测试套件里自动跑；引擎不在时跳过。
     """
     print("=== 测试就地覆盖的像素级对齐 ===")
-    reason = _tesseract_unavailable_reason()
+    reason = _rapidocr_unavailable_reason()
     if reason:
         _skip(reason)
         return
@@ -872,7 +837,7 @@ def test_inplace_cover_pixel_alignment():
     from PyQt5.QtWidgets import QApplication
 
     import managers.result_render as rr
-    from managers.ocr_providers.tesseract import TesseractProvider
+    from managers.ocr_providers.rapidocr import RapidOCRProvider
 
     app = QApplication.instance() or QApplication(sys.argv)  # noqa: F841
 
@@ -903,8 +868,8 @@ def test_inplace_cover_pixel_alignment():
     image = _qpixmap_to_pil(pixmap)
 
     # ---- 2. 真实引擎识别 ----
-    blocks = TesseractProvider(None).recognize_blocks(image)
-    assert blocks, "Tesseract 未识别到任何行块"
+    blocks = RapidOCRProvider(None).recognize_blocks(image)
+    assert blocks, "RapidOCR 未识别到任何行块"
 
     matched = []
     for index, (rect, text, _size, _align) in enumerate(lines):
@@ -922,10 +887,15 @@ def test_inplace_cover_pixel_alignment():
         block = _match_block(blocks, box)
         assert block is not None, \
             f"第{index}行没匹配到识别块（共识别 {len(blocks)} 块）: {text!r}"
-        dx, dy = block.left - box[0], block.top - box[1]
-        assert abs(dx) <= 2 and abs(dy) <= 2, \
-            f"第{index}行块框与字迹错位 dx={dx} dy={dy}" \
-            f"（坐标回映射漏算留白会偏离到 6px）"
+        # RapidOCR 的检测框自带一圈留白（实测约为行高的 14%），不能像 Tesseract
+        # 那样要求与实心字迹严丝合缝；这里守住"框住且不夸张"：四边都盖住字迹，
+        # 留白不超过行高的 30%——缩放或偏移映射错了会远超这个量级
+        pad_limit = max(6, int(block.height * 0.3))
+        pads = (box[0] - block.left, box[1] - block.top,
+                block.left + block.width - (box[0] + box[2]),
+                block.top + block.height - (box[1] + box[3]))
+        assert all(-1 <= pad <= pad_limit for pad in pads), \
+            f"第{index}行块框与字迹错位（四边留白 {pads}，上限 {pad_limit}px）"
         matched.append((index, block, text))
 
     # ---- 3. 真实绘制，逐像素确认原文没有露出 ----
@@ -1004,7 +974,7 @@ def test_result_render_cache():
 
 
 def test_ocr_provider_reuse():
-    """OCR provider 必须复用：每次识别新建实例会多起一个 tesseract --version 进程"""
+    """OCR provider 必须复用：每次识别新建实例都会重新加载一遍三个 ONNX 模型"""
     print("=== 测试 OCR provider 实例复用 ===")
     from managers.ocr import OCRManager
 
@@ -1020,73 +990,14 @@ def test_ocr_provider_reuse():
     print("✅ OCR provider 实例复用测试通过\n")
 
 
-def test_app_paths_ocr_component_location():
+def test_installer_has_no_ocr_download():
     """
-    OCR 组件的安装位置与运行时探测路径必须是同一个
+    识别组件已内置，安装器不再下载任何 OCR 包
 
-    安装包（scripts/setup.iss 内置下载）把 Tesseract 解压到
-    ~/.screenshot-translation/resources/，exe 不再自带这 225MB。
-    两侧路径各改一半的表现是"装完仍然没有本地识别"，所以这条耦合要钉住。
+    旧版本在装填阶段从 Release 拉 85MB 的 Tesseract 便携包；RapidOCR 模型随
+    exe 分发后这条链路必须彻底消失，否则升级用户还会多等一次下载。
     """
-    print("=== 测试 OCR 组件探测路径 ===")
-    import tempfile
-    from managers import app_paths
-
-    env_names = ('HOME', 'USERPROFILE', 'HOMEDRIVE', 'HOMEPATH')
-    saved_env = {name: os.environ.get(name) for name in env_names}
-    saved_frozen = getattr(sys, 'frozen', None)
-    saved_meipass = getattr(sys, '_MEIPASS', None)
-    saved_executable = sys.executable
-    try:
-        with tempfile.TemporaryDirectory() as home, \
-                tempfile.TemporaryDirectory() as appdir:
-            os.environ['HOME'] = home
-            os.environ['USERPROFILE'] = home
-            os.environ.pop('HOMEDRIVE', None)
-            os.environ.pop('HOMEPATH', None)
-            sys.frozen = True
-            sys._MEIPASS = os.path.join(appdir, '_internal')
-            os.makedirs(sys._MEIPASS, exist_ok=True)
-            sys.executable = os.path.join(appdir, 'ScreenshotTranslator.exe')
-
-            ocr_dir = os.path.join(home, '.screenshot-translation', 'resources')
-            assert app_paths.ocr_resources_dir() == ocr_dir
-            assert app_paths.tesseract_cmd_candidates()[0] == \
-                os.path.join(ocr_dir, 'tesseract', 'tesseract.exe'), "下载目录未排在首位"
-            assert app_paths.tessdata_candidates()[0] == \
-                os.path.join(ocr_dir, 'tessdata')
-
-            # 组件真落地时，探测函数要能命中它
-            exe = app_paths.tesseract_cmd_candidates()[0]
-            os.makedirs(os.path.dirname(exe), exist_ok=True)
-            open(exe, 'w').close()
-            from managers.ocr_providers import tesseract as tess_mod
-            assert tess_mod._find_tesseract_cmd() == exe
-    finally:
-        for name, value in saved_env.items():
-            if value is None:
-                os.environ.pop(name, None)
-            else:
-                os.environ[name] = value
-        for attr, value in (('frozen', saved_frozen), ('_MEIPASS', saved_meipass)):
-            if value is None:
-                if hasattr(sys, attr):
-                    delattr(sys, attr)
-            else:
-                setattr(sys, attr, value)
-        sys.executable = saved_executable
-
-
-def test_installer_downloads_ocr_without_external_process():
-    """
-    OCR 组件的下载必须整个交给 Setup，安装阶段不许再拉外部进程
-
-    老做法是 PrepareToInstall 里 Exec 一个 powershell 脚本，控制台窗口会弹出来、
-    进度也在那个窗口里而不是向导里。现在下载、校验、解压全在 [Files] 里声明，
-    所以钉三件事：脚本里没有任何外部进程调用、内置下载三件套齐全、
-    编译期参数（附件名/字节数/SHA256）确实由出包脚本产出并在编安装器之前产出。
-    """
-    print("=== 测试安装包内置下载 ===")
+    print("=== 测试安装器不再下载 OCR 组件 ===")
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
     def read(*parts):
@@ -1095,49 +1006,17 @@ def test_installer_downloads_ocr_without_external_process():
 
     iss = read('scripts', 'setup.iss')
     lowered = iss.lower()
+    for marker in ('ocr-components', 'shouldfetchocr', 'ocrdownloadready',
+                   'ocrresourcesdir', 'ocr-version.txt', 'myappocr', 'download'):
+        assert marker not in lowered, f"安装器仍残留 OCR 下载逻辑: {marker}"
     assert 'exec(' not in lowered, "装填阶段又去起外部进程了（会弹控制台）"
-    assert '.ps1' not in lowered and 'fetch_ocr' not in lowered
-    assert 'extracttemporaryfile' not in lowered
-
-    # Inno 7 内置下载：download 标志 + 编译期大小 + 校验值 + 归档解压
-    assert 'Flags: external download extractarchive recursesubdirs ignoreversion' in iss
-    assert 'ExternalSize: {#MyAppOcrSize}' in iss
-    assert 'Hash: "{#MyAppOcrSha}"' in iss
-    assert 'ArchiveExtraction=auto' in iss
-    # 同一标签重装不该再走一遍 85MB
-    assert 'Check: ShouldFetchOcr' in iss
-    assert 'ocr-version.txt' in iss
-
-    # 卸载/升级不能删下载下来的识别组件：Inno 覆盖安装会先跑旧版卸载程序，
-    # 在这里删就等于每次升级都重新下载 85MB（标签跳过逻辑一并失效）
-    uninstall = iss.split('[UninstallDelete]')[1]
-    uninstall = uninstall.split('\n[')[0]
-    directives = [line for line in uninstall.splitlines()
-                  if line.strip() and not line.strip().startswith(';')]
-    joined = '\n'.join(directives)
-    assert 'resources\\tesseract' not in joined, \
-        "卸载清单仍在删 tesseract，升级会重新下载组件"
-    assert 'resources\\tessdata' not in joined, \
-        "卸载清单仍在删 tessdata，升级会重新下载组件"
-    assert 'ocr-version.txt' not in joined, \
-        "卸载清单仍在删版本标记，标签跳过逻辑会失效"
-
-    packager = read('scripts', 'make_release_package.py')
-    for define in ('MyAppOcrPartName', 'MyAppOcrSize', 'MyAppOcrSha', 'MyAppOcrParts'):
-        assert f'#define {define}' in packager, f"出包脚本没写 {define}，iss 编译期拿不到"
 
     publisher = read('scripts', 'publish_release.py')
-    assemble = publisher.split('def step_assemble')[1].split('\ndef ')[0]
-    built_at = assemble.index('make_release_package.py')
-    compiled_at = assemble.index('iscc')
-    assert built_at < compiled_at, "必须先出 OCR 包再编安装器，否则校验值是上一版的"
-
-    # 就绪与否要在编译期落到输出里，并由发版脚本抓：三元组缺项时 download 条目
-    # 根本不编进去，Setup.exe 同名、编得过，只有装机勾了 OCR 才中止
-    assert '#pragma message "OCRDownloadReady=1' in iss, "iss 没打就绪哨兵"
-    assert '#pragma message "OCRDownloadReady=0' in iss, "iss 没打未就绪哨兵"
-    assert 'OCRDownloadReady=1' in assemble, "发版脚本没校验就绪哨兵"
-    assert 'capture=True' in assemble, "编译安装器没收输出，哨兵抓不到"
+    assert 'ocr-components' not in publisher, "发版脚本还在传 OCR 组件附件"
+    assert 'OCRDownloadReady' not in publisher, "发版脚本还在等 OCR 下载就绪哨兵"
+    for stale in ('setup_ocr.py', 'collect_ocr_bundle.py', 'make_release_package.py'):
+        assert not os.path.exists(os.path.join(root, 'scripts', stale)), \
+            f"OCR 下载链路脚本应已删除: {stale}"
 
 
 def test_app_paths_user_data():
@@ -1209,42 +1088,38 @@ def test_app_paths_user_data():
     print("✅ 打包态数据目录测试通过\n")
 
 
-def test_theme_system():
-    """主题系统：深色/浅色 QSS 可生成、非法值回退、配置往返"""
-    print("=== 测试主题系统 ===")
+def test_fixed_light_style_system():
+    """界面固定浅色：只生成浅色 QSS，主题配置入口已移除"""
+    print("=== 测试固定浅色样式系统 ===")
     import tempfile
     from managers import styles
     from config import ConfigManager
 
-    keys = [k for k, _ in styles.available_themes()]
-    assert keys == ['dark', 'light'], f"主题列表不符: {keys}"
-    dark_qss = styles.style_sheet('dark')
-    light_qss = styles.style_sheet('light')
-    assert dark_qss != light_qss, "两套主题 QSS 不应相同"
+    light_qss = styles.style_sheet()
+    assert '#f2f4f8' in light_qss, "浅色主题缺少窗口底色"
 
-    assert styles.set_current_theme('light') == 'light'
-    assert styles.style_sheet() == light_qss, "无参时应使用当前主题"
-    assert styles.current_theme() == 'light'
-    assert styles.set_current_theme('不存在的主题') == 'dark', "非法主题应回退默认"
-
-    # 关键控件样式必须齐备：浅色下缺样式会出现看不清的默认控件
+    # 关键控件样式必须齐备：缺样式会出现看不清的默认控件
     for selector in ('QSlider::handle:horizontal', 'QScrollBar::handle:vertical',
                      'QToolTip', 'QComboBox QAbstractItemView',
                      'QPushButton#primary', 'QGroupBox::title'):
         assert selector in light_qss, f"主题缺少控件样式: {selector}"
-        assert selector in dark_qss, f"深色主题缺少控件样式: {selector}"
+
+    # 主题切换入口已经删掉，避免界面与配置里还能改
+    for removed in ('set_current_theme', 'current_theme', 'available_themes',
+                    'normalize_theme', 'palette'):
+        assert not hasattr(styles, removed), \
+            f"样式模块仍保留主题切换入口: {removed}"
 
     with tempfile.TemporaryDirectory() as tmp:
         path = os.path.join(tmp, 'config.ini')
         cm = ConfigManager(path)
-        assert cm.get_theme() == 'dark', "新配置默认应为深色主题"
-        cm.set_theme('light')
-        assert cm.get_theme() == 'light'
-        cm.set_theme('bogus')
-        assert cm.get_theme() == 'dark', "非法主题写入后读回应回退"
-        with open(path, encoding='utf-8') as f:
-            assert '[UI]' in f.read(), "配置里未生成 [UI] 段"
-    print("✅ 主题系统测试通过\n")
+        assert not hasattr(cm, 'get_theme'), "配置里仍有主题读取入口"
+        assert not hasattr(cm, 'set_theme'), "配置里仍有主题写入入口"
+        with cm.batch():
+            cm.set_minimize_to_tray(False)
+        assert '[UI]' not in open(path, encoding='utf-8').read(), \
+            "新配置不应再生成 [UI] 主题段"
+    print("✅ 固定浅色样式系统测试通过\n")
 
 
 def test_config_batch_and_sections():
@@ -1266,13 +1141,13 @@ def test_config_batch_and_sections():
         cm._write_config = lambda: writes.append(1) or real_write()
         with cm.batch():
             cm.set_api_type('baidu')
-            cm.set_target_lang('ja')
+            cm.set_target_lang('en')
             cm.set_overlay_option('snap_threshold', '30')
         assert len(writes) == 1, f"批量上下文应只落盘一次，实际 {len(writes)}"
-        assert cm.get_api_type() == 'baidu' and cm.get_target_lang() == 'ja'
+        assert cm.get_api_type() == 'baidu' and cm.get_target_lang() == 'en'
 
         # 回归：写 OCR 选项时不得把用户调好的遮罩参数重置为默认值
-        cm.set_ocr_option('tesseract_langs', 'eng')
+        cm.set_ocr_option('rapidocr_score_threshold', '0.6')
         assert cm.get_overlay_option('snap_threshold') == '30', "写OCR选项重置了磁吸阈值"
         assert cm.get_overlay_option('dim_opacity') == '20', "写OCR选项重置了暗角透明度"
 
@@ -1386,7 +1261,7 @@ def test_ocr_notice_not_translated():
 
     assert is_ocr_notice("未识别到文字，请重新框选包含文字的区域")
     assert is_ocr_notice(
-        "[OCR识别不可用：请检查OCR引擎配置（Tesseract未安装或密钥未填写）]")
+        "[OCR识别不可用：请检查本地OCR组件是否完整]")
     assert is_ocr_notice("  未识别到文字，请重新框选包含文字的区域  ")
     assert not is_ocr_notice("Hello World")
     assert not is_ocr_notice("")
@@ -1668,18 +1543,16 @@ def test_config_defaults_in_memory():
         assert manager.get_api_type() == 'edge_free'
         assert manager.get_global_hotkey() == 'alt+z'
         assert manager.is_minimize_to_tray() is True
-        assert manager.get_ocr_type() == 'tesseract'
-        assert manager.get_ocr_option('tesseract_langs') == 'eng+chi_sim'
+        assert manager.get_ocr_option('rapidocr_score_threshold') == '0.5'
         assert manager.get_overlay_option('snap_threshold') == '12'
-        assert manager.get_theme() == 'dark'
 
         # 用户真的改了配置才写盘，重启后才能读回改动
-        manager.set_theme('light')
+        manager.set_minimize_to_tray(False)
         assert os.path.exists(path), "改动配置后应落盘"
         with open(path, encoding='utf-8') as f:
             content = f.read()
-        assert '[UI]' in content and 'theme = light' in content
-        assert ConfigManager(path).get_theme() == 'light'
+        assert '[Startup]' in content and 'minimize_to_tray = false' in content
+        assert ConfigManager(path).is_minimize_to_tray() is False
 
         # 文件存在但内容读坏了：就地修好，而不是每次启动都回退默认值
         with open(path, 'w', encoding='utf-8') as f:
@@ -1714,8 +1587,8 @@ def test_corrupt_config_repair_fills_every_key():
         with open(path, encoding='utf-8') as f:
             content = f.read()
         assert 'target_lang' in content, "已存在但残缺的段没被补默认值"
-        assert 'llm_model' in content, "半截解析让修复后的文件缺键"
-        for section in ('[Hotkey]', '[Startup]', '[UI]', '[Overlay]', '[OCR]'):
+        assert 'baidu_api_key' in content, "半截解析让修复后的文件缺键"
+        for section in ('[Hotkey]', '[Startup]', '[Overlay]', '[OCR]'):
             assert section in content, f"修复后的文件缺段: {section}"
     print("✅ 坏配置修复补齐全部键测试通过\n")
 
@@ -1739,9 +1612,9 @@ def test_batch_persist_false_writes_no_file():
         cm._write_config = counting_write
         try:
             with cm.batch(persist=False):
-                cm.set_theme('light')
+                cm.set_minimize_to_tray(False)
                 cm.set_target_lang('en')
-            assert cm.get_theme() == 'light', "内存里的值必须生效"
+            assert cm.is_minimize_to_tray() is False, "内存里的值必须生效"
             assert cm.get_target_lang() == 'en'
             assert not writes, "persist=False 仍然写盘了"
             assert not os.path.exists(path), "没保存就不该有 config.ini"
@@ -1754,11 +1627,11 @@ def test_batch_persist_false_writes_no_file():
             assert not os.path.exists(path), "没保存过就不该有 config.ini"
 
             with cm.batch():
-                cm.set_theme('dark')
+                cm.set_minimize_to_tray(True)
             assert len(writes) == 1, "真正的保存仍然要落盘"
             with open(path, encoding='utf-8') as f:
                 content = f.read()
-            assert 'theme = dark' in content
+            assert 'minimize_to_tray = true' in content
         finally:
             del cm._write_config
     print("✅ 批量上下文只改内存测试通过\n")
@@ -1773,9 +1646,9 @@ def test_write_failure_keeps_changes_pending():
     with tempfile.TemporaryDirectory() as tmp:
         path = os.path.join(tmp, 'config.ini')
         cm = ConfigManager(path)
-        cm.set_theme('dark')
+        cm.set_minimize_to_tray(False)
         before = open(path, encoding='utf-8').read()
-        assert 'theme = dark' in before
+        assert 'minimize_to_tray = false' in before
 
         real_replace = os.replace
         try:
@@ -1784,7 +1657,7 @@ def test_write_failure_keeps_changes_pending():
 
             os.replace = failing_replace
             with cm.batch():
-                cm.set_theme('light')
+                cm.set_minimize_to_tray(True)
             assert cm.write_ok is False, "失败状态没记到 write_ok"
             assert cm._pending_changes is True, "失败后不该把改动当成已落盘"
             assert open(path, encoding='utf-8').read() == before, "失败时原文件被动了"
@@ -1796,7 +1669,7 @@ def test_write_failure_keeps_changes_pending():
             with cm.batch():
                 pass
             assert cm.write_ok is True, "重试后应写成功"
-            assert 'theme = light' in open(path, encoding='utf-8').read()
+            assert 'minimize_to_tray = true' in open(path, encoding='utf-8').read()
         finally:
             os.replace = real_replace
     print("✅ 配置写盘失败语义测试通过\n")
@@ -2342,7 +2215,7 @@ def test_ocr_empty_result_shortcut():
         calls = []
 
     class FakeRegistry:
-        """假注册表：去掉 tesseract/mock 兜底，只留被测 provider"""
+        """假注册表：去掉 rapidocr/mock 兜底，只留被测 provider"""
         def __init__(self):
             self.providers = {
                 'probe_empty_local': EmptyLocalProvider,
@@ -2463,7 +2336,7 @@ def test_translation_warm_up():
     assert manager.warm_up() is True
     assert calls == [('Hello', True)], f"预热应跳过缓存真发一次请求: {calls}"
 
-    manager.api_type = 'llm'               # 付费接口不预热
+    manager.api_type = 'baidu'             # 付费接口不预热
     calls.clear()
     assert manager.warm_up() is False
     assert calls == [], "付费接口不该在启动时发起请求"
@@ -2762,6 +2635,244 @@ def test_toolbar_fit_width_reversible():
     print("✅ 工具条宽度精简可逆测试通过\n")
 
 
+def test_selection_release_starts_recognition_immediately():
+    """
+    框选松手立即识别，不再要求 Enter/双击确认
+
+    拖动调整仍然可用：结果回来后在选区边角/内部拖动，松手即按新范围重做。
+    """
+    print("=== 测试框选松手立即识别 ===")
+    from PyQt5.QtCore import QEvent, QPoint, QPointF, Qt
+    from PyQt5.QtGui import QMouseEvent
+
+    from PIL import Image
+
+    from managers.screenshot import ScreenshotWidget
+
+    _ensure_qt_app()
+    widget = ScreenshotWidget()
+    widget._snap_threshold = 0
+    widget.screen_width, widget.screen_height = 800, 600
+    widget._screen_rects = []
+    widget._snap_window_rects = []
+    widget.full_screen = Image.new('RGB', (800, 600), 'white')
+    widget._grab_scale = widget._grab_scale_y = 1.0
+    emitted = []
+    widget.region_selected.connect(lambda *args: emitted.append(args))
+    try:
+        widget.begin = QPoint(100, 100)
+        widget.end = QPoint(300, 200)
+        widget.is_selecting = True
+        release = QMouseEvent(QEvent.MouseButtonRelease, QPointF(300, 200),
+                              Qt.LeftButton, Qt.NoButton, Qt.NoModifier)
+        widget.mouseReleaseEvent(release)
+
+        assert not widget.is_selecting
+        assert emitted, "松手后没有立即发起识别"
+        image, region = emitted[0]
+        assert (region.width(), region.height()) == (200, 100), \
+            f"提交的选区尺寸不对: {region}"
+        assert image.size == (200, 100)
+        assert widget._loading, "识别请求已发出，遮罩应进入加载态"
+    finally:
+        widget.full_screen = None
+        widget.close()
+    print("✅ 框选松手立即识别测试通过\n")
+
+
+def test_result_drag_resizes_and_releases_into_new_recognition():
+    """结果态：拖边角改范围、拖内部整体移动；松手立即按新范围重新识别"""
+    print("=== 测试结果态拖拽缩放与松手重译 ===")
+    from PyQt5.QtCore import QEvent, QPoint, QPointF, QRect, Qt
+    from PyQt5.QtGui import QMouseEvent
+
+    from PIL import Image
+
+    from managers.screenshot import ScreenshotWidget
+
+    _ensure_qt_app()
+    widget = ScreenshotWidget()
+    widget._snap_threshold = 0
+    widget.screen_width, widget.screen_height = 800, 600
+    widget._screen_rects = []
+    widget._snap_window_rects = []
+    widget.full_screen = Image.new('RGB', (800, 600), 'white')
+    widget._grab_scale = widget._grab_scale_y = 1.0
+    emitted = []
+    widget.region_selected.connect(lambda *args: emitted.append(args))
+    try:
+        widget._result = {'image': None}
+        widget._result_rect = QRect(100, 100, 200, 100)
+        widget._set_selection_rect(widget._result_rect)
+        assert widget.grab() is not None, "结果态绘制失败"
+
+        # 拖右下角：宽高各自变大，左上角不动
+        start = widget._get_rect()
+        assert widget._begin_result_drag(
+            QPoint(start.right(), start.bottom())), "右下角未命中"
+        assert widget._drag_mode == 'resize'
+        widget._apply_adjust_drag(
+            QPoint(start.right() + 40, start.bottom() + 30))
+        grown = widget._get_rect()
+        assert widget._result_rect == grown, "拖动预览没有同步到结果选区"
+        assert (grown.left(), grown.top()) == (start.left(), start.top())
+        assert grown.width() > start.width() and grown.height() > start.height(), \
+            f"拖右下角没有放大选区: {start} -> {grown}"
+
+        # 拖左边：只改左沿，右沿保持
+        assert widget._begin_result_drag(
+            QPoint(grown.left(), grown.top() + 20))
+        assert 'l' in widget._resize_edges
+        widget._apply_adjust_drag(
+            QPoint(grown.left() - 25, grown.top() + 20))
+        wider = widget._get_rect()
+        assert wider.left() == grown.left() - 25, f"左沿未跟手: {wider}"
+        assert wider.right() == grown.right(), "拖左边却动了右边"
+
+        # 拖内部：整体平移
+        center = widget._get_rect().center()
+        assert widget._begin_result_drag(center), "选区内部未命中"
+        assert widget._drag_mode == 'move'
+        widget._apply_adjust_drag(center + QPoint(50, 20))
+        moved = widget._get_rect()
+        assert moved.topLeft() == wider.topLeft() + QPoint(50, 20), \
+            f"整体移动位置不对: {wider} -> {moved}"
+        assert (moved.width(), moved.height()) == (wider.width(), wider.height())
+
+        # 松手：不点任何按钮，直接按新范围重新识别
+        release = QMouseEvent(QEvent.MouseButtonRelease,
+                              QPointF(moved.right(), moved.bottom()),
+                              Qt.LeftButton, Qt.NoButton, Qt.NoModifier)
+        widget.mouseReleaseEvent(release)
+        assert widget._drag_mode is None
+        assert emitted, "拖动松手后没有发起重新识别"
+        assert emitted[-1][1] == moved, f"重识别区域不对: {emitted[-1][1]}"
+        assert widget._loading
+
+        # 拖过对边：停住而不是翻转
+        widget._loading = False
+        widget._result = {'image': None}
+        widget._result_rect = QRect(100, 100, 200, 100)
+        widget._set_selection_rect(widget._result_rect)
+        rect = widget._get_rect()
+        assert widget._begin_result_drag(
+            QPoint(rect.left(), rect.top() + 10))
+        widget._apply_adjust_drag(
+            QPoint(rect.right() + 200, rect.top() + 10))
+        flipped = widget._get_rect()
+        assert flipped.width() >= 2, f"拖过对边把选区压没了: {flipped}"
+    finally:
+        widget.full_screen = None
+        widget.close()
+    print("✅ 结果态拖拽缩放与松手重译测试通过\n")
+
+
+def test_result_click_outside_starts_new_selection():
+    """结果态点在选区外应开始新框选，而不是卡在旧选区"""
+    print("=== 测试结果态点选区外重新框选 ===")
+    from PyQt5.QtCore import QEvent, QPoint, QPointF, QRect, Qt
+    from PyQt5.QtGui import QMouseEvent
+
+    from managers.screenshot import ScreenshotWidget
+
+    _ensure_qt_app()
+    widget = ScreenshotWidget()
+    widget._snap_threshold = 0
+    widget.screen_width, widget.screen_height = 800, 600
+    widget._screen_rects = []
+    widget._snap_window_rects = []
+    try:
+        widget._result = {'image': None}
+        widget._result_rect = QRect(100, 100, 200, 100)
+        widget._set_selection_rect(widget._result_rect)
+
+        press = QMouseEvent(QEvent.MouseButtonPress, QPointF(600, 500),
+                            Qt.LeftButton, Qt.LeftButton, Qt.NoModifier)
+        widget.mousePressEvent(press)
+        assert widget.is_selecting, "点选区外后应开始新的框选"
+        assert widget.begin == QPoint(600, 500)
+    finally:
+        widget.close()
+    print("✅ 结果态点选区外重新框选测试通过\n")
+
+
+def test_copy_to_clipboard_closes_overlay():
+    """复制成功后遮罩立即收起；写入失败则留着让用户重试"""
+    print("=== 测试复制后自动关闭遮罩 ===")
+    from PyQt5.QtCore import QRect
+    from PIL import Image
+
+    import managers.screenshot as screenshot_mod
+    from managers.screenshot import ScreenshotWidget
+
+    app = _ensure_qt_app()
+    widget = ScreenshotWidget()
+    widget._snap_threshold = 0
+    widget.screen_width, widget.screen_height = 800, 600
+    widget._screen_rects = []
+    widget._snap_window_rects = []
+    widget._grab_scale = widget._grab_scale_y = 1.0
+    widget.full_screen = Image.new('RGB', (800, 600), 'white')
+    widget._result = {
+        'image': Image.new('RGB', (120, 60), 'white'),
+        'original_text': 'hello',
+        'translated_text': '你好',
+        'blocks': [],
+        'block_texts': ['hello'],
+    }
+    widget._result_rect = QRect(100, 100, 120, 60)
+    widget._set_selection_rect(widget._result_rect)
+
+    closed = []
+    widget.screenshot_canceled.connect(lambda: closed.append(True))
+
+    class SpyClipboard:
+        @staticmethod
+        def set_text_later(text, on_done=None):
+            if on_done:
+                on_done(True)
+
+        @staticmethod
+        def set_pixmap_later(pixmap, on_done=None):
+            if on_done:
+                on_done(True)
+
+    real = screenshot_mod.clipboard
+    screenshot_mod.clipboard = SpyClipboard
+    try:
+        widget._copy_text_kind('original')
+        app.processEvents()
+        assert closed, "提取原文后遮罩没有关闭"
+        assert widget.full_screen is None
+
+        # 失败时不该关：用户还看着结果，关了就没法重试
+        widget.full_screen = Image.new('RGB', (800, 600), 'white')
+        closed.clear()
+
+        class FailingClipboard(SpyClipboard):
+            @staticmethod
+            def set_pixmap_later(pixmap, on_done=None):
+                if on_done:
+                    on_done(False)
+
+        screenshot_mod.clipboard = FailingClipboard
+        widget._copy_image('original')
+        app.processEvents()
+        assert not closed, "剪贴板写入失败却关闭了遮罩"
+        assert widget.full_screen is not None
+
+        # 成功路径的图片复制同样收起遮罩
+        screenshot_mod.clipboard = SpyClipboard
+        widget._copy_image('translated')
+        app.processEvents()
+        assert closed, "复制译图后遮罩没有关闭"
+    finally:
+        screenshot_mod.clipboard = real
+        widget.full_screen = None
+        widget.close()
+    print("✅ 复制后自动关闭遮罩测试通过\n")
+
+
 def test_hotkey_unregister_when_filter_fails():
     """
     RegisterHotKey 成功后半途抛错必须把系统热键摘掉
@@ -2889,52 +3000,6 @@ def test_single_instance_closes_full_width_handle():
     print("✅ 单实例句柄释放测试通过\n")
 
 
-def test_empty_tessdata_prefix_is_not_exported():
-    """
-    没定位到 tessdata 时不能把空串写进 TESSDATA_PREFIX
-
-    空前缀会让 tesseract 去找 "/eng.traineddata"（相对当前工作目录），而
-    什么都不设时它用的是 exe 自带的默认目录——探测失败时设个空串等于把一个
-    本来能用的引擎判死。
-    """
-    print("=== 测试空的 TESSDATA_PREFIX 不导出 ===")
-    import managers.ocr_providers.tesseract as tess_mod
-
-    saved_env = os.environ.get('TESSDATA_PREFIX')
-    saved_applied = tess_mod._applied_prefix
-    probe_dir = os.path.abspath(os.path.join(os.getcwd(), 'tessdata'))
-    try:
-        os.environ.pop('TESSDATA_PREFIX', None)
-        tess_mod._applied_prefix = None
-
-        tess_mod._apply_tessdata_prefix('')
-        assert 'TESSDATA_PREFIX' not in os.environ, \
-            "空前缀不该导出（tesseract 会去找相对路径下的语言包）"
-
-        tess_mod._apply_tessdata_prefix(probe_dir)
-        assert os.environ['TESSDATA_PREFIX'] == probe_dir
-        assert tess_mod._applied_prefix == probe_dir
-
-        # 后来者没探测到：清掉我们设的那份，别让旧目录继续生效
-        tess_mod._apply_tessdata_prefix('')
-        assert 'TESSDATA_PREFIX' not in os.environ, \
-            "自己设过的前缀应在探测失败时清掉"
-
-        # 用户环境里原有的前缀不归我们动
-        os.environ['TESSDATA_PREFIX'] = 'C:\\UserOwned\\tessdata'
-        tess_mod._applied_prefix = None
-        tess_mod._apply_tessdata_prefix('')
-        assert os.environ['TESSDATA_PREFIX'] == 'C:\\UserOwned\\tessdata', \
-            "不该清掉用户自己设的前缀"
-    finally:
-        tess_mod._applied_prefix = saved_applied
-        if saved_env is None:
-            os.environ.pop('TESSDATA_PREFIX', None)
-        else:
-            os.environ['TESSDATA_PREFIX'] = saved_env
-    print("✅ 空的 TESSDATA_PREFIX 不导出测试通过\n")
-
-
 def _load_script(filename):
     """按文件路径加载 scripts/ 下的脚本模块（没有 __init__.py，不能直接 import）"""
     import importlib.util
@@ -2977,108 +3042,6 @@ def test_script_runner_discovers_every_paramless_test():
     assert run_all(started, "ok") is False
     assert ran == [], "失败后不应继续执行后续用例"
     print("✅ 脚本运行器用例发现测试通过\n")
-
-
-def test_collect_ocr_bundle_includes_config_dirs():
-    """
-    最小集要收上 tessdata/configs 与 tessdata/tessconfigs
-
-    顶层 listdir 见目录就跳，tessconfigs 一直是这么漏掉的；配置目录里还可能有
-    子目录，所以按 os.walk 收。训练工具 exe 仍然不收（60MB+）。
-    """
-    print("=== 测试OCR最小集收配置目录 ===")
-    import tempfile
-    mod = _load_script('collect_ocr_bundle.py')
-    saved_root = mod.PROJECT_ROOT
-    try:
-        with tempfile.TemporaryDirectory() as tmp:
-            tes = os.path.join(tmp, 'resources', 'tesseract')
-            data = os.path.join(tmp, 'resources', 'tessdata')
-            # 便携包把配置目录放在 exe 旁边（跟着 exe 的 tessdata/）
-            cfg = os.path.join(tes, 'tessdata', 'configs')
-            tesscfg = os.path.join(tes, 'tessdata', 'tessconfigs')
-            for path in (os.path.join(tes, 'tesseract.exe'),
-                         os.path.join(tes, 'libtesseract.dll'),
-                         os.path.join(tes, 'lstmtraining.exe'),
-                         os.path.join(cfg, 'tsv'),
-                         os.path.join(cfg, 'team', 'nested.conf'),
-                         os.path.join(tesscfg, 'std'),
-                         os.path.join(data, 'eng.traineddata'),
-                         os.path.join(data, 'chi_sim.traineddata')):
-                os.makedirs(os.path.dirname(path), exist_ok=True)
-                with open(path, 'wb') as f:
-                    f.write(b'x')
-            mod.PROJECT_ROOT = tmp
-            out = os.path.join(tmp, 'out')
-            count, _total = mod.collect(out)
-            assert count == 7, f"应收到 7 个文件（训练 exe 除外）: {count}"
-
-            def packed(*rel):
-                return os.path.isfile(os.path.join(out, *rel))
-
-            assert packed('tessdata', 'configs', 'tsv')
-            assert packed('tessdata', 'configs', 'team', 'nested.conf'), \
-                "配置目录的子目录没收（只 listdir 一层）"
-            assert packed('tessdata', 'tessconfigs', 'std'), \
-                "tessconfigs 没进包：-c 指定的老式配置名会打不开"
-            assert not packed('tesseract', 'lstmtraining.exe'), "训练工具不该进包"
-    finally:
-        mod.PROJECT_ROOT = saved_root
-    print("✅ OCR最小集配置目录测试通过\n")
-
-
-def test_publish_release_requires_ready_sentinel():
-    """
-    装进内置下载这件事必须由编译输出证明
-
-    [Files] 里的 download 条目是条件编译的：没就绪时 Setup.exe 同名、编得过，
-    只有用户装机勾了 OCR 才中止。所以脚本抓 iscc 的哨兵，缺了就中止。
-    """
-    print("=== 测试发版脚本校验内置下载哨兵 ===")
-    import tempfile
-    mod = _load_script('publish_release.py')
-    saved = (mod.PROJECT_ROOT, mod.ISCC_CANDIDATES, mod.run)
-    try:
-        with tempfile.TemporaryDirectory() as tmp:
-            for rel in ('dist/ScreenshotTranslator/app.exe',
-                        'dist/release/ocr-components.zip.001',
-                        'dist/release/ocr-components.zip.sha256',
-                        'dist/release/ocr-artifact.iss',
-                        'fake/iscc.exe'):
-                path = os.path.join(tmp, *rel.split('/'))
-                os.makedirs(os.path.dirname(path), exist_ok=True)
-                with open(path, 'wb') as f:
-                    f.write(b'x')
-            mod.PROJECT_ROOT = tmp
-            mod.ISCC_CANDIDATES = [os.path.join(tmp, 'fake', 'iscc.exe')]
-
-            calls = []
-
-            def make_run(output):
-                def _run(cmd, cwd=None, check=True, env=None, capture=False):
-                    calls.append((cmd, capture))
-                    return output
-                return _run
-
-            # 输出里没有就绪哨兵 → 中止，且不产出安装包
-            mod.run = make_run("OCRDownloadReady=0 reason=no-artifact-include")
-            try:
-                mod.step_assemble('9.9.9')
-                assert False, "内置下载没就绪时必须中止"
-            except SystemExit as e:
-                assert '内置下载' in str(e), f"中止原因应指向内置下载: {e}"
-            assert not any('iscc.exe' in c[0][-1] for c in calls[-1:]) or True
-
-            # 就绪 → 放行，并且确实把 iscc 的输出收进来了（capture=True）
-            calls.clear()
-            mod.run = make_run("Line 66: OCRDownloadReady=1 part=ocr-components.zip.001")
-            mod.step_assemble('9.9.9')
-            iscc_calls = [c for c in calls if 'iscc.exe' in c[0][0]]
-            assert len(iscc_calls) == 1, f"应调用一次 iscc: {len(iscc_calls)}"
-            assert iscc_calls[0][1] is True, "编译安装器要收输出，否则哨兵没法校验"
-    finally:
-        mod.PROJECT_ROOT, mod.ISCC_CANDIDATES, mod.run = saved
-    print("✅ 发版脚本内置下载哨兵测试通过\n")
 
 
 def test_publish_release_refuses_tag_on_other_commit():
@@ -3264,31 +3227,6 @@ def test_wait_pending_survives_concurrent_completion():
         pass
     assert not errors, f"收尾等待与完成回调并发时报错: {errors}"
     print("✅ 线程池收尾等待并发安全测试通过\n")
-
-
-def test_ocr_secret_env_override(tmp_path):
-    """云端 OCR 密钥支持环境变量注入，且不当作普通配置项读写"""
-    print("=== 测试 OCR 密钥环境变量 ===")
-    import os as _os
-
-    from config import ConfigManager
-
-    key = 'BAIDU_OCR_API_KEY'
-    saved = _os.environ.get(key)
-    try:
-        _os.environ[key] = 'env-secret'
-        cm = ConfigManager(str(tmp_path / 'config.ini'))
-        assert cm.is_env_ocr_secret('baidu_ocr_api_key') is True
-        assert cm.get_ocr_option('baidu_ocr_api_key') == 'env-secret', \
-            "读取应按环境变量优先"
-        assert cm.is_env_ocr_secret('tesseract_langs') is False, \
-            "非密钥项不该走环境变量通道"
-    finally:
-        if saved is None:
-            _os.environ.pop(key, None)
-        else:
-            _os.environ[key] = saved
-    print("✅ OCR 密钥环境变量测试通过\n")
 
 
 def test_retry_handler_zero_attempts():

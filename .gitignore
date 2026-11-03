@@ -38,13 +38,13 @@ config.ini.bak
 *.swp
 *.swo
 
+# ===== 旧版 OCR 组件残留 =====
+# v1.7.0 起本地识别改用随包的 RapidOCR 模型，这两个目录只是旧版 Tesseract 的
+# 就地残留，程序不再读取；保留忽略规则，防发版时 `git add -A` 把大文件带进去
+resources/tesseract/
+resources/tessdata/
+
 # ===== 工具本地目录 =====
 .freebuff/
 # 开发期探针脚本与目视验证截图
 scratch/
-
-# ===== 大体积二进制（走 Release 附件分发）=====
-# Tesseract 便携版主程序（约238MB）
-resources/tesseract/
-# Tessdata 语言训练数据（约65MB，eng/chi_sim）
-resources/tessdata/

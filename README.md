@@ -6,16 +6,15 @@
 
 ### 方式一：安装程序（推荐普通用户）
 从 [Releases](https://github.com/lingfeng983/screenshot-translation/releases) 下载
-`ScreenshotTranslator-Setup.exe`（约 30MB），双击安装：
+`ScreenshotTranslator-Setup.exe`（约 83MB，含离线识别模型），双击安装：
 
-1. 安装时会问你是否**下载 OCR 离线识别组件**（默认勾选，约 85MB，从同一 Release 的
-   附件取，装到 `%USERPROFILE%\.screenshot-translation\resources\`）。
-   断网/下载失败会让安装中止，重试或取消勾选即可只装程序本体
+1. 安装包已经包含 RapidOCR 的识别模型，**不再需要下载任何 OCR 组件**，
+   装完即可断网识别
 2. 装完托盘出现图标（若被折叠，点任务栏 `^` 展开并右键图标→设置常显）
 3. 按 `Alt+Z` 截图翻译
 
-> 不装 OCR 组件时，识别需改用设置里的在线 OCR（百度云等）或系统已装的 Tesseract。
-> 使用百度云OCR/LLM 等需密钥的服务时，右键托盘→设置 填入密钥。
+> 本地识别由 RapidOCR + ONNX Runtime 在程序内完成，不依赖系统安装 Tesseract；
+> OCR 引擎固定为本地 RapidOCR，设置里不再提供引擎选择。
 
 ### 方式二：源码运行（开发者）
 
@@ -31,22 +30,13 @@ pip install -r requirements.txt
 # 3. 创建本地配置（含API密钥，不入库）
 copy config.example.ini config.ini
 
-# 4. 下载 OCR 组件（Tesseract 运行最小集，约85MB，不入仓库，走 Release 附件）
-python scripts/setup_ocr.py               # 默认取最新 Release；固定版本用 --release v1.5.0
-
-# 5. 启动
+# 4. 启动
 python main.py
 ```
 
-> **OCR 组件分发方式**：仓库只保留源码；Tesseract 运行最小集（约 85MB）以
-> `ocr-components.zip.00N` 附件形式发布在 GitHub [Releases](https://github.com/lingfeng983/screenshot-translation/releases)。
-> 源码端 `python scripts/setup_ocr.py` 下载、SHA256 校验并解压到 `resources/`——
-> 不带参数取最新 Release（`latest/download` 跳转），需要固定版本给 `--release <标签>`；
-> 离线环境可用 `python scripts/setup_ocr.py --local <分卷目录>`。
-> 安装程序走的是同一批附件，由 Setup 自己下载校验并解压到用户数据目录，
-> 全程不起外部进程（所以不会弹控制台窗口）。
-> 维护者更新组件后运行 `python scripts/collect_ocr_bundle.py` +
-> `python scripts/make_release_package.py` 重新打包（包名固定，勿加日期）。
+> **离线识别说明**：RapidOCR 的 PP-OCRv6 模型（约 30MB）随 `rapidocr` 依赖一起装好，
+> 在程序进程内经 ONNX Runtime 推理，源码态与安装包都不需要额外下载识别组件，
+> 也不需要系统装 Tesseract。模型文件缺失时会提示本地 OCR 组件不完整。
 
 ### 启动程序
 ```bash
@@ -78,16 +68,20 @@ python main.py
 2. 按下的瞬间整屏就被**冻结成一张快照**（视频、时钟、进度条都停在那一刻，框选和看译文时都不会再动，框到的画面与最终识别的就是同一帧）；
    **多显示器时整张虚拟桌面一起冻结、一起覆盖**，副屏上的内容也能直接框选
 3. 在屏幕上拖拽选择要翻译的区域（选区会自动磁吸对齐到附近窗口边缘与屏幕边，蓝色虚线指示吸附目标）
-4. 程序自动进行OCR识别和翻译，遮罩保持不关闭，选区内显示"识别并翻译中…"
+4. **松开鼠标立即开始识别**（不需要二次确认）；遮罩保持不关闭，选区内显示"识别并翻译中…"
 5. 译文就地覆盖回原文位置（取原文周围的背景色填底、按块高自动缩字），遮罩不关闭
-6. 选区下方浮动工具条可切换 **原文 / 双语 / 译文** 三态、换目标语言重译、复制、钉住、保存、关闭
-7. 鼠标悬停或单击选区内的段落，会在下方气泡卡片里显示该段原文与译文（Ctrl+C 只复制该段）
-8. 行级坐标不可用时（OCR 引擎不支持或译文行数对不齐）自动降级为整段气泡卡片展示
+6. 结果出来后选区四角/四边仍可拖动调整范围（按住选区内部可整体平移）：**松开鼠标即按新范围
+   重新识别翻译**，边调边看，不用退出重来
+7. 选区下方浮动工具条可切换 **原文 / 双语 / 译文** 三态、换目标语言重译，
+   还有六个图标按钮：**提取原文/译文文本到剪贴板**、**保存原图/译图**、**复制原图/译图到剪贴板**，
+   以及钉住、重译、关闭；**提取或复制到剪贴板成功后遮罩自动关闭**
+8. 鼠标悬停或单击选区内的段落，会在下方气泡卡片里显示该段原文与译文（Ctrl+C 只复制该段）
+9. 行级坐标不可用时（OCR 引擎不支持或译文行数对不齐）自动降级为整段气泡卡片展示
 
 多显示器说明：各屏缩放比例一致时覆盖全部显示器（副屏在主屏左侧/上方也行）；
 缩放比例不一致（混合 DPI）时只覆盖主屏，因为单一缩放系数无法把坐标换算准确。
 
-遮罩内快捷键：`ESC` 退出、`Enter` 确认选区、`T`/`1`/`2`/`3` 切换展示模式、`Ctrl+C` 复制、
+遮罩内快捷键：`ESC` 退出、`T`/`1`/`2`/`3` 切换展示模式、`Ctrl+C` 复制、
 `Ctrl+S` 保存结果图、`P` 钉屏、`R` 失败后重试；结果态下再按一次截图热键等同于取消。
 钉住的窗口支持拖动、滚轮缩放、双击关闭、`Ctrl+C` 复制图片。
 
@@ -101,22 +95,21 @@ python main.py
 - **必应翻译** - 需要 API 密钥
 - **百度翻译** - 需要 应用ID + API密钥
 - **有道翻译** - 需要 应用ID + API密钥
-- **大模型(LLM)** - 任意 OpenAI 兼容接口（OpenAI / DeepSeek / 通义千问 / Kimi / 本地 Ollama 等），填入 API地址、密钥与模型名即可；本地 Ollama 可不填密钥（地址如 `http://localhost:11434/v1`）
 
 还可配置：
-- **目标语言** - 中文/繁体/英/日/韩/法/德/西/俄
+- **目标语言** - 中文 / 英语
 - **降级API** - 主API失败后自动切换的备用API；整条降级链的最后会依次兜底尝试 Edge 免费翻译、谷歌免费翻译
 - **测试翻译** - 保存前先验证当前API配置是否可用（后台线程执行，不会卡住设置窗口）
-- **界面主题** - 深色（默认）/ 浅色（白色）两套主题，切换立即预览，保存后长期生效
 - **截图遮罩** - 磁吸阈值（`snap_threshold`，0~48px，选区吸附窗口边缘的距离）与暗角透明度（`dim_opacity`，0~180），滑条调节，下次截图生效
 
-### OCR引擎设置
-支持多种识别引擎（配置窗口中可切换）：
-- **Tesseract(本地)** (默认) - 本地离线识别，免费，需安装Tesseract（项目已内置便携版探测逻辑）
-- **百度云OCR(在线)** - 中文识别效果更佳，每月有免费额度，需注册获取API Key
-- **模拟OCR(降级)** - 引擎不可用时的兜底，返回提示文本
+### OCR识别
+识别引擎**固定为本地 RapidOCR**，代码里写死，设置窗口不再提供引擎选择：
+- 内置 PP-OCRv6 检测/识别/方向分类模型，经 ONNX Runtime 在进程内推理
+- 完全离线、免费，无需填入任何密钥，也不用安装外部 OCR 程序
+- 识别阈值可在 `config.ini` 的 `[OCR] rapidocr_score_threshold` 调整（默认 0.5）
+- `mock` 模拟引擎仅作为程序内部的兜底保留（组件异常时返回提示文本），用户无需关心
 
-扩展新的OCR引擎与翻译API方式相同：在 `managers/ocr_providers/` 下新建定义了 `register(registry)` 的模块即可。
+扩展新的OCR引擎与翻译API方式相同：在 `managers/ocr_providers/` 下新建定义了 `register(registry)` 的模块即可（不影响默认走本地 RapidOCR）。
 
 ### 扩展新的翻译API（开发者）
 翻译模块基于 provider 插件架构，新增翻译服务只需两步：
@@ -143,17 +136,9 @@ def register(registry):
 
 程序启动时自动发现并注册，配置窗口会自动出现"我的翻译"选项及其字段，无需修改任何其他代码。
 
-### 界面主题
-设置窗口顶部“外观”分组可选择主题：
-
-| 主题 | 底色 | 说明 |
-|---|---|---|
-| `dark` 深色（默认） | 深蓝灰 | 原视觉风格，深夜/暗色环境不刺眼 |
-| `light` 浅色（白色） | 浅灰白 | 白色面板，白天或投影场景更清晰 |
-
-切换后**立即预览**（整个应用即时换肤），点“保存”后写入配置长期生效；
-配置项为 `[UI] theme`，旧配置文件启动时自动补齐。截图遮罩、结果卡片与
-遮罩工具条是浮在屏幕内容之上的深色元素，风格独立，不随主题变化（白底卡片在亮屏幕上会看不清）。
+### 界面风格
+界面固定使用**浅色（白色）**风格，不再提供主题切换。截图遮罩、结果卡片与
+遮罩工具条是浮在屏幕内容之上的深色元素，风格独立（白底卡片在亮屏幕上会看不清）。
 
 ### 快捷键设置
 可在配置面板中自定义全局快捷键。快捷键分组里有一行实时状态：注册成功会写明走
@@ -178,11 +163,11 @@ set ST_ALLOW_MULTI_INSTANCE=1 && python main.py
 ### 常见问题及解决方案
 
 #### 1. OCR功能不可用
-**现象**: 显示"使用模拟OCR识别"
-**原因**: pytesseract库或Tesseract OCR未正确安装
-**解决**: 
-- 安装Tesseract OCR: https://github.com/UB-Mannheim/tesseract/wiki
-- 确保tesseract.exe在系统PATH中
+**现象**: 选区内提示"[OCR识别不可用：请检查本地OCR组件是否完整]"
+**原因**: 本地识别组件缺失/损坏（极少见），通常是 `rapidocr` 或 ONNX Runtime 安装不完整
+**解决**:
+- 重装安装包（模型随包分发）；源码运行则 `pip install -r requirements.txt` 重装依赖
+- 仍失败时查看日志里的具体异常（源码运行在项目根，打包运行在 `%USERPROFILE%\.screenshot-translation\`）
 
 #### 2. 快捷键不生效
 **现象**: 按快捷键无反应或过一段时间才失效
@@ -222,8 +207,9 @@ set ST_ALLOW_MULTI_INSTANCE=1 && python main.py
 
 ### 运行环境要求
 - **操作系统**: Windows 10/11
-- **Python版本**: 3.7+
-- **必需依赖**: PyQt5, Pillow, pyautogui, requests, pystray, keyboard
+- **Python版本**: 3.10+（当前发布包用 3.14 构建）
+- **必需依赖**: PyQt5, Pillow, rapidocr, onnxruntime, numpy, opencv-python-headless,
+  requests, pystray, keyboard
 
 ### 目录结构
 ```
@@ -238,10 +224,9 @@ ScreenshotTranslation/
 ├── screenshot-translator.spec  # PyInstaller onedir 打包配置（含依赖裁剪）
 ├── scripts/
 │   ├── publish_release.py       # 一条命令出包＋发版（测试→构建→Setup→发 Release）
-│   ├── setup.iss                # Inno Setup 7 安装脚本（OCR 组件由 Setup 内置下载）
-│   ├── collect_ocr_bundle.py    # 抽出 Tesseract 运行最小集 → dist/ocr-bundle
-│   ├── make_release_package.py  # OCR组件分卷打包（上传Release用，并写 ocr-artifact.iss）
-│   └── setup_ocr.py             # 从Release下载恢复OCR组件（源码态/手工补装）
+│   ├── setup.iss                # Inno Setup 7 安装脚本（OCR 模型已随包，不再下载）
+│   ├── rt_preload_onnx.py       # PyInstaller 运行时钩子：先导入 onnxruntime 再加载 Qt
+│   └── pyi_preload/             # 构建期隔离子进程的 sitecustomize（同一导入顺序约束）
 ├── tests/                   # pytest 回归测试（从项目根直接 python -m pytest tests/）
 │   ├── conftest.py                  # 共用装置：sys.path、会话级 QApplication、online/smoke 标记
 │   ├── _runner.py                   # 脚本运行器的用例发现（python tests/test_xxx.py 时走它）
@@ -256,12 +241,13 @@ ScreenshotTranslation/
 │   ├── single_instance.py   # ★ 命名互斥体单实例守卫（重复启动时提示并退出）
 │   ├── translation.py       # 翻译管理器（分发/缓存/降级链）
 │   ├── ocr.py               # OCR管理器（分发/重试/降级）
-│   ├── screenshot.py        # 截图遮罩（磁吸/气泡/角标记）+ 就地译文结果态
+│   ├── screenshot.py        # 截图遮罩（磁吸/气泡/角标记/结果态拖动调整选区）+ 就地译文结果态
 │   ├── result_render.py     # ★ 结果渲染（行块贴图覆盖/气泡卡片/裁剪合成）
 │   ├── text_block.py        # ★ OCR行块模型 + 段落聚合（悬停/选块依据）
-│   ├── overlay_toolbar.py   # ★ 选区浮动工具条（三态/语言/复制/钉住/保存）
+│   ├── overlay_toolbar.py   # ★ 选区浮动工具条（三态/语言/六个图标操作/钉住/重译/关闭）
+│   ├── vector_icons.py      # ★ 程序化矢量图标（提取/保存/复制 + 原/译角标）
 │   ├── pin_window.py        # ★ 结果钉屏浮窗（可多开、置顶）
-│   ├── styles.py            # ★ 双主题QSS（深色/浅色，调色板驱动，支持实时预览）
+│   ├── styles.py            # ★ 浅色 QSS（调色板驱动）
 │   ├── icon.py              # 程序化图标生成
 │   ├── window_enum.py       # Win32可见窗口枚举（磁吸数据源）
 │   ├── cache_manager.py     # 翻译缓存（持久化/LRU）
@@ -273,15 +259,13 @@ ScreenshotTranslation/
 │   │   ├── edge_free.py     #   Edge免费翻译（微软翻译，国内可直连，默认）
 │   │   ├── google_free.py   #   谷歌免费翻译（Copyfish同款）
 │   │   ├── libretranslate.py / bing.py / baidu.py / youdao.py
-│   │   └── llm.py           #   大模型翻译（OpenAI兼容）
 │   └── ocr_providers/       # OCR引擎插件目录（扩展放这里）
 │       ├── base.py          #   OCR基类（继承公共基座）
-│       ├── tesseract.py     #   本地Tesseract（默认，含图像预处理）
-│       ├── baidu_cloud.py   #   百度云OCR（在线，云引擎扩展示例）
-│       └── mock.py          #   模拟OCR（兜底降级）
+│       ├── rapidocr.py      #   本地RapidOCR（固定使用，ONNX Runtime 进程内推理）
+│       └── mock.py          #   模拟OCR（组件异常时内部兜底）
 └── resources/
     ├── icon.png / icon.ico  # 程序图标（构建时自动生成）
-    └── tessdata/            # OCR语言数据
+    └── config 等只读资源
 ```
 
 ### 插件架构一览
@@ -297,38 +281,28 @@ ScreenshotTranslation/
 
 ### 打包（onedir + 安装包）
 ```powershell
-# 1. 打包程序本体（不含 OCR，整个目录约 73MB）
+# 1. 打包程序本体（含 RapidOCR 模型与 ONNX Runtime，整个目录约 248MB）
 #    ST_VERSION 会被写进 exe 的 Windows 版本资源（右键属性看得到）；不给就没有版本信息
 #    环境变量按你的 shell 给：PowerShell 用 $env:，cmd 用 set，Bash 才用 VAR=值 前缀
-$env:ST_VERSION = "1.3.0"      # cmd: set ST_VERSION=1.3.0
+$env:ST_VERSION = "1.7.0"      # cmd: set ST_VERSION=1.7.0
 python -m PyInstaller screenshot-translator.spec --noconfirm
 
-# 2. 出 OCR 组件附件（安装时要从 GitHub Release 拉它）
-python scripts/collect_ocr_bundle.py      # → dist/ocr-bundle（约225MB）
-python scripts/make_release_package.py    # → dist/release/ocr-components.zip.001 + .sha256（约85MB）
-                                          #   同时写 ocr-artifact.iss：安装脚本编译期要的
-                                          #   附件名/字节数/SHA256，所以这一步必须在第 3 步之前
-
-# 3. 编译安装器（先把 dist/ScreenshotTranslator/ 拷进 release/onedir/）
-iscc.exe /DMyAppVersion=1.3.0 /DMyAppOcrTag=v1.3.0 scripts\setup.iss
-# 产物：release/ScreenshotTranslator-Setup.exe（约30MB，唯一对外分发包）
-# 输出里的 `OCRDownloadReady=1 part=...` 表示内置下载真编进去了；
-# 打成 `OCRDownloadReady=0 reason=...` 时安装包同名但勾了 OCR 就会中止，
-# publish_release.py 抓这行，未就绪直接中止发版
+# 2. 编译安装器（先把 dist/ScreenshotTranslator/ 的内容拷进 release/onedir/）
+iscc.exe /DMyAppVersion=1.7.0 scripts\setup.iss
+# 产物：release/ScreenshotTranslator-Setup.exe（约 83MB，唯一对外分发包）
 ```
-> 上面三步 `python scripts/publish_release.py --version 1.3.0` 一条命令串完，
-> 顺带提交、打 tag、发 Release。编译安装脚本需要 Inno Setup 7（内置下载是 7 的能力）。
+> 上面两步 `python scripts/publish_release.py --version 1.7.0` 一条命令串完，
+> 顺带提交、打 tag、发 Release。编译安装脚本需要 Inno Setup 7。
 
-Tesseract **不再打进 exe**：安装程序在装填阶段由 Setup 自己从 GitHub Release 附件下载
-`ocr-components.zip.001`，SHA256 由 Setup 校验、解压到
-`%USERPROFILE%\.screenshot-translation\resources\`，进度就在向导里，不起外部进程所以
-不会弹控制台窗口。同一标签已装过则跳过下载（靠 `ocr-version.txt` 标记）。
-**卸载不会删除**这批组件（它们装在用户目录、由所有版本共用；卸载时删掉会让每次
-覆盖升级都重新下载 85MB），需要清理时手工删除 `%USERPROFILE%\.screenshot-translation\resources\`。
-代价是安装时要联网，好处是安装包从 105MB 降到 30MB，225MB 的二进制不跟着每个包跑。
+RapidOCR 的 PP-OCRv6 检测/识别/方向分类模型（约 30MB）与 ONNX Runtime 都打进
+`_internal/`，安装时不再下载任何组件、也不需要系统装 Tesseract：装完即可断网识别。
+安装器用 `lzma2/ultra64` 压缩换取更小的下载体积（248MB 目录 → 约 83MB 安装包）。
 
-打包时自动裁剪无用依赖：Qt 的 QML/场景图/Vulkan 插件与翻译文件、PIL 的
-`_avif/_webp/_imagingtk` 等扩展。
+打包时自动裁剪无用依赖：Qt 的 QML/场景图/Vulkan/ANGLE 与翻译文件、PIL 的
+`_avif/_webp/_imagingtk` 等扩展、OpenCV 的视频后端与示例数据、RapidOCR 的
+Paddle/PyTorch/OpenVINO/MNN 分支。另外本机组合（Python 3.14 + PyQt5 + onnxruntime）
+存在导入顺序约束：onnxruntime 必须先于 Qt 加载，`main.py`、`scripts/rt_preload_onnx.py`
+与 `scripts/pyi_preload/sitecustomize.py` 分别覆盖源码、冻结进程、构建子进程三种场景。
 
 exe 启动即加载本目录下的 `_internal`，不再解包到临时目录。可写文件统一落在
 `%USERPROFILE%\.screenshot-translation\`（`config.ini`、`translation_cache.json`、

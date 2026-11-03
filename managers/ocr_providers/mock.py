@@ -3,7 +3,7 @@
 """
 模拟 OCR 提供者（兜底降级用）
 
-当配置的OCR引擎不可用（如未安装Tesseract、密钥未填）时，
+当配置的OCR引擎不可用（如本地组件缺失、密钥未填）时，
 返回明确的提示文本而不是抛异常，保证截图流程不中断。
 """
 
@@ -32,7 +32,7 @@ class MockOCRProvider(OCRProvider):
             str: 提示文本
         """
         logger.warning("使用模拟OCR识别")
-        text = "[OCR识别不可用：请检查OCR引擎配置（Tesseract未安装或密钥未填写）]"
+        text = "[OCR识别不可用：请检查OCR引擎配置（本地OCR组件不可用或密钥未填写）]"
         logger.info(f"模拟OCR识别结果: {text}")
         return text
 

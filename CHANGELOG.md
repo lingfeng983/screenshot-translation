@@ -2,9 +2,72 @@
 
 所有显著改动记录于此。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
-## [Unreleased]
+## [v1.7.0] — 2026-11-03
+
+### 新增
+- **本地 OCR 换成 RapidOCR（ONNX Runtime 进程内推理）**：内置 PP-OCRv6 检测/识别/
+  方向分类模型（约 30MB），装完即可断网识别，不再依赖系统安装 Tesseract，也不需要
+  安装时额外下载组件。新 provider 返回行级四点坐标供就地覆盖；置信度阈值进入配置
+  （`rapidocr_score_threshold`，默认 0.5），低于阈值的误检行不送翻译；引擎懒加载并
+  复用单例，构造与推理各加锁串行化（`managers/ocr_providers/rapidocr.py`）
+- **安装包自带识别模型**：`screenshot-translator.spec` 收集 `rapidocr` 的模型与默认
+  配置，安装器只装 onedir 本体；Setup 从"联网下载 85MB 组件"变成离线安装
+  （`scripts/setup.iss`）
+- **结果态继续拖动调整选区**：框选松开鼠标立即开始 OCR 与翻译，不再需要二次确认；
+  结果出来后选区四角/四边仍显示手柄，拖动时预览冻结画面，**松开鼠标即按新范围重新
+  识别翻译**；按住内部可整体平移，拖过对边会停住不翻转，点击选区外开始新框选，
+  宽度不足 2px 的误触恢复原范围（`managers/screenshot.py`）
+- **工具条新增六个图标操作**：提取原文/译文文本到剪贴板、保存原图/译图、复制原图/译图
+  到剪贴板；图标为程序化矢量图（文档/软盘/双页），右下角用透明底白字区分"原/译"，
+  按钮无文字、带完整悬停提示与无障碍名，窄屏时按优先级自动折叠
+  （`managers/overlay_toolbar.py`、`managers/vector_icons.py`）
+- **复制成功自动关闭遮罩**：提取原文/译文、复制原图/译图（含 Ctrl+C 复制结果）写入
+  剪贴板成功后遮罩立即收起；写入失败时保持打开，方便重试（`managers/screenshot.py`）
+
+### 变更
+- **界面固定浅色，移除主题设置**：删除设置页“外观”分组与太阳/月亮图标、
+  `[UI] theme` 配置项及其迁移逻辑、双主题 QSS 与主题 API；启动即应用统一的
+  浅色调色板（`main.py`、`managers/styles.py`、`config.py`、`config.example.ini`）
+- **OCR 引擎固定为本地 RapidOCR**：移除设置页的引擎选择与服务/密钥输入框，
+  `OCRManager` 写死 `rapidocr`；`mock` 仅作组件异常时内部兜底，不再对用户暴露
+  （`main.py`、`managers/ocr.py`、`config.py`、`config.example.ini`）
+- **目标语言收窄为中文 / 英语**：语言表、微软语种映射与配置迁移同步收敛，
+  旧配置里的其它目标语言启动时归位到 `zh`（`managers/providers/base.py`、`config.py`）
+- **旧配置自动迁移**：`ocr_type=tesseract` 改为 `rapidocr`，移除已无实现的
+  `tesseract_langs` 与 `llm_*` 配置，补齐 `rapidocr_score_threshold`
+  （`config.py`）
+- **打包裁剪**：恢复收集 numpy（OCR 必需），移除 OpenCV 视频后端（约 29MB）与
+  示例数据、Qt 的 ANGLE/软件 OpenGL/数据库/SVG/TIFF/WebP 组件，显式排除
+  Paddle/PyTorch/OpenVINO/MNN 分支与 pyOpenSSL 相关依赖；安装器改用
+  `lzma2/ultra64` 压缩。实测 onedir 约 248MB、Setup.exe 约 83MB
+  （`screenshot-translator.spec`、`scripts/setup.iss`）
+- **依赖清单更新**：去掉 pytesseract/pyautogui/pygetwindow/pyrect，加入
+  rapidocr/onnxruntime/opencv-python-headless/numpy（`requirements.txt`）
+
+### 移除
+- **设置窗口右上角的“？”按钮**：去掉 `Qt.WindowContextHelpButtonHint`，
+  标题栏只保留最小化/关闭（`main.py`）
+- **大模型（LLM）翻译**：删除 provider、配置项与界面映射，翻译链路只保留
+  Edge/谷歌/LibreTranslate/必应/百度/有道（`managers/providers/llm.py` 等）
+- **Tesseract 及其下载链路**：删除本地 provider、`setup_ocr.py`、
+  `collect_ocr_bundle.py`、`make_release_package.py`，安装器的下载任务/校验解压
+  逻辑与发版脚本的 OCR 附件上传、就绪哨兵一并移除；发版只上传 Setup.exe
+  （`scripts/publish_release.py`、`managers/app_paths.py`）
+- **百度云 OCR provider**：删除 `managers/ocr_providers/baidu_cloud.py` 与配置项、
+  界面映射和环境变量读取，OCR 注册表收敛为 `rapidocr` + 内部 `mock`
+  （`tests/test_ocr_providers.py` 同步改为只覆盖本地引擎）
 
 ### 修复
+- **PyQt5 之后导入 onnxruntime 会让进程直接消失**：本机组合（Python 3.14 +
+  PyQt5 5.15.10 + onnxruntime 1.31）先加载 QtCore 再导入 onnxruntime 会在模块
+  初始化阶段访问冲突，既让全量测试中途崩掉，也让 PyInstaller 的隔离导入子进程
+  与冻结后的 exe 无法启动。现在源码入口、冻结进程运行时钩子、构建期隔离子进程三处
+  都保证 onnxruntime 先于 Qt 加载（`main.py`、`scripts/rt_preload_onnx.py`、
+  `scripts/pyi_preload/sitecustomize.py`、`screenshot-translator.spec`）
+- 回归测试改为适配 RapidOCR 的 `boxes/txts/scores` 返回对象（假引擎覆盖行块、
+  阈值过滤、BGR 通道与空结果定案）；就地覆盖的像素对齐断言改为"检测框须盖住
+  字迹且四边留白不超过行高 30%"——RapidOCR 检测框自带约 14% 留白，原先按
+  Tesseract 紧框定的 ±2px 不再适用；新增断言安装器与发版脚本不再残留 OCR 下载链
 - **发版脚本把构建日志写到 stderr，自动化会把成功判成失败**：PyInstaller/iscc 的
   进度与 INFO 日志都在 stderr，调用方常整条命令 `2>&1`（PowerShell 会把 stderr
   变成错误记录），v1.6.0 发版实测跑完仍被报成 `exit code 1`。`run()` 现在把子进程

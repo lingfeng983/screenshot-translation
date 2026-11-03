@@ -12,7 +12,7 @@ import threading
 import time
 
 from PIL import ImageGrab
-from PyQt5.QtCore import Qt, QRect, QPoint, pyqtSignal
+from PyQt5.QtCore import Qt, QRect, QPoint, QTimer, pyqtSignal
 from PyQt5.QtGui import QPainter, QPen, QColor, QCursor, QPixmap
 from PyQt5.QtWidgets import QApplication, QWidget
 
@@ -634,6 +634,11 @@ class ScreenshotWidget(QWidget):
         self.begin = QPoint()
         self.end = QPoint()
         self.is_selecting = False
+        # 结果态下拖动边/角调整选区用；松手立即重新识别翻译
+        self._drag_mode = None          # 'move' / 'resize' / None
+        self._resize_edges = frozenset()
+        self._drag_origin = QPoint()
+        self._drag_start_rect = QRect()
         # 全屏截图背景，初始化失败时保持为None，供后续判空
         self.full_screen = None
         # 冻结整屏的位图（抓拍失败时为None）；遮罩全程画它，不再透出实时桌面
@@ -788,6 +793,11 @@ class ScreenshotWidget(QWidget):
     _DEFAULT_DIM_OPACITY = 90                 # 暗角透明度 (0~180)
     _DEFAULT_SNAP_THRESHOLD = 12              # 磁吸阈值（像素）
 
+    # 小于该宽/高的选区视为误触（单击或抖动）
+    _MIN_SELECT_EDGE = 10
+    # 结果态拖动时边/角的命中范围（像素）
+    _HANDLE_HIT = 10
+
     def paintEvent(self, event):
         """
         绘制事件：柔和暗角 + 蓝色发光选区 + 角标记 + 尺寸气泡，
@@ -822,6 +832,7 @@ class ScreenshotWidget(QWidget):
         dim_color = QColor(0, 0, 0, self._dim_opacity)
         painter.fillRect(self.rect(), dim_color)
 
+        # 框选拖拽中画选区（此时还没有结果可展示）
         if (self._loading or self._error or self._result is not None) \
                 and not self.is_selecting:
             self._draw_result(painter)
@@ -955,6 +966,23 @@ class ScreenshotWidget(QWidget):
         painter.drawLine(x2 - length, y2, x2, y2)
         painter.drawLine(x2, y2 - length, x2, y2)
 
+    def _draw_handles(self, painter, rect):
+        """结果态的可拖拽把手：四角与四边中点各一个小方块"""
+        size = 7
+        half = size // 2
+        points = [
+            rect.topLeft(), rect.topRight(), rect.bottomLeft(), rect.bottomRight(),
+            QPoint(rect.center().x(), rect.top()),
+            QPoint(rect.center().x(), rect.bottom()),
+            QPoint(rect.left(), rect.center().y()),
+            QPoint(rect.right(), rect.center().y()),
+        ]
+        painter.setPen(QPen(QColor(255, 255, 255, 230), 1))
+        painter.setBrush(QColor(self._ACCENT))
+        for point in points:
+            painter.drawRect(QRect(point.x() - half, point.y() - half, size, size))
+        painter.setBrush(Qt.NoBrush)
+
     def _draw_snap_guides(self, painter, rect):
         """吸附激活时绘制蓝色虚线参考线，提示当前吸附目标"""
         guides = getattr(self, '_active_snap_lines', None)
@@ -1068,12 +1096,19 @@ class ScreenshotWidget(QWidget):
 
         return new_rect, x_guides + y_guides
 
-    def _draw_size_bubble(self, painter, rect):
+    def _draw_size_bubble(self, painter, rect, hint=''):
         """
         尺寸提示气泡：优先放在选区上方居中，空间不足自动翻转到下方，
         并夹取在屏幕范围内不出界
+
+        Args:
+            painter (QPainter): 当前绘制器
+            rect (QRect): 选区（逻辑坐标）
+            hint (str): 追加在尺寸后面的操作提示（结果态拖动时用）
         """
         text = f"{rect.width()} × {rect.height()}"
+        if hint:
+            text = f"{text}   {hint}"
         font = painter.font()
         font.setPointSize(10)
         painter.setFont(font)
@@ -1207,6 +1242,14 @@ class ScreenshotWidget(QWidget):
         rect = self._result_rect
         if rect is None:
             return
+        if self._drag_mode in ('move', 'resize'):
+            # 拖动调整中：只预览新的选区范围（底图取自同一张冻结图），
+            # 松手后才重裁重译，避免旧译文被拉变形
+            self._draw_frozen_region(painter, rect)
+            self._draw_border(painter, rect)
+            self._draw_handles(painter, rect)
+            self._draw_size_bubble(painter, rect, hint='· 松开鼠标重新识别')
+            return
         if self._crop_pixmap is not None:
             if abs(self._scale_y - self._scale) < 0.001:
                 # 横纵倍率一致：按逻辑尺寸 1:1 贴回，不做重采样
@@ -1224,6 +1267,7 @@ class ScreenshotWidget(QWidget):
             return
         if self._error:
             self._draw_border(painter, rect)
+            self._draw_handles(painter, rect)
             anchor, title, body, footer = self._error_card()
             self._draw_card(painter, anchor, title, body, footer)
             return
@@ -1241,6 +1285,7 @@ class ScreenshotWidget(QWidget):
                 scale_y=self._scale_y)
             painter.restore()
         self._draw_border(painter, rect)
+        self._draw_handles(painter, rect)
 
         active = self._active_paragraph()
         if active is not None:
@@ -1371,9 +1416,10 @@ class ScreenshotWidget(QWidget):
         toolbar.language_changed.connect(
             lambda lang: self.retranslate_requested.emit(lang, True))
         toolbar.mode_changed.connect(self._set_mode)
-        toolbar.copy_clicked.connect(self._copy_result)
+        toolbar.text_copy_clicked.connect(self._copy_text_kind)
+        toolbar.image_save_clicked.connect(self._save_image)
+        toolbar.image_copy_clicked.connect(self._copy_image)
         toolbar.pin_clicked.connect(self._pin_result)
-        toolbar.save_clicked.connect(self._save_result)
         toolbar.close_clicked.connect(self._cancel_screenshot)
         self._toolbar = toolbar
         self._show_toolbar()
@@ -1435,9 +1481,48 @@ class ScreenshotWidget(QWidget):
         return self._card_body(payload.get('original_text', ''),
                               payload.get('translated_text', ''))
 
+    def _result_text_kind(self, kind):
+        """
+        取指定类型的文本：'original' 原文 / 'translated' 译文
+
+        与 Ctrl+C 一致：选中/悬停某段时只取该段，否则取整段结果。
+
+        Args:
+            kind (str): 'original' 或 'translated'
+
+        Returns:
+            str: 可直接写入剪贴板的文本（可能为空）
+        """
+        payload = self._result or {}
+        index = self._active_paragraph()
+        if index is not None and index < len(self._paragraphs):
+            indices = self._paragraphs[index][1]
+            if kind == 'translated':
+                texts = payload.get('block_texts') or []
+                return '\n'.join(texts[i] for i in indices if i < len(texts))
+            return '\n'.join(self._blocks[i].text for i in indices)
+        if kind == 'translated':
+            return (payload.get('translated_text') or '').strip()
+        return (payload.get('original_text') or '').strip()
+
+    def _copy_text_kind(self, kind):
+        """工具条按钮：提取原文/译文文本到剪贴板"""
+        text = self._result_text_kind(kind)
+        if not text:
+            return
+
+        def done(ok):
+            """确认写入生效才记日志并收起遮罩，失败由 clipboard 模块记警告"""
+            if ok:
+                label = '译文' if kind == 'translated' else '原文'
+                logger.info(f"已复制{label}文本到剪贴板")
+                QTimer.singleShot(0, self._finish_after_copy)
+
+        clipboard.set_text_later(text, on_done=done)
+
     def _copy_result(self):
         """
-        复制当前文本到剪贴板
+        复制当前展示文本到剪贴板（Ctrl+C）
 
         剪贴板被其他程序占用时写入会静默失败，故走带生效校验的重试写入；
         重试交给事件循环排（不在这Sleep），遮罩不会因为复制卡一下。
@@ -1450,12 +1535,28 @@ class ScreenshotWidget(QWidget):
             """确认写入生效才记"已复制"，失败由 clipboard 模块记警告日志"""
             if ok:
                 logger.info("已复制翻译结果到剪贴板")
+                QTimer.singleShot(0, self._finish_after_copy)
 
         clipboard.set_text_later(text, on_done=done)
 
-    def _render_result_pixmap(self):
+    def _render_original_pixmap(self):
+        """
+        选区原图（不含译文覆盖）
+
+        Returns:
+            QPixmap 或 None
+        """
+        payload = self._result
+        if payload is None or payload.get('image') is None:
+            return None
+        return result_render.pil_to_qpixmap(payload['image'])
+
+    def _render_result_pixmap(self, mode=None):
         """
         合成结果图（选区底图 + 就地覆盖的译文），按图像物理像素绘制
+
+        Args:
+            mode (str 或 None): 显式指定覆盖模式；None 表示跟随当前展示模式
 
         Returns:
             QPixmap 或 None
@@ -1466,6 +1567,7 @@ class ScreenshotWidget(QWidget):
         image = payload['image']
         if image is None:
             return None
+        mode = mode or self._mode
         base = result_render.pil_to_qpixmap(image)
         if base is None:
             logger.error("结果图转换失败（PIL → QPixmap），放弃本次导出")
@@ -1482,10 +1584,10 @@ class ScreenshotWidget(QWidget):
             # 底图按需从 PIL 转换：常驻一份 1:1 QPixmap 等于把选区再存一遍
             painter.drawPixmap(0, 0, base)
             texts = payload.get('block_texts') or []
-            if texts and self._mode != result_render.MODE_ORIGINAL:
+            if texts and mode != result_render.MODE_ORIGINAL:
                 result_render.paint_blocks(
                     painter, image, payload.get('blocks') or [], texts,
-                    QPoint(0, 0), self._mode, scale=1.0)
+                    QPoint(0, 0), mode, scale=1.0)
         except Exception as e:
             logger.exception(f"结果图合成失败: {e}")
             return None
@@ -1499,6 +1601,20 @@ class ScreenshotWidget(QWidget):
             pixmap.setDevicePixelRatio(self._scale)
         return pixmap
 
+    def _image_pixmap(self, kind):
+        """
+        取可导出的图片：'original' 原图 / 'translated' 译图（整段译文）
+
+        Args:
+            kind (str): 'original' 或 'translated'
+
+        Returns:
+            QPixmap 或 None
+        """
+        if kind == 'translated':
+            return self._render_result_pixmap(mode=result_render.MODE_TRANSLATED)
+        return self._render_original_pixmap()
+
     def _pin_result(self):
         """把当前结果钉在屏幕上（原选区位置，1:1 像素）"""
         pixmap = self._render_result_pixmap()
@@ -1511,8 +1627,43 @@ class ScreenshotWidget(QWidget):
         logger.info("结果已钉到屏幕")
 
     def _save_result(self):
-        """保存结果图为 PNG 文件"""
-        pixmap = self._render_result_pixmap()
+        """保存当前展示模式的结果图（Ctrl+S）"""
+        self._save_pixmap(self._render_result_pixmap())
+
+    def _save_image(self, kind):
+        """工具条按钮：保存原图/译图为 PNG 文件"""
+        pixmap = self._image_pixmap(kind)
+        if pixmap is None:
+            return
+        if kind == 'translated':
+            self._save_pixmap(pixmap, prefix='翻译结果', title='保存译图')
+        else:
+            self._save_pixmap(pixmap, prefix='截图原图', title='保存原图')
+
+    def _copy_image(self, kind):
+        """工具条按钮：复制原图/译图到剪贴板"""
+        pixmap = self._image_pixmap(kind)
+        if pixmap is None:
+            return
+
+        def done(ok):
+            """确认写入生效才记日志并收起遮罩，失败由 clipboard 模块记警告"""
+            if ok:
+                label = '译图' if kind == 'translated' else '原图'
+                logger.info(f"已复制{label}到剪贴板")
+                QTimer.singleShot(0, self._finish_after_copy)
+
+        clipboard.set_pixmap_later(pixmap, on_done=done)
+
+    def _save_pixmap(self, pixmap, prefix='翻译结果', title='保存翻译结果'):
+        """
+        把图片存成 PNG
+
+        Args:
+            pixmap (QPixmap 或 None): 要保存的图片；None 时直接返回
+            prefix (str): 默认文件名前缀
+            title (str): 文件对话框标题
+        """
         if pixmap is None:
             return
         from datetime import datetime
@@ -1520,16 +1671,16 @@ class ScreenshotWidget(QWidget):
         import os
 
         default_dir = os.path.expanduser('~')
-        name = datetime.now().strftime('翻译结果_%Y%m%d_%H%M%S.png')
+        name = datetime.now().strftime(f'{prefix}_%Y%m%d_%H%M%S.png')
         path, _selected = QFileDialog.getSaveFileName(
-            self, '保存翻译结果', os.path.join(default_dir, name),
+            self, title, os.path.join(default_dir, name),
             'PNG 图片 (*.png)')
         if not path:
             return
         if pixmap.save(path, 'PNG'):
-            logger.info(f"结果图已保存: {path}")
+            logger.info(f"图片已保存: {path}")
         else:
-            logger.error(f"结果图保存失败: {path}")
+            logger.error(f"图片保存失败: {path}")
 
     def _handle_result_ctrl_key(self, event):
         """结果态下的 Ctrl 组合键"""
@@ -1554,9 +1705,11 @@ class ScreenshotWidget(QWidget):
 
     def mousePressEvent(self, event):
         """
-        鼠标按下事件
+        鼠标按下事件：结果态先做边/角命中（拖动调整），再做段落命中
         """
         if event.button() == Qt.LeftButton:
+            if self._begin_result_drag(event.pos()):
+                return
             if self._handle_result_press(event.pos()):
                 return
             self.begin = event.pos()
@@ -1596,31 +1749,203 @@ class ScreenshotWidget(QWidget):
 
     def mouseMoveEvent(self, event):
         """
-        鼠标移动事件：拖拽更新选区，结果态更新段落悬停
+        鼠标移动事件：拖拽更新选区，结果态拖动缩放/平移并更新段落悬停
         """
         if self.is_selecting:
             self.end = event.pos()
             self.update()
-        elif self._result is not None:
-            index = self._paragraph_at(event.pos())
-            if index != self._hover_paragraph:
-                self._hover_paragraph = index
-                self.update()
+        elif self._drag_mode:
+            self._apply_adjust_drag(event.pos())
+            self.update()
+        elif self._result is not None or self._error:
+            if self._result is not None:
+                index = self._paragraph_at(event.pos())
+                if index != self._hover_paragraph:
+                    self._hover_paragraph = index
+                    self.update()
+            self._update_result_cursor(event.pos())
 
     def mouseReleaseEvent(self, event):
         """
-        鼠标释放事件
+        鼠标释放事件：框选松手立即识别；结果态拖动松手立即按新范围重新识别
         """
-        if event.button() == Qt.LeftButton and self.is_selecting:
+        if event.button() != Qt.LeftButton:
+            return
+        if self.is_selecting:
             self.end = event.pos()
             self.is_selecting = False
-            self.update()
-            self._confirm_selection()
-            # 释放后清理参考线状态
             self._active_snap_lines = None
+            self._confirm_selection()
+            return
+        if not self._drag_mode:
+            return
+
+        start_rect = QRect(self._drag_start_rect)
+        dragged_rect = QRect(self._result_rect or self._get_rect())
+        self._drag_mode = None
+        self._resize_edges = frozenset()
+        self._active_snap_lines = None
+        if dragged_rect.width() > self._MIN_SELECT_EDGE \
+                and dragged_rect.height() > self._MIN_SELECT_EDGE:
+            if dragged_rect != start_rect:
+                # 松开即识别，不再需要额外确认；工具条等新结果回来再显示
+                self._confirm_selection()
+                return
+        else:
+            # 拖得太小：回到拖动前的范围，别把已有结果裁成一条缝
+            self._result_rect = QRect(start_rect)
+            self._set_selection_rect(start_rect)
+        self._show_toolbar()
+        self._update_result_cursor(event.pos())
+        self.update()
+
+    def _begin_result_drag(self, pos):
+        """
+        结果态按下：命中边/角或选区内部时进入拖动调整
+
+        Returns:
+            bool: 是否已进入拖动；False 表示事件应继续交给段落命中/新框选
+        """
+        if self._loading or not (self._result is not None or self._error):
+            return False
+        rect = self._result_rect
+        if rect is None:
+            return False
+        zone = self._hit_zone(pos, rect)
+        if zone is None:
+            return False
+        if zone[0] == 'move' and self._result is not None \
+                and self._paragraph_at(pos) is not None:
+            # 段落点击优先：按在段落上是查看该段卡片，不是拖动整个选区
+            return False
+        self._drag_mode, self._resize_edges = zone
+        self._drag_origin = QPoint(pos)
+        self._drag_start_rect = QRect(rect)
+        self._hide_toolbar()
+        self._update_result_cursor(pos)
+        return True
+
+    def _hit_zone(self, pos, rect=None):
+        """结果选区命中测试：边/角 → resize，内部 → move"""
+        if rect is None:
+            rect = self._result_rect or self._get_rect()
+        if rect.width() <= 0 or rect.height() <= 0:
+            return None
+        hit = self._HANDLE_HIT
+        within_x = rect.left() - hit <= pos.x() <= rect.right() + hit
+        within_y = rect.top() - hit <= pos.y() <= rect.bottom() + hit
+        dx_left = abs(pos.x() - rect.left())
+        dx_right = abs(pos.x() - rect.right())
+        dy_top = abs(pos.y() - rect.top())
+        dy_bottom = abs(pos.y() - rect.bottom())
+
+        edges = set()
+        if within_y:
+            if dx_left <= hit and dx_left <= dx_right:
+                edges.add('l')
+            elif dx_right <= hit:
+                edges.add('r')
+        if within_x:
+            if dy_top <= hit and dy_top <= dy_bottom:
+                edges.add('t')
+            elif dy_bottom <= hit:
+                edges.add('b')
+        if edges:
+            return 'resize', frozenset(edges)
+        if rect.contains(pos):
+            return 'move', frozenset()
+        return None
+
+    def _apply_adjust_drag(self, pos):
+        """按拖拽位移缩放/移动选区，并夹在桌面内、至少保留 2 像素"""
+        dx = pos.x() - self._drag_origin.x()
+        dy = pos.y() - self._drag_origin.y()
+        start = self._drag_start_rect
+        edges = self._resize_edges
+
+        if self._drag_mode == 'move':
+            rect = QRect(start).translated(dx, dy)
+            if rect.left() < 0:
+                rect.moveLeft(0)
+            if rect.top() < 0:
+                rect.moveTop(0)
+            if rect.right() >= self.screen_width:
+                rect.moveRight(self.screen_width - 1)
+            if rect.bottom() >= self.screen_height:
+                rect.moveBottom(self.screen_height - 1)
+        else:
+            left = start.left() + (dx if 'l' in edges else 0)
+            right = start.right() + (dx if 'r' in edges else 0)
+            top = start.top() + (dy if 't' in edges else 0)
+            bottom = start.bottom() + (dy if 'b' in edges else 0)
+            left = max(0, min(left, self.screen_width - 1))
+            right = max(0, min(right, self.screen_width - 1))
+            top = max(0, min(top, self.screen_height - 1))
+            bottom = max(0, min(bottom, self.screen_height - 1))
+            # 拖过对边时停住而不是翻转：翻转会让选区在手里"跳"一下
+            if left > right - 1:
+                if 'l' in edges:
+                    left = right - 1
+                else:
+                    right = left + 1
+            if top > bottom - 1:
+                if 't' in edges:
+                    top = bottom - 1
+                else:
+                    bottom = top + 1
+            rect = QRect(QPoint(left, top), QPoint(right, bottom))
+
+        snapped, guides = self._snap_rect(rect)
+        self._active_snap_lines = guides or None
+        self._result_rect = QRect(snapped)
+        self._set_selection_rect(snapped)
+
+    @staticmethod
+    def _cursor_for_edges(edges):
+        """边集合 → 对应方向的缩放光标"""
+        horizontal = 'l' in edges or 'r' in edges
+        vertical = 't' in edges or 'b' in edges
+        if horizontal and vertical:
+            if ('l' in edges and 't' in edges) \
+                    or ('r' in edges and 'b' in edges):
+                return Qt.SizeFDiagCursor
+            return Qt.SizeBDiagCursor
+        if horizontal:
+            return Qt.SizeHorCursor
+        return Qt.SizeVerCursor
+
+    def _update_result_cursor(self, pos):
+        """结果态光标反馈：拖动中/可缩放边角/可移动内部/选区外重新框选"""
+        if self._loading:
+            return
+        if self._drag_mode == 'move':
+            self.setCursor(QCursor(Qt.SizeAllCursor))
+            return
+        if self._drag_mode == 'resize':
+            self.setCursor(QCursor(self._cursor_for_edges(self._resize_edges)))
+            return
+        if self._result is None and self._error is None:
+            return
+        zone = self._hit_zone(pos)
+        if zone is None:
+            self.setCursor(QCursor(Qt.CrossCursor))
+        elif zone[0] == 'move':
+            if self._result is not None and self._paragraph_at(pos) is not None:
+                self.setCursor(QCursor(Qt.ArrowCursor))
+            else:
+                self.setCursor(QCursor(Qt.SizeAllCursor))
+        else:
+            self.setCursor(QCursor(self._cursor_for_edges(zone[1])))
+
+    def _set_selection_rect(self, rect):
+        """把选区矩形写回 begin/end 两个端点（end 为开区间上界）"""
+        self.begin = QPoint(rect.left(), rect.top())
+        self.end = QPoint(rect.left() + rect.width(), rect.top() + rect.height())
 
     def _confirm_selection(self):
-        """确认当前选区：有效则发起识别，太小则取消（鼠标释放与Enter共用）"""
+        """确认当前选区：有效则发起识别，太小则取消（框选松手与结果态重识别共用）"""
+        self._drag_mode = None
+        self._resize_edges = frozenset()
         # 用吸附后的矩形裁剪，与用户在遮罩上看到的选择完全一致
         raw = self._get_rect()
         rect, _ = self._snap_rect(raw)
@@ -1628,7 +1953,8 @@ class ScreenshotWidget(QWidget):
         logger.info(f"选择区域: x={rect.x()}, y={rect.y()}, "
                     f"width={rect.width()}, height={rect.height()}")
 
-        if rect.width() <= 10 or rect.height() <= 10:
+        if rect.width() <= self._MIN_SELECT_EDGE \
+                or rect.height() <= self._MIN_SELECT_EDGE:
             if self._loading:
                 # 等结果期间的误触小拖拽：遮罩关掉等于把在途请求一起丢掉，
                 # 用户看到的就是一片空白 + 白等几秒，这里保持加载画面不动
@@ -1670,9 +1996,9 @@ class ScreenshotWidget(QWidget):
             logger.warning(f"选区换算到抓拍图后为空: {box}，取消截图")
             self._cancel_screenshot()
             return
-        # crop 与原图共享像素缓冲，必须 copy 才能放下整屏图（1440p 约 11 MiB）
+        # crop 与原图共享像素缓冲，必须 copy；整屏图保留到遮罩关闭，
+        # 结果态拖动调整后要按新范围重新裁剪，不能提前释放
         screenshot = self.full_screen.crop(box).copy()
-        self.full_screen = None
         logger.info(f"截图完成，大小: {screenshot.width}x{screenshot.height}")
 
         # 遮罩不关闭：先用本次裁剪图冻结选区做加载提示，结果回来后就地覆盖
@@ -1682,10 +2008,13 @@ class ScreenshotWidget(QWidget):
         self._blocks = []
         self._paragraphs = []
         self._result_rect = QRect(rect)
+        self._set_selection_rect(rect)
         self._scale = screenshot.width / max(1, rect.width())
         self._scale_y = screenshot.height / max(1, rect.height())
         self._crop_pixmap = result_render.pil_to_qpixmap(screenshot, dpr=self._scale)
         self._loading = True
+        self._hide_toolbar()
+        self.setCursor(QCursor(Qt.ArrowCursor))
         self.region_selected.emit(screenshot, QRect(rect))
         self.update()
 
@@ -1702,34 +2031,6 @@ class ScreenshotWidget(QWidget):
             self._handle_result_key(event)
         elif self._error and event.key() == Qt.Key_R:
             self.retry_requested.emit()
-        elif event.key() == Qt.Key_Enter or event.key() == Qt.Key_Return:
-            # 按下Enter键，确认截图（不再误传QKeyEvent给鼠标处理）
-            if self.is_selecting:
-                self.is_selecting = False
-                self._confirm_selection()
-        elif event.key() in (Qt.Key_Up, Qt.Key_Down, Qt.Key_Left, Qt.Key_Right):
-            # 按下方向键，微调选择区域
-            if self.is_selecting:
-                delta = 1
-                if event.modifiers() & Qt.ShiftModifier:
-                    delta = 10
-
-                if event.key() == Qt.Key_Up:
-                    self.begin.setY(self.begin.y() - delta)
-                    self.end.setY(self.end.y() - delta)
-                elif event.key() == Qt.Key_Down:
-                    self.begin.setY(self.begin.y() + delta)
-                    self.end.setY(self.end.y() + delta)
-                elif event.key() == Qt.Key_Left:
-                    self.begin.setX(self.begin.x() - delta)
-                    self.end.setX(self.end.x() - delta)
-                elif event.key() == Qt.Key_Right:
-                    self.begin.setX(self.begin.x() + delta)
-                    self.end.setX(self.end.x() + delta)
-
-                # 连着按方向键能把整个选区推出屏幕外（越界后既看不见也裁不出像素）
-                self._clamp_selection_points()
-                self.update()
 
     def closeEvent(self, event):
         """
@@ -1743,6 +2044,12 @@ class ScreenshotWidget(QWidget):
         self.full_screen = None
         super().closeEvent(event)
 
+    def _finish_after_copy(self):
+        """复制成功后收起遮罩：内容已在剪贴板，留着只会继续挡屏"""
+        logger.info("内容已复制到剪贴板，关闭截图遮罩")
+        self.screenshot_canceled.emit()
+        self.close()
+
     def _cancel_screenshot(self):
         """
         取消截图
@@ -1752,12 +2059,6 @@ class ScreenshotWidget(QWidget):
         self.screenshot_canceled.emit()
         # 关闭窗口
         self.close()
-
-    def _clamp_selection_points(self):
-        """把选区两端点夹回桌面内（方向键微调没有鼠标拖拽那样的天然边界）"""
-        for point in (self.begin, self.end):
-            point.setX(max(0, min(point.x(), self.screen_width)))
-            point.setY(max(0, min(point.y(), self.screen_height)))
 
     def _get_rect(self):
         """

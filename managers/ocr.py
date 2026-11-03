@@ -4,8 +4,9 @@
 OCR管理器
 负责图像文字识别，基于 provider 注册表分发到具体OCR引擎
 
-内置提供者：Tesseract(本地离线)、百度云OCR(在线)、模拟OCR(兜底)
-扩展方式：在 managers/ocr_providers/ 下新建符合约定的模块即可自动注册
+内置提供者：RapidOCR(本地离线，固定引擎)、模拟OCR(兜底)
+识别引擎不再开放配置：界面与配置都不提供切换入口，避免用户误配后
+把截图翻译卡在不可用的引擎上。
 """
 
 import logging
@@ -32,7 +33,7 @@ NO_TEXT_NOTICE = "未识别到文字，请重新框选包含文字的区域"
 # OCR 降级提示文本（mock 引擎的输出与“图里没字”的可行动提示）。
 # 这类文本是给用户看的提示，不是原文，不应再送翻译 API。
 OCR_NOTICE_TEXTS = (
-    "[OCR识别不可用：请检查OCR引擎配置（Tesseract未安装或密钥未填写）]",
+    "[OCR识别不可用：请检查本地OCR组件是否完整]",
     NO_TEXT_NOTICE,
 )
 
@@ -59,7 +60,7 @@ class OCRManager(ProviderChainManager):
 
     # 链式调度基类配置
     _registry = ocr_provider_registry
-    _default_provider_name = 'tesseract'
+    _default_provider_name = 'rapidocr'
     _failure_prefix = _OCR_FAIL_PREFIX
 
     def _default_retry_handler(self):
@@ -84,7 +85,7 @@ class OCRManager(ProviderChainManager):
             config_manager: 配置管理器实例（读取 [OCR] 段）
         """
         self.config_manager = config_manager
-        self.ocr_type = 'tesseract'  # 默认本地Tesseract
+        self.ocr_type = 'rapidocr'  # 默认本地RapidOCR
         self._providers = {}
         self._provider_lock = threading.Lock()
         # 最近一次识别失败的异常：用于区分“引擎坏了”与“图里没字”
@@ -100,10 +101,9 @@ class OCRManager(ProviderChainManager):
         """
         取得 provider 实例（按类缓存）
 
-        Tesseract 构造时要探测引擎路径、跑一次 `tesseract --version` 子进程并
-        扫盘定位 tessdata，若每次识别都新建实例，一次翻译就白白多起一个进程。
-        构造过程还会改写进程级全局态（pytesseract 的引擎路径、
-        TESSDATA_PREFIX），所以同一次构造必须在锁内完成。
+        RapidOCR 构造时要加载检测/识别/分类三个 ONNX 模型（约 1 秒），若每次
+        识别都新建实例，每次翻译都要重新加载一遍。构造过程还会占住引擎的
+        模型文件，所以同一次构造必须在锁内完成。
 
         Args:
             provider_cls: OCR provider 类
@@ -119,13 +119,8 @@ class OCRManager(ProviderChainManager):
             return provider
 
     def _load_config(self):
-        """加载OCR引擎配置"""
-        try:
-            if self.config_manager:
-                self.ocr_type = self.config_manager.get_ocr_type()
-                logger.info(f"从配置加载OCR引擎: {self.ocr_type}")
-        except Exception as e:
-            logger.error(f"加载OCR配置失败: {e}")
+        """固定使用本地 RapidOCR（引擎选择不再对外开放）"""
+        self.ocr_type = 'rapidocr'
 
     def close_providers(self):
         """
@@ -166,7 +161,7 @@ class OCRManager(ProviderChainManager):
         """
         对图像执行OCR识别（带重试与降级）
 
-        降级链：当前引擎(带重试) -> Tesseract -> 模拟OCR
+        降级链：当前引擎(带重试) -> RapidOCR -> 模拟OCR
         保证任何情况下都返回文本，不中断截图翻译流程。
 
         Args:
@@ -184,11 +179,11 @@ class OCRManager(ProviderChainManager):
         result, last_error, last_provider = self._recognize_via(
             provider_cls, image, deadline=deadline, cancel_event=cancel_event)
 
-        # 1) 当前引擎失败时，尝试本地Tesseract兜底
+        # 1) 当前引擎失败时，尝试本地RapidOCR兜底
         if self._is_failure(result) and self._chain_open(deadline, cancel_event):
-            fallback_cls = ocr_provider_registry.get('tesseract')
+            fallback_cls = ocr_provider_registry.get('rapidocr')
             if fallback_cls is not None and fallback_cls is not provider_cls:
-                logger.warning("当前OCR引擎失败，尝试本地Tesseract")
+                logger.warning("当前OCR引擎失败，尝试本地RapidOCR")
                 fallback_result, fb_error, fb_provider = self._recognize_via(
                     fallback_cls, image, deadline=deadline,
                     cancel_event=cancel_event)
@@ -246,8 +241,8 @@ class OCRManager(ProviderChainManager):
             if text.strip():
                 return text, blocks
         # 本地引擎已经判定“这张图没字”时别再跑一遍文本链路：同一张图重试
-        # 结果必然一样，而 Tesseract 一次识别实测约 0.6 秒（模型加载占大头），
-        # 白等这一秒只会让“框了个空区域”的反馈慢一倍
+        # 结果必然一样，而 RapidOCR 一次识别实测约 0.3 秒（模型加载占大头），
+        # 白等这一下只会让“框了个空区域”的反馈慢一倍
         if self._empty_result_is_final(last_error, last_provider):
             logger.info("当前引擎未识别到文字且结果确定，跳过重复识别")
             return NO_TEXT_NOTICE, []
@@ -258,7 +253,7 @@ class OCRManager(ProviderChainManager):
         本次空结果是否已经是最终答案
 
         判据必须是“实际动手的那个引擎”，不是配置里的那个：配了云端引擎、
-        块级链路里退到本地 Tesseract 后才报“没字”，此时答案同样确定；
+        块级链路里退到本地 RapidOCR 后才报“没字”，此时答案同样确定；
         反过来只看配置引擎会把云端偶发空结果当定案。
 
         错误与引擎由调用方按本次请求局部传递（不再从实例属性上读）：两次
@@ -282,7 +277,7 @@ class OCRManager(ProviderChainManager):
 
     def _perform_ocr_blocks(self, image, deadline=None, cancel_event=None):
         """
-        块级识别降级链：当前引擎 -> 本地Tesseract
+        块级识别降级链：当前引擎 -> 本地RapidOCR
 
         Args:
             image (PIL.Image.Image): 待识别的图像
@@ -300,12 +295,12 @@ class OCRManager(ProviderChainManager):
         blocks, error, used_cls = self._recognize_blocks_via(
             provider_cls, image, deadline, cancel_event)
         if not blocks:
-            fallback_cls = ocr_provider_registry.get('tesseract')
+            fallback_cls = ocr_provider_registry.get('rapidocr')
             if fallback_cls is not None and fallback_cls is not provider_cls:
                 if not self._chain_open(deadline, cancel_event):
-                    logger.warning("识别链时限已用尽，跳过本地Tesseract兜底")
+                    logger.warning("识别链时限已用尽，跳过本地RapidOCR兜底")
                     return [], error, used_cls
-                logger.warning("当前OCR引擎拿不到块级坐标，尝试本地Tesseract")
+                logger.warning("当前OCR引擎拿不到块级坐标，尝试本地RapidOCR")
                 blocks, fb_error, fb_cls = self._recognize_blocks_via(
                     fallback_cls, image, deadline, cancel_event)
                 if blocks:

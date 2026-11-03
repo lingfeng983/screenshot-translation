@@ -10,6 +10,15 @@ import os
 import sys
 import threading
 
+# ONNX Runtime 必须先于 PyQt5 导入：在本机组合（Python 3.14 + PyQt5 5.15.10 +
+# onnxruntime 1.31）上，先加载 QtCore 再导入 onnxruntime 会在模块初始化阶段
+# 访问冲突直接终止进程，反序则正常。RapidOCR 只在截图识别时才用到，这里花
+# 约 0.2s 把运行时带起来；缺依赖时留给 provider 在真正识别时报可读错误。
+try:
+    import onnxruntime  # noqa: F401
+except ImportError:
+    pass
+
 from logging.handlers import RotatingFileHandler
 
 from PyQt5.QtCore import QEvent, Qt, QTimer
@@ -201,9 +210,8 @@ class MainApp:
             # 托盘常驻，关闭配置窗口不应结束事件循环
             self.app.setQuitOnLastWindowClosed(False)
 
-            # 配置管理器先就位：主题存在配置里，样式表要按它生成
+            # 配置管理器先就位，界面固定使用浅色主题
             self.config_manager = ConfigManager()
-            styles.set_current_theme(self.config_manager.get_theme())
             styles.apply_app(self.app)
             self._apply_app_icon()
 
@@ -508,11 +516,13 @@ class ConfigWindow(QDialog):
         self.config_manager = main_app.config_manager
 
         self.setWindowTitle("截图翻译工具 - 设置")
+        # 去掉标题栏右上角的“？”（QDialog 默认带上下文帮助按钮）
+        self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
         # 设置项较多，内容用滚动区承载，小屏也能完整操作
         self.resize(640, 620)
         self.setMinimumSize(520, 420)
 
-        # 应用当前主题（深色/浅色由 [UI] theme 决定，与全局样式一致）
+        # 应用界面样式（固定浅色主题）
         styles.apply_to(self)
 
         # 任务栏/窗口图标（PIL Image → QPixmap）
@@ -549,29 +559,6 @@ class ConfigWindow(QDialog):
             form.setVerticalSpacing(6)
             form.setHorizontalSpacing(10)
             return form
-
-        # 外观配置（界面主题）
-        appearance_group = QGroupBox("外观")
-        appearance_layout = _new_form()
-
-        self.theme_combo = QComboBox()
-        for theme_key, theme_label in styles.available_themes():
-            self.theme_combo.addItem(theme_label, theme_key)
-        current_theme = (self.config_manager.get_theme()
-                         if self.config_manager else styles.DEFAULT_THEME)
-        theme_index = self.theme_combo.findData(current_theme)
-        if theme_index >= 0:
-            self.theme_combo.setCurrentIndex(theme_index)
-        # 切换即预览：先看效果，点保存后才长期生效
-        self.theme_combo.currentIndexChanged.connect(self._on_theme_changed)
-        appearance_layout.addRow("界面主题:", self.theme_combo)
-
-        theme_hint = QLabel("切换后立即预览，点“保存”后长期生效")
-        theme_hint.setObjectName("hintLabel")
-        appearance_layout.addRow("", theme_hint)
-
-        appearance_group.setLayout(appearance_layout)
-        layout.addWidget(appearance_group)
 
         # 翻译API配置
         api_group = QGroupBox("翻译API配置")
@@ -641,44 +628,6 @@ class ConfigWindow(QDialog):
 
         # 按初始选择生成动态字段
         self._on_api_type_changed(self.api_type_combo.currentIndex())
-
-        # OCR引擎配置
-        ocr_group = QGroupBox("OCR引擎配置")
-        ocr_layout = _new_form()
-
-        # 从OCR provider注册表获取可用引擎
-        from managers.ocr_providers import ocr_provider_registry
-        ocr_names = ocr_provider_registry.names()
-
-        self.ocr_type_combo = QComboBox()
-        for name in ocr_names:
-            self.ocr_type_combo.addItem(
-                ocr_provider_registry.display_name_of(name), name)
-        if self.config_manager:
-            try:
-                current_ocr = self.config_manager.get_ocr_type()
-                ocr_index = self.ocr_type_combo.findData(current_ocr)
-                if ocr_index >= 0:
-                    self.ocr_type_combo.setCurrentIndex(ocr_index)
-            except Exception as e:
-                logger.error(f"获取OCR引擎配置失败: {e}")
-        self.ocr_type_combo.currentIndexChanged.connect(self._on_ocr_type_changed)
-        ocr_layout.addRow("OCR引擎:", self.ocr_type_combo)
-
-        # 当前OCR引擎的动态字段区域
-        self.ocr_fields_layout = _new_form()
-        ocr_layout.addRow(self.ocr_fields_layout)
-        self._ocr_field_edits = {}
-        # OCR 侧同样保留未保存输入与"来自环境变量"的密钥标记
-        self._ocr_drafts = {}
-        self._ocr_env_secret_values = {}
-        self._last_ocr_type = None
-
-        ocr_group.setLayout(ocr_layout)
-        layout.addWidget(ocr_group)
-
-        # 按初始选择生成OCR动态字段
-        self._on_ocr_type_changed(self.ocr_type_combo.currentIndex())
 
         # 截图遮罩配置（磁吸阈值/暗角透明度滑条）
         overlay_group = QGroupBox("截图遮罩")
@@ -851,18 +800,6 @@ class ConfigWindow(QDialog):
         from managers.providers.base import TARGET_LANGUAGES
         return TARGET_LANGUAGES
 
-    def _on_theme_changed(self, index):
-        """主题下拉切换：立即应用进程级样式做预览，保存后才落盘"""
-        theme = self.theme_combo.currentData()
-        if not theme:
-            return
-        styles.set_current_theme(theme)
-        app = QApplication.instance()
-        if app is not None:
-            styles.apply_app(app)
-        styles.apply_to(self)
-        logger.info(f"主题预览: {theme}（点保存后长期生效）")
-
     def _current_provider(self):
         """获取当前选中的provider类，未找到时返回None"""
         from managers.providers import provider_registry
@@ -920,9 +857,6 @@ class ConfigWindow(QDialog):
                 'baidu_api_key': lambda: self.config_manager.get_baidu_api_info()[1],
                 'youdao_app_id': lambda: self.config_manager.get_youdao_api_info()[0],
                 'youdao_api_key': lambda: self.config_manager.get_youdao_api_info()[1],
-                'llm_base_url': self.config_manager.get_llm_base_url,
-                'llm_api_key': self.config_manager.get_llm_api_key,
-                'llm_model': self.config_manager.get_llm_model,
             }
             getter = getters.get(field_name)
             if getter is not None:
@@ -954,9 +888,6 @@ class ConfigWindow(QDialog):
                 v, self.config_manager.get_youdao_api_info()[1]),
             'youdao_api_key': lambda v: self.config_manager.set_youdao_api_info(
                 self.config_manager.get_youdao_api_info()[0], v),
-            'llm_base_url': self.config_manager.set_llm_base_url,
-            'llm_api_key': self.config_manager.set_llm_api_key,
-            'llm_model': self.config_manager.set_llm_model,
         }
         setter = setters.get(field_name)
         if setter is not None:
@@ -1024,7 +955,7 @@ class ConfigWindow(QDialog):
 
     def _save_form_fields(self, persist=True):
         """
-        保存当前表单的动态字段值到配置（翻译API + OCR引擎 + 截图遮罩）
+        保存当前表单的动态字段值到配置（翻译API + 截图遮罩）
 
         Args:
             persist (bool): 是否落盘。“测试翻译”只要让未保存的表单值当场生效，
@@ -1036,14 +967,6 @@ class ConfigWindow(QDialog):
         with self.config_manager.batch(persist=persist):
             for field_name, edit in self._api_field_edits.items():
                 self._save_field_value(field_name, edit.text().strip())
-            for field_name, edit in self._ocr_field_edits.items():
-                value = edit.text().strip()
-                env_value = self._ocr_env_secret_values.get(field_name)
-                if env_value is not None and value == env_value:
-                    # 同翻译密钥：环境变量给的值本来就不在 config.ini 里，
-                    # 原样保存等于把明文密钥写进可被读到的文件
-                    continue
-                self.config_manager.set_ocr_option(field_name, value)
             if persist:
                 # 遮罩参数只在真正"保存"时写入：点"测试翻译"不该顺手改掉
                 # 本次会话后续截图的遮罩观感（内存配置会立刻影响下一次截图）
@@ -1051,54 +974,6 @@ class ConfigWindow(QDialog):
                     'snap_threshold', str(self.snap_slider.value()))
                 self.config_manager.set_overlay_option(
                     'dim_opacity', str(self.dim_slider.value()))
-
-    def _current_ocr_provider(self):
-        """获取当前选中的OCR provider类，未找到时返回None"""
-        from managers.ocr_providers import ocr_provider_registry
-        return ocr_provider_registry.get(self.ocr_type_combo.currentData())
-
-    def _on_ocr_type_changed(self, index):
-        """OCR引擎切换时，重新生成该引擎的配置字段"""
-        try:
-            new_type = self.ocr_type_combo.currentData()
-            # 同 API 侧：切走前暂存未保存输入，切回来能继续填
-            if self._last_ocr_type and self._ocr_field_edits:
-                self._ocr_drafts[self._last_ocr_type] = {
-                    name: edit.text() for name, edit in self._ocr_field_edits.items()}
-
-            # 清空旧字段
-            while self.ocr_fields_layout.rowCount():
-                self.ocr_fields_layout.removeRow(0)
-            self._ocr_field_edits = {}
-            self._ocr_env_secret_values = {}
-
-            provider_cls = self._current_ocr_provider()
-            self._last_ocr_type = new_type
-            if provider_cls is None:
-                return
-
-            draft = self._ocr_drafts.get(new_type) or {}
-            # 按provider声明动态生成输入框，值从 [OCR] 配置段读取
-            for field_name, label, is_password in provider_cls.config_fields:
-                edit = QLineEdit()
-                if is_password:
-                    edit.setEchoMode(QLineEdit.Password)
-                if field_name in draft:
-                    value = draft[field_name]
-                elif self.config_manager:
-                    value = self.config_manager.get_ocr_option(field_name)
-                else:
-                    value = ''
-                edit.setText(value)
-                # 云端 OCR 密钥同样支持环境变量注入，且不回写进明文配置
-                if (value and self.config_manager
-                        and self.config_manager.is_env_ocr_secret(field_name)):
-                    self._ocr_env_secret_values[field_name] = value
-                    edit.setPlaceholderText('值来自环境变量，保持不变则不写入配置文件')
-                self._ocr_field_edits[field_name] = edit
-                self.ocr_fields_layout.addRow(f"{label}:", edit)
-        except Exception as e:
-            logger.error(f"生成OCR配置字段失败: {e}")
 
     def _on_save(self):
         """保存表单配置并同步到翻译与快捷键管理器"""
@@ -1108,7 +983,6 @@ class ConfigWindow(QDialog):
 
             # save 前把值取出来：后面要在批量写盘之外用
             api_type = self.api_type_combo.currentData()
-            ocr_type = self.ocr_type_combo.currentData()
             target_lang = self.target_lang_combo.currentData() or 'zh'
             hotkey = self.hotkey_edit.text()
             hotkey_ok = True
@@ -1116,18 +990,13 @@ class ConfigWindow(QDialog):
 
             # 所有配置写入放进批量上下文：十几次 setter 只落盘一次
             with self.config_manager.batch():
-                # API类型与OCR引擎类型（userData 存的是provider名称）
+                # API类型（userData 存的是provider名称）
                 self.config_manager.set_api_type(api_type)
-                self.config_manager.set_ocr_type(ocr_type)
                 # 目标语言与降级API
                 self.config_manager.set_target_lang(target_lang)
                 self.config_manager.set_fallback_api_type(
                     self.fallback_api_combo.currentData() or '')
-                # 界面主题（切换时已预览生效，这里只落盘）
-                theme = self.theme_combo.currentData()
-                if theme:
-                    self.config_manager.set_theme(theme)
-                # 当前API/OCR的动态字段（密钥/URL等）与遮罩滑条
+                # 当前API的动态字段（密钥/URL等）与遮罩滑条
                 self._save_form_fields()
                 # 启动行为
                 self.config_manager.set_minimize_to_tray(
@@ -1150,18 +1019,12 @@ class ConfigWindow(QDialog):
 
             # 保存成功：草稿里的值已经写进配置，清掉避免下次切回来又盖回旧输入
             self._api_drafts.clear()
-            self._ocr_drafts.clear()
 
             # 同步翻译管理器
             if self.main_app.translation_manager:
                 self.main_app.translation_manager.set_api_type(api_type)
                 self.main_app.translation_manager.set_target_lang(target_lang)
                 self.main_app.translation_manager.reload_config()
-
-            # 同步OCR管理器
-            if self.main_app.ocr_manager:
-                self.main_app.ocr_manager.set_ocr_type(ocr_type)
-                self.main_app.ocr_manager.reload_config()
 
             if not hotkey_ok:
                 # 配置已全部落盘、管理器已同步，只有热键保持原值
@@ -1215,31 +1078,8 @@ class ConfigWindow(QDialog):
             event (QCloseEvent): Qt关闭事件对象
         """
         logger.debug("配置窗口关闭事件触发")
-        self._revert_unsaved_theme()
         # 接受关闭事件，让窗口关闭
         event.accept()
-
-    def _revert_unsaved_theme(self):
-        """
-        没保存就关窗时撤掉主题预览
-
-        下拉框的"切换即预览"改的是进程级样式（app stylesheet），不落盘就关掉
-        窗口，界面会一直顶着预览主题跑，和配置里的值对不上——下次别的窗口
-        构造时用的也是这个错的主题。
-        """
-        try:
-            persisted = styles.normalize_theme(
-                self.config_manager.get_theme()
-                if self.config_manager else styles.DEFAULT_THEME)
-            if styles.current_theme() == persisted:
-                return
-            styles.set_current_theme(persisted)
-            app = QApplication.instance()
-            if app is not None:
-                styles.apply_app(app)
-            logger.info(f"主题预览未保存，已恢复为配置中的 {persisted}")
-        except Exception as e:
-            logger.warning(f"恢复主题失败: {e}")
 
 
 

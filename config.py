@@ -83,7 +83,7 @@ class ConfigManager:
                 # 旧配置文件自动迁移：六个段逐个补齐。缺段的危害不只是读不到值
                 # （读侧有 fallback 兜着），而是 setter 里的 config.set 会直接
                 # 抛 NoSectionError——用户点一次“保存”就崩一次。
-                if self._migrate_sections():
+                if self._migrate_sections() or self._migrate_values():
                     self.save_config()
             except Exception as e:
                 logger.error(f"配置文件加载失败，回退默认配置: {e}")
@@ -108,7 +108,6 @@ class ConfigManager:
         ('Translation', '_set_translation_defaults'),
         ('Hotkey', '_set_hotkey_defaults'),
         ('Startup', '_set_startup_defaults'),
-        ('UI', '_set_ui_defaults'),
         ('Overlay', '_set_overlay_defaults'),
         ('OCR', '_set_ocr_defaults'),
     )
@@ -124,6 +123,46 @@ class ConfigManager:
         for section, filler in self._SECTION_DEFAULTS:
             if not self.config.has_section(section):
                 getattr(self, filler)()
+                migrated = True
+        return migrated
+
+    def _migrate_values(self):
+        """
+        迁移旧版本留在配置里的引擎名与废弃选项
+
+        - OCR 已固定为本地 RapidOCR：ocr_type、旧 Tesseract 语言与云端密钥
+          都已无对应实现，留着只会让人以为还能配
+        - 旧的 LLM 配置同样已无实现
+        - 目标语言收窄为中文/英文，旧值（如 ja）回落到中文
+        - 界面固定浅色，旧配置里的主题选择不再生效
+
+        Returns:
+            bool: 是否有配置项被改写（需要落盘）
+        """
+        migrated = False
+        # 界面固定浅色：旧配置里的主题选择已无意义
+        if self.config.has_option('UI', 'theme'):
+            self.config.remove_option('UI', 'theme')
+            migrated = True
+        if self.config.has_section('UI') and not self.config.options('UI'):
+            self.config.remove_section('UI')
+        # OCR 已固定为本地 RapidOCR：旧配置里的引擎选择与云端密钥都不再有任何作用
+        for option in ('ocr_type', 'tesseract_langs',
+                       'baidu_ocr_api_key', 'baidu_ocr_secret_key'):
+            if self.config.has_option('OCR', option):
+                self.config.remove_option('OCR', option)
+                migrated = True
+        for option in ('llm_base_url', 'llm_api_key', 'llm_model'):
+            if self.config.has_option('Translation', option):
+                self.config.remove_option('Translation', option)
+                migrated = True
+        if not self.config.has_option('OCR', 'rapidocr_score_threshold'):
+            self.config.set('OCR', 'rapidocr_score_threshold', '0.5')
+            migrated = True
+        if self.config.has_option('Translation', 'target_lang'):
+            if self.config.get('Translation', 'target_lang').strip().lower() \
+                    not in ('zh', 'en'):
+                self.config.set('Translation', 'target_lang', 'zh')
                 migrated = True
         return migrated
 
@@ -172,8 +211,6 @@ class ConfigManager:
         self._set_hotkey_defaults()
         # 启动行为配置
         self._set_startup_defaults()
-        # 界面外观配置
-        self._set_ui_defaults()
         # 截图遮罩默认配置
         self._set_overlay_defaults()
         # OCR 默认配置
@@ -197,10 +234,6 @@ class ConfigManager:
         self.config.set('Translation', 'baidu_app_id', '')
         self.config.set('Translation', 'youdao_api_key', '')
         self.config.set('Translation', 'youdao_app_id', '')
-        # LLM（OpenAI兼容接口）翻译配置
-        self.config.set('Translation', 'llm_base_url', 'https://api.openai.com/v1')
-        self.config.set('Translation', 'llm_api_key', '')
-        self.config.set('Translation', 'llm_model', 'gpt-4o-mini')
 
     def _set_hotkey_defaults(self):
         """设置 [Hotkey] 段默认配置值"""
@@ -232,10 +265,8 @@ class ConfigManager:
         else:
             return
 
-        self.config.set('OCR', 'ocr_type', 'tesseract')  # 默认本地Tesseract
-        self.config.set('OCR', 'tesseract_langs', 'eng+chi_sim')  # 识别语言组合
-        self.config.set('OCR', 'baidu_ocr_api_key', '')
-        self.config.set('OCR', 'baidu_ocr_secret_key', '')
+        # 引擎固定为本地 RapidOCR，[OCR] 段只保留识别参数
+        self.config.set('OCR', 'rapidocr_score_threshold', '0.5')  # 行置信度下限
 
     def _set_overlay_defaults(self):
         """
@@ -248,15 +279,6 @@ class ConfigManager:
 
         self.config.set('Overlay', 'snap_threshold', '12')  # 磁吸阈值（像素）
         self.config.set('Overlay', 'dim_opacity', '90')     # 暗角透明度 (0~180)
-
-    def _set_ui_defaults(self):
-        """设置 [UI] 段默认配置值（界面主题）"""
-        if not self.config.has_section('UI'):
-            self.config.add_section('UI')
-        else:
-            return
-
-        self.config.set('UI', 'theme', 'dark')  # dark / light
 
     def save_config(self):
         """
@@ -355,9 +377,11 @@ class ConfigManager:
         获取目标语言代码
 
         Returns:
-            str: 目标语言代码，如 zh / en / ja
+            str: 目标语言代码：zh / en
         """
-        return self.config.get('Translation', 'target_lang', fallback='zh')
+        value = self.config.get('Translation', 'target_lang', fallback='zh')
+        value = str(value or '').strip().lower()
+        return value if value in ('zh', 'en') else 'zh'
 
     def set_target_lang(self, target_lang):
         """
@@ -388,31 +412,10 @@ class ConfigManager:
         self._set('Translation', 'libretranslate_url', url)
         self.save_config()
 
-    # OCR引擎相关配置
-    def get_ocr_type(self):
-        """
-        获取OCR引擎类型
-
-        Returns:
-            str: OCR引擎类型
-        """
-        return self.config.get('OCR', 'ocr_type', fallback='tesseract')
-
-    def set_ocr_type(self, ocr_type):
-        """
-        设置OCR引擎类型
-
-        Args:
-            ocr_type (str): OCR引擎类型
-        """
-        if not self.config.has_section('OCR'):
-            self._set_ocr_defaults()
-        self._set('OCR', 'ocr_type', ocr_type)
-        self.save_config()
-
+    # OCR 识别参数（引擎固定为本地 RapidOCR，不再提供选择/密钥配置）
     def get_ocr_option(self, option, fallback=''):
         """
-        读取 [OCR] 段的配置项（密钥类优先环境变量）
+        读取 [OCR] 段的配置项
 
         Args:
             option (str): 配置项名
@@ -421,11 +424,6 @@ class ConfigManager:
         Returns:
             str: 配置值
         """
-        env_name = self.OCR_SECRET_ENV_OPTIONS.get(option)
-        if env_name:
-            env_value = os.environ.get(env_name)
-            if env_value:
-                return env_value
         return self.config.get('OCR', option, fallback=fallback)
 
     def set_ocr_option(self, option, value):
@@ -492,31 +490,6 @@ class ConfigManager:
         self._set('Overlay', option, value)
         self.save_config()
 
-    # 界面外观配置
-    def get_theme(self):
-        """
-        获取界面主题标识
-
-        Returns:
-            str: 'dark' 或 'light'；非法值回退 dark
-        """
-        raw = self.config.get('UI', 'theme', fallback='dark')
-        value = str(raw or '').strip().lower()
-        return value if value in ('dark', 'light') else 'dark'
-
-    def set_theme(self, theme):
-        """
-        设置界面主题并保存
-
-        Args:
-            theme (str): 'dark' / 'light'
-        """
-        value = str(theme or '').strip().lower()
-        if value not in ('dark', 'light'):
-            value = 'dark'
-        self._set('UI', 'theme', value)
-        self.save_config()
-
     # 快捷键配置
     def get_global_hotkey(self):
         """
@@ -577,13 +550,6 @@ class ConfigManager:
         'baidu_api_key': 'BAIDU_API_KEY',
         'youdao_app_id': 'YOUDAO_APP_ID',
         'youdao_api_key': 'YOUDAO_API_KEY',
-        'llm_api_key': 'LLM_API_KEY',
-    }
-
-    # [OCR] 段的密钥同理：云端 OCR 的 Secret Key 同样不该只以明文落盘
-    OCR_SECRET_ENV_OPTIONS = {
-        'baidu_ocr_api_key': 'BAIDU_OCR_API_KEY',
-        'baidu_ocr_secret_key': 'BAIDU_OCR_SECRET_KEY',
     }
 
     @classmethod
@@ -598,20 +564,6 @@ class ConfigManager:
             bool: True 表示值来自环境，不该被写回明文配置
         """
         env_name = cls.SECRET_ENV_OPTIONS.get(option)
-        return bool(env_name and os.environ.get(env_name))
-
-    @classmethod
-    def is_env_ocr_secret(cls, option):
-        """
-        [OCR] 段配置项当前是否由环境变量提供
-
-        Args:
-            option (str): OCR 段中的配置项名
-
-        Returns:
-            bool: True 表示值来自环境，不该被写回明文配置
-        """
-        env_name = cls.OCR_SECRET_ENV_OPTIONS.get(option)
         return bool(env_name and os.environ.get(env_name))
 
     def _get_secret(self, env_name, option):
@@ -692,64 +644,6 @@ class ConfigManager:
         self._set('Translation', 'youdao_api_key', api_key)
         self.save_config()
 
-    # LLM（OpenAI兼容接口）翻译配置
-    # 注意：llm_base_url 和 llm_model 非密钥，直接读写配置文件
-    def get_llm_base_url(self):
-        """
-        获取LLM API地址
-
-        Returns:
-            str: API地址
-        """
-        return self.config.get('Translation', 'llm_base_url', fallback='https://api.openai.com/v1')
-
-    def set_llm_base_url(self, base_url):
-        """
-        设置LLM API地址
-
-        Args:
-            base_url (str): API地址
-        """
-        self._set('Translation', 'llm_base_url', base_url)
-        self.save_config()
-
-    def get_llm_api_key(self):
-        """
-        获取LLM API密钥，优先环境变量
-
-        Returns:
-            str: API密钥，未设置时返回空字符串
-        """
-        return self._get_secret('LLM_API_KEY', 'llm_api_key')
-
-    def set_llm_api_key(self, api_key):
-        """
-        设置LLM API密钥并保存配置
-
-        Args:
-            api_key (str): API密钥
-        """
-        self._set('Translation', 'llm_api_key', api_key)
-        self.save_config()
-
-    def get_llm_model(self):
-        """
-        获取LLM模型名称
-
-        Returns:
-            str: 模型名称
-        """
-        return self.config.get('Translation', 'llm_model', fallback='gpt-4o-mini')
-
-    def set_llm_model(self, model):
-        """
-        设置LLM模型名称
-
-        Args:
-            model (str): 模型名称
-        """
-        self._set('Translation', 'llm_model', model)
-        self.save_config()
 
 if __name__ == '__main__':
     # 测试配置管理器

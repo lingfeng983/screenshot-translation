@@ -13,6 +13,13 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# 与 main.py 相同的导入顺序约束：先加载 QtCore 再导入 onnxruntime 会让进程
+# 在 onnxruntime 模块初始化阶段访问冲突退出（无 Python 异常、无用例失败信息）
+try:
+    import onnxruntime  # noqa: F401
+except ImportError:
+    pass
+
 import pytest
 
 

@@ -9,25 +9,18 @@
 
 from ..provider_common import BaseProvider
 
-# 常见目标语言：UI下拉框与各provider共用的映射表
+# 翻译目标语言：UI下拉框与各provider共用的映射表
 # 格式: (语言代码, 显示名)
+# 只保留中英互译两个目标；源语言始终由引擎自动识别
 TARGET_LANGUAGES = [
     ('zh', '中文'),
-    ('zh-TW', '繁体中文'),
     ('en', '英语'),
-    ('ja', '日语'),
-    ('ko', '韩语'),
-    ('fr', '法语'),
-    ('de', '德语'),
-    ('es', '西班牙语'),
-    ('ru', '俄语'),
 ]
 
 # 微软系接口（Edge 免费端点与必应/Azure Translator）的语言代码：
-# 繁体中文必须写 zh-Hant，直接送 zh-TW 会被当成不支持的语种
+# 简体中文必须写 zh-Hans，直接送 zh 会被当成不支持的语种
 MICROSOFT_LANG_MAP = {
     'zh': 'zh-Hans',
-    'zh-TW': 'zh-Hant',
 }
 
 

@@ -3,19 +3,23 @@
 """
 截图遮罩的选区浮动工具条
 
-结果态下贴在选区下沿的深色小工具条：原文/双语/译文 三态切换、
-目标语言、复制、钉住、保存、重新翻译、关闭。
+结果态下贴在选区下沿的深色小工具条：原文/双语/译文 三态切换、目标语言、
+提取原文/译文文本、保存原图/译图、复制原图/译图、钉住、重新翻译、关闭。
 
-用真实 QPushButton 而非自绘，命中测试与键盘可达性交给 Qt。
+用真实 QPushButton 而非自绘，命中测试与键盘可达性交给 Qt。图标由
+vector_icons 程序化绘制，右下角"原/译"徽标区分同一动作的两个对象。
 """
 
-from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt5.QtCore import QSize, Qt, pyqtSignal
 from PyQt5.QtWidgets import QComboBox, QPushButton, QWidget, QHBoxLayout
 
-from . import result_render
+from . import result_render, vector_icons
 
 # 高度固定，宽度由内容决定；越宽时按 _TRIM_ORDER 逐级精简
 TOOLBAR_HEIGHT = 34
+
+_ICON_SIZE = 20
+_ICON_BUTTON_SIZE = QSize(28, 26)
 
 _TOOLBAR_QSS = """
 QWidget#OverlayToolbar {
@@ -31,6 +35,7 @@ QPushButton {
     border-radius: 6px;
     font-size: 12px;
 }
+QPushButton[iconAction="true"] { padding: 2px 5px; }
 QPushButton:hover { background-color: #2d2f33; }
 QPushButton:pressed { background-color: #3c3f44; }
 QPushButton:checked { background-color: #3b82f6; color: #ffffff; font-weight: 600; }
@@ -57,9 +62,10 @@ class OverlayToolbar(QWidget):
 
     mode_changed = pyqtSignal(str)
     language_changed = pyqtSignal(str)
-    copy_clicked = pyqtSignal()
+    text_copy_clicked = pyqtSignal(str)     # 'original' / 'translated'
+    image_save_clicked = pyqtSignal(str)    # 'original' / 'translated'
+    image_copy_clicked = pyqtSignal(str)    # 'original' / 'translated'
     pin_clicked = pyqtSignal()
-    save_clicked = pyqtSignal()
     retranslate_clicked = pyqtSignal()
     close_clicked = pyqtSignal()
 
@@ -81,6 +87,7 @@ class OverlayToolbar(QWidget):
 
         self._mode_buttons = {}
         self._trimmable = []
+        self._icon_buttons = {}
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(6, 4, 6, 4)
@@ -109,33 +116,60 @@ class OverlayToolbar(QWidget):
         # 全部失灵，只能鼠标点回去
         self.lang_combo.activated.connect(self._reactivate_host)
         layout.addWidget(self.lang_combo)
-        self._trimmable.append(self.lang_combo)
 
         layout.addSpacing(6)
 
-        self.copy_button = self._make_button('复制')
-        self.copy_button.clicked.connect(self.copy_clicked.emit)
-        layout.addWidget(self.copy_button)
+        self.text_original_button = self._make_icon_button(
+            'text', '原', '提取原文到剪贴板', self.text_copy_clicked, 'original')
+        layout.addWidget(self.text_original_button)
+
+        self.text_translated_button = self._make_icon_button(
+            'text', '译', '提取译文到剪贴板', self.text_copy_clicked, 'translated')
+        layout.addWidget(self.text_translated_button)
+
+        self.save_original_button = self._make_icon_button(
+            'save', '原', '保存原图', self.image_save_clicked, 'original')
+        layout.addWidget(self.save_original_button)
+
+        self.save_translated_button = self._make_icon_button(
+            'save', '译', '保存译图', self.image_save_clicked, 'translated')
+        layout.addWidget(self.save_translated_button)
+
+        self.copy_original_image_button = self._make_icon_button(
+            'copy', '原', '复制原图到剪贴板', self.image_copy_clicked, 'original')
+        layout.addWidget(self.copy_original_image_button)
+
+        self.copy_translated_image_button = self._make_icon_button(
+            'copy', '译', '复制译图到剪贴板', self.image_copy_clicked, 'translated')
+        layout.addWidget(self.copy_translated_image_button)
+
+        layout.addSpacing(4)
 
         self.pin_button = self._make_button('钉住')
         self.pin_button.clicked.connect(self.pin_clicked.emit)
         layout.addWidget(self.pin_button)
-        self._trimmable.append(self.pin_button)
-
-        self.save_button = self._make_button('保存')
-        self.save_button.clicked.connect(self.save_clicked.emit)
-        layout.addWidget(self.save_button)
-        self._trimmable.append(self.save_button)
 
         self.retranslate_button = self._make_button('重译')
         self.retranslate_button.clicked.connect(self.retranslate_clicked.emit)
         layout.addWidget(self.retranslate_button)
-        self._trimmable.append(self.retranslate_button)
 
         self.close_button = self._make_button('×')
         self.close_button.setFocusPolicy(Qt.NoFocus)
         self.close_button.clicked.connect(self.close_clicked.emit)
         layout.addWidget(self.close_button)
+
+        # 窄选区优先省掉图片操作，再省文本提取；模式切换与关闭始终保留
+        self._trimmable = [
+            self.lang_combo,
+            self.copy_translated_image_button,
+            self.copy_original_image_button,
+            self.save_translated_button,
+            self.save_original_button,
+            self.text_translated_button,
+            self.text_original_button,
+            self.pin_button,
+            self.retranslate_button,
+        ]
 
         self.set_mode(mode, emit=False)
 
@@ -145,6 +179,30 @@ class OverlayToolbar(QWidget):
         button.setCheckable(checkable)
         button.setFocusPolicy(Qt.NoFocus)
         button.setCursor(Qt.PointingHandCursor)
+        return button
+
+    def _make_icon_button(self, icon_name, badge, tooltip, signal, kind):
+        """
+        创建带"原/译"徽标的图标按钮
+
+        Args:
+            icon_name (str): vector_icons 里的图标名
+            badge (str): 右下角徽标
+            tooltip (str): 悬停提示（同时作为无障碍名称）
+            signal (pyqtSignal): 点击时发出的信号
+            kind (str): 随信号带出的对象类型（original/translated）
+        """
+        button = QPushButton(self)
+        button.setIcon(vector_icons.icon(icon_name, badge=badge))
+        button.setIconSize(QSize(_ICON_SIZE, _ICON_SIZE))
+        button.setFixedSize(_ICON_BUTTON_SIZE)
+        button.setFocusPolicy(Qt.NoFocus)
+        button.setCursor(Qt.PointingHandCursor)
+        button.setToolTip(tooltip)
+        button.setAccessibleName(tooltip)
+        button.setProperty('iconAction', True)
+        button.clicked.connect(lambda _checked=False, k=kind: signal.emit(k))
+        self._icon_buttons[(icon_name, kind, badge)] = button
         return button
 
     def _on_mode_clicked(self, mode_key):

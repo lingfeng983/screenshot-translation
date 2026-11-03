@@ -41,7 +41,7 @@ def test_provider_registry():
     names = provider_registry.names()
     print(f"已注册的提供者: {names}")
 
-    expected = {'edge_free', 'google_free', 'libretranslate', 'bing', 'baidu', 'youdao', 'llm'}
+    expected = {'edge_free', 'google_free', 'libretranslate', 'bing', 'baidu', 'youdao'}
     missing = expected - set(names)
     assert not missing, f"缺少内置提供者: {missing}"
 
@@ -88,10 +88,6 @@ def test_edge_free_provider():
     assert kwargs['json'] == ['Hello world'], "body必须是字符串数组"
     assert 'to=zh-Hans' in args[0], "目标语言应映射为zh-Hans"
     assert 'from=&' in args[0], "auto源语言应留空from参数"
-
-    # 繁体映射
-    provider.translate("hi", 'auto', 'zh-TW')
-    assert 'to=zh-Hant' in session.post.call_args[0][0]
 
     print("✅ Edge免费翻译provider测试通过\n")
 
@@ -267,37 +263,13 @@ def test_per_translation_target_lang():
     print("✅ 单次翻译目标语言测试通过\n")
 
 
-def test_llm_messages():
-    """测试LLM提示词构造与think标签清理"""
-    print("=== 测试LLM provider ===")
-    from managers.providers.llm import LLMProvider
-
-    provider = LLMProvider()
-    messages = provider._build_messages("Hello", 'auto', 'zh')
-    assert messages[0]['role'] == 'system'
-    assert '中文' in messages[1]['content']
-    assert 'Hello' in messages[1]['content']
-
-    # 指定源语言
-    messages2 = provider._build_messages("Hello", 'en', 'ja')
-    assert '英语' in messages2[1]['content'] and '日语' in messages2[1]['content']
-
-    # think标签清理
-    dirty = "<think>推理过程</think>你好世界"
-    assert provider._strip_reasoning(dirty) == "你好世界"
-    assert provider._strip_reasoning("普通文本") == "普通文本"
-
-    print("✅ LLM provider测试通过\n")
-
-
 def test_target_languages():
-    """测试目标语言表"""
+    """测试目标语言表：只保留中英互译"""
     print("=== 测试目标语言 ===")
     from managers.providers.base import TARGET_LANGUAGES
 
     codes = [c for c, _ in TARGET_LANGUAGES]
-    assert 'zh' in codes and 'en' in codes and 'ja' in codes
-    assert len(codes) == len(set(codes)), "语言代码不应重复"
+    assert codes == ['zh', 'en'], f"目标语言应收窄为中/英: {codes}"
 
     print("✅ 目标语言测试通过\n")
 
@@ -508,7 +480,8 @@ def test_bing_uses_microsoft_language_codes():
     """
     必应/Azure 的语言代码与 Edge 免费端点同源
 
-    zh-TW 直接送过去会 400；两处各自维护映射表的话迟早一边改一边没改。
+    微软用 zh-Hans 表示简体中文，直接送 zh 也能认但语义不明确；两处各自维护
+    映射表的话迟早一边改一边没改。
     """
     print("=== 测试必应语种映射 ===")
     from unittest import mock
@@ -528,14 +501,14 @@ def test_bing_uses_microsoft_language_codes():
     provider.session = mock.Mock()
     provider.session.post.return_value = resp
 
-    provider.translate('hi', 'auto', 'zh-TW')
+    provider.translate('hi', 'auto', 'zh')
     params = provider.session.post.call_args.kwargs['params']
-    assert params['to'] == 'zh-Hant', f"繁体未映射: {params['to']}"
+    assert params['to'] == 'zh-Hans', f"中文未映射: {params['to']}"
 
     provider.session.post.reset_mock()
-    provider.translate('hi', 'auto', 'ja')
+    provider.translate('hi', 'auto', 'en')
     params = provider.session.post.call_args.kwargs['params']
-    assert params['to'] == 'ja', f"日语不该被改写: {params['to']}"
+    assert params['to'] == 'en', f"英语不该被改写: {params['to']}"
 
     print("✅ 必应语种映射测试通过\n")
 

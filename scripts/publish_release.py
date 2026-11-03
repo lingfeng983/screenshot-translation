@@ -5,18 +5,15 @@
 
 流程：
     1. pytest 全量测试（--skip-tests 可跳过）
-    2. PyInstaller 构建 onedir（OCR 组件不进 exe，见第 3 步）
+    2. PyInstaller 构建 onedir（RapidOCR 模型随 exe 分发，安装时不再下载组件）
     3. 出包：onedir 同步到 release/onedir/ → Inno Setup 编译唯一的交付物
-       release/ScreenshotTranslator-Setup.exe；再抽 OCR 最小集切成
-       dist/release/ocr-components.zip.00N，作为安装包安装时要下载的 Release 附件
+       release/ScreenshotTranslator-Setup.exe
     4. CHANGELOG 的 [Unreleased] 段落就地改名为 [v版本] — 日期
     5. git commit + tag + push（含 tag；origin 推 GitHub，gitee 远程存在则镜像）
-    6. GitHub API 创建/更新 Release（取 [v版本] 段作为说明），并把安装包与
-       OCR 组件分卷作为附件上传（uploads.github.com，二进制 body）：
-       同名旧附件要等新附件传成功才删，所以整条命令可以重复执行。
+    6. GitHub API 创建/更新 Release（取 [v版本] 段作为说明），并上传安装包
+       （uploads.github.com，二进制 body）：同名旧附件要等新附件传成功才删，
+       所以整条命令可以重复执行。
        origin 与发布目标仓库不一致时在第 1 步之前就中止。
-       Setup.exe 与 ocr-components 分卷必须落在同一个 tag 下——安装包按
-       v版本 去取 OCR 附件，取不到就按设计中止安装。
 
 用法：
     python scripts/publish_release.py --version 1.2.0
@@ -48,8 +45,7 @@ GITHUB_UPLOAD = "https://uploads.github.com"
 logger = logging.getLogger("publish-release")
 
 ISCC_CANDIDATES = [
-    # 安装脚本用了 Inno 7 的内置下载（download 标志 + ExternalSize + Hash +
-    # extractarchive），6.x 编不过，所以候选只列 7
+    # lzma2/ultra64 压缩字典在 Inno 7 上才放开，6.x 会退回默认字典
     r"C:\Program Files\Inno Setup 7\iscc.exe",
     r"C:\Program Files (x86)\Inno Setup 7\iscc.exe",
 ]
@@ -106,7 +102,7 @@ def step_build(version, no_build):
 
 
 def step_assemble(version):
-    print("\n=== 3/6 出包：Setup.exe + OCR 组件分卷 ===")
+    print("\n=== 3/6 出包：Setup.exe ===")
     src = os.path.join(PROJECT_ROOT, "dist", "ScreenshotTranslator")
     dst = os.path.join(PROJECT_ROOT, "release", "onedir")
     if not os.path.isdir(src):
@@ -115,40 +111,11 @@ def step_assemble(version):
         shutil.rmtree(dst)
     shutil.copytree(src, dst)
 
-    # OCR 组件不进 exe，改成安装时从本次 Release 的附件拉取，所以分卷必须跟安装包
-    # 一起产出、一起上传（包名固定，装填器按名字找）。而且必须**先**打包再编安装脚本：
-    # download 标志要在编译期给出附件字节数与 SHA256，这两个值只有出包那步知道
-    run([sys.executable, "scripts/collect_ocr_bundle.py"])
-    run([sys.executable, "scripts/make_release_package.py"])
-    parts_dir = os.path.join(PROJECT_ROOT, "dist", "release")
-    for name in ("ocr-components.zip.001", "ocr-components.zip.sha256",
-                 "ocr-artifact.iss"):
-        path = os.path.join(parts_dir, name)
-        if not os.path.isfile(path):
-            sys.exit(f"缺少 OCR 附件：{path}（安装包里勾了下载的都会失败）")
-    parts = sorted(n for n in os.listdir(parts_dir)
-                   if n.startswith("ocr-components.zip.") and not n.endswith(".sha256"))
-    if len(parts) > 1:
-        # Setup 内置下载只取单个附件，多卷得回到老的合并路线，不能默默出一个
-        # 勾了 OCR 就必然中止的安装包
-        sys.exit(f"OCR 组件被切成了 {len(parts)} 卷：安装包只会下载第一卷，识别必然失败。"
-                 f"用 --part-size 放宽到单卷（GitHub 单附件上限 2GB），"
-                 f"或临时用 python scripts/setup_ocr.py --release v{version} 补装组件")
-
     iscc = next((p for p in ISCC_CANDIDATES if os.path.isfile(p)), None)
     if not iscc:
         sys.exit("未找到 Inno Setup 7 编译器 iscc.exe，请安装后重试")
     iss = os.path.join(PROJECT_ROOT, "scripts", "setup.iss")
-    output = run([iscc, f"/DMyAppVersion={version}", f"/DMyAppOcrTag=v{version}", iss],
-                 capture=True)
-    # 上面查的是文件在不在，这里查的是编译结果真把 download 条目编进去了没有：
-    # 三元组缺一项或多卷时 setup.iss 走的是"未就绪"分支，产物同名、编得过，
-    # 只有装到用户机器上勾了 OCR 才会中止——那种包不能发
-    if "OCRDownloadReady=1" not in output:
-        reason = re.search(r"OCRDownloadReady=0 reason=(\S+)", output)
-        sys.exit("安装包没编进 OCR 内置下载（"
-                 + (reason.group(1) if reason else "编译输出里没有就绪哨兵")
-                 + "）：确认 dist/release/ocr-artifact.iss 与单卷附件齐备后重跑")
+    run([iscc, f"/DMyAppVersion={version}", iss], capture=True)
 
 
 def step_changelog(version):
@@ -373,14 +340,8 @@ def upload_attachment(rid, path, token):
 
 
 def collect_attachments():
-    """本次要传的附件：安装包 + OCR 组件分卷与校验文件"""
+    """本次要传的附件：只有安装包（OCR 模型已打进 onedir）"""
     files = [os.path.join(PROJECT_ROOT, "release", "ScreenshotTranslator-Setup.exe")]
-    parts_dir = os.path.join(PROJECT_ROOT, "dist", "release")
-    files += sorted(
-        os.path.join(parts_dir, n)
-        for n in os.listdir(parts_dir)
-        if n.startswith("ocr-components.zip.")
-    ) if os.path.isdir(parts_dir) else []
     missing = [p for p in files if not os.path.isfile(p)]
     if missing:
         sys.exit(f"缺少待上传附件: {missing}")

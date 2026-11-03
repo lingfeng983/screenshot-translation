@@ -118,7 +118,7 @@ class ErrorHandler:
         ErrorHandler.handle_error(error, "OCR", show_message)
 
         # OCR失败时返回默认文本
-        return "[OCR识别失败，请确保已安装Tesseract OCR]"
+        return "[OCR识别失败，请检查本地OCR组件或改用在线OCR]"
 
     @staticmethod
     def handle_translation_error(error, show_message=False):
