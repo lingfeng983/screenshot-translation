@@ -12,7 +12,7 @@ import threading
 import time
 
 from PIL import ImageGrab
-from PyQt5.QtCore import Qt, QRect, QPoint, QTimer, pyqtSignal
+from PyQt5.QtCore import Qt, QRect, QRectF, QPoint, QTimer, pyqtSignal
 from PyQt5.QtGui import QPainter, QPen, QColor, QCursor, QPixmap
 from PyQt5.QtWidgets import QApplication, QWidget
 
@@ -172,7 +172,7 @@ class ScreenshotManager:
 
     def start_screenshot(self):
         """
-        启动截图流程
+        启动截图流程（框选后识别并翻译）
         """
         logger.info("启动截图流程")
 
@@ -183,10 +183,25 @@ class ScreenshotManager:
             # 打包后没有控制台，print_exc 那路等于什么都没留
             logger.exception("启动截图流程失败")
 
-    def _run_screenshot(self):
+    def start_capture(self):
+        """
+        启动纯截图流程：框选后只展示原图与保存/复制/钉住，不跑 OCR 与翻译
+        """
+        logger.info("启动截图流程（仅截图）")
+
+        try:
+            qt_dispatcher.dispatch_to_main_thread(
+                self._run_screenshot, capture_only=True)
+        except Exception:
+            logger.exception("启动纯截图流程失败")
+
+    def _run_screenshot(self, capture_only=False):
         """
         运行截图流程
         确保在主线程中运行，避免Qt线程安全问题
+
+        Args:
+            capture_only (bool): True 时框选后跳过识别翻译
         """
         try:
             # 获取QApplication实例（非主线程不会新建）
@@ -209,7 +224,7 @@ class ScreenshotManager:
 
             # 创建截图窗口，保留强引用避免被GC回收；传入配置以读取遮罩参数
             self._screenshot_widget = ScreenshotWidget(
-                config_manager=self.config_manager)
+                config_manager=self.config_manager, capture_only=capture_only)
 
             # 连接信号
             widget = self._screenshot_widget
@@ -283,7 +298,7 @@ class ScreenshotManager:
         提交后台任务，线程池拒收时当场给出可重试提示
 
         submit 返回 None 意味着没有任何线程会来回投结果：不处理的话遮罩
-        永远停在"识别并翻译中"，用户只能 ESC 重来。
+        就停在小转圈上转个没完，用户只能 ESC 重来。
 
         Args:
             widget: 当前遮罩窗口
@@ -604,15 +619,18 @@ class ScreenshotWidget(QWidget):
     # 信号：截图取消
     screenshot_canceled = pyqtSignal()
 
-    def __init__(self, config_manager=None):
+    def __init__(self, config_manager=None, capture_only=False):
         """
         初始化截图窗口
 
         Args:
             config_manager: 配置管理器实例，读取 [Overlay] 段的遮罩参数；
                 不传时使用默认值
+            capture_only (bool): True 时框选后只展示原图与保存/复制/钉住，
+                不发起识别与翻译
         """
         super().__init__()
+        self.capture_only = bool(capture_only)
 
         # 设置窗口属性
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
@@ -674,6 +692,10 @@ class ScreenshotWidget(QWidget):
         self._mode = result_render.MODE_TRANSLATED
         self._loading = False
         self._error = None
+        # 加载动画：角度由定时器推进，只重绘胶囊那一小块
+        self._spinner_angle = 0
+        self._spinner_timer = None
+        self._spinner_rect = None
         self._toolbar = None
         # 每次确认选区递增，用于丢弃上一次选区的迟到结果
         self._request_id = 0
@@ -788,6 +810,14 @@ class ScreenshotWidget(QWidget):
     _ACCENT = QColor("#3b82f6")               # 强调蓝：选区边框
     _BUBBLE_BG = QColor(30, 36, 48, 235)      # 气泡底：主题面板色
     _BUBBLE_TEXT = QColor("#93c5fd")          # 气泡文字：淡蓝
+
+    # 加载动画：选区居中的小圆环。只转圈、不带文字——等待本身不需要解释
+    _SPINNER_BOX = 44                         # 胶囊直径（像素）
+    _SPINNER_RING_INSET = 11                  # 圆环距胶囊边缘的留白
+    _SPINNER_WIDTH = 2.5                      # 圆环线宽
+    _SPINNER_ARC = 280                        # 弧长（度）：留缺口才看得出在转
+    _SPINNER_STEP = 20                        # 每帧转过的角度
+    _SPINNER_INTERVAL = 33                    # 帧间隔（毫秒，约 30fps）
 
     # 默认可调参数（实际值从 [Overlay] 配置段读取）
     _DEFAULT_DIM_OPACITY = 90                 # 暗角透明度 (0~180)
@@ -1156,6 +1186,7 @@ class ScreenshotWidget(QWidget):
         self._result = payload
         self._error = None
         self._loading = False
+        self._stop_loading_spinner()
         self._result_rect = region
         self._scale = scale
         self._scale_y = scale_y
@@ -1176,6 +1207,7 @@ class ScreenshotWidget(QWidget):
         """识别/翻译失败：保留选区并给出可重试的错误卡片"""
         self._result = None
         self._loading = False
+        self._stop_loading_spinner()
         self._error = message or '识别失败'
         self._hide_toolbar()
         self.update()
@@ -1200,13 +1232,21 @@ class ScreenshotWidget(QWidget):
         return None
 
     def set_result_busy(self, busy):
-        """请求进行中：禁用工具条并重译期间给出提示"""
+        """
+        请求进行中：禁用工具条，并在选区中央转圈
+
+        重译/重试与首次识别共用同一个动画：界面里不再出现"翻译中"这类文字，
+        等待只用一个转圈表达。
+        """
         if self._toolbar is not None:
             self._toolbar.set_busy(busy)
-        if busy and self._error:
+        if busy:
             self._error = None
             self._loading = True
+            self._start_loading_spinner()
             self.update()
+        else:
+            self._stop_loading_spinner()
 
     def _build_paragraphs(self):
         """把逻辑坐标行块聚成段落，返回 [(屏幕矩形, [块下标]), ...]"""
@@ -1263,7 +1303,7 @@ class ScreenshotWidget(QWidget):
 
         if self._loading:
             self._draw_border(painter, rect)
-            self._draw_pill(painter, rect, '识别并翻译中…')
+            self._draw_loading_spinner(painter, rect)
             return
         if self._error:
             self._draw_border(painter, rect)
@@ -1326,7 +1366,7 @@ class ScreenshotWidget(QWidget):
             tuple 或 None: (anchor, title, body, footer)
         """
         payload = self._result
-        if payload is None:
+        if payload is None or self.capture_only:
             return None
         texts = payload.get('block_texts') or []
         title = self._card_title()
@@ -1384,6 +1424,74 @@ class ScreenshotWidget(QWidget):
                 rect.setBottom(bottom)
         return rect
 
+    def _draw_loading_spinner(self, painter, anchor):
+        """
+        选区居中的加载动画：一个深色小圆盘 + 旋转的弧
+
+        比原来那句"识别并翻译中…"更安静，也省掉一行要看的中文；
+        圆盘位置按选区中心算好并记下来，定时器只重绘这一小块，
+        不必每帧把整张冻结桌面重画一遍。
+        """
+        size = self._SPINNER_BOX
+        x = anchor.center().x() - size // 2
+        y = anchor.center().y() - size // 2
+        x = max(4, min(x, self.screen_width - size - 4))
+        y = max(4, min(y, self.screen_height - size - 4))
+        bubble = QRect(x, y, size, size)
+        # 局部重绘范围：多留 2px 给抗锯齿边缘
+        self._spinner_rect = bubble.adjusted(-2, -2, 2, 2)
+
+        painter.save()
+        try:
+            painter.setRenderHint(QPainter.Antialiasing, True)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(self._BUBBLE_BG)
+            painter.drawRoundedRect(bubble, size // 2, size // 2)
+
+            inset = self._SPINNER_RING_INSET
+            ring = QRectF(bubble.adjusted(inset, inset, -inset, -inset))
+
+            track = QColor(self._BUBBLE_TEXT)
+            track.setAlpha(56)
+            painter.setBrush(Qt.NoBrush)
+            painter.setPen(QPen(track, self._SPINNER_WIDTH))
+            painter.drawEllipse(ring)
+
+            arc = QPen(self._BUBBLE_TEXT, self._SPINNER_WIDTH)
+            arc.setCapStyle(Qt.RoundCap)
+            painter.setPen(arc)
+            # Qt 的角度单位是 1/16 度；起点取负角度，视觉上是顺时针转
+            painter.drawArc(
+                ring, int(-self._spinner_angle * 16), int(-self._SPINNER_ARC * 16))
+        finally:
+            painter.restore()
+
+    def _start_loading_spinner(self):
+        """开始转圈（重复调用不会叠加定时器）"""
+        if self._spinner_timer is None:
+            self._spinner_timer = QTimer(self)
+            self._spinner_timer.setInterval(self._SPINNER_INTERVAL)
+            self._spinner_timer.timeout.connect(self._tick_loading_spinner)
+        if not self._spinner_timer.isActive():
+            self._spinner_angle = 0
+            self._spinner_rect = None
+            self._spinner_timer.start()
+
+    def _tick_loading_spinner(self):
+        """推进一帧：有上次的圆盘位置就只刷那一块"""
+        self._spinner_angle = (self._spinner_angle + self._SPINNER_STEP) % 360
+        rect = self._spinner_rect
+        if rect is not None and not rect.isEmpty():
+            self.update(rect)
+        else:
+            self.update()
+
+    def _stop_loading_spinner(self):
+        """停表：结果回来（成功或失败）后不再空转"""
+        if self._spinner_timer is not None:
+            self._spinner_timer.stop()
+        self._spinner_rect = None
+
     def _draw_pill(self, painter, anchor, text):
         """选区居中的状态胶囊（加载中/提示）"""
         font = painter.font()
@@ -1412,7 +1520,8 @@ class ScreenshotWidget(QWidget):
             return
         toolbar = OverlayToolbar(self, payload.get('languages') or [],
                                  current_lang=payload.get('target_lang'),
-                                 mode=self._mode)
+                                 mode=self._mode,
+                                 capture_only=self.capture_only)
         toolbar.language_changed.connect(
             lambda lang: self.retranslate_requested.emit(lang, True))
         toolbar.mode_changed.connect(self._set_mode)
@@ -1685,6 +1794,13 @@ class ScreenshotWidget(QWidget):
     def _handle_result_ctrl_key(self, event):
         """结果态下的 Ctrl 组合键"""
         key = event.key()
+        if self.capture_only:
+            # 纯截图没有文本可复制/无可对比的译图，复制的就是原图
+            if key == Qt.Key_C:
+                self._copy_image('original')
+            elif key == Qt.Key_S:
+                self._save_image('original')
+            return
         if key == Qt.Key_C:
             self._copy_result()
         elif key == Qt.Key_S:
@@ -1693,6 +1809,11 @@ class ScreenshotWidget(QWidget):
     def _handle_result_key(self, event):
         """结果态下的单键操作：T 切模式、1/2/3 直选、P 钉住、R 重试"""
         key = event.key()
+        if self.capture_only:
+            # 纯截图只有一种形态：保留钉住，模式切换/重试没有意义
+            if key == Qt.Key_P:
+                self._pin_result()
+            return
         if key == Qt.Key_T:
             self._cycle_mode()
         elif key in (Qt.Key_1, Qt.Key_2, Qt.Key_3):
@@ -2012,10 +2133,24 @@ class ScreenshotWidget(QWidget):
         self._scale = screenshot.width / max(1, rect.width())
         self._scale_y = screenshot.height / max(1, rect.height())
         self._crop_pixmap = result_render.pil_to_qpixmap(screenshot, dpr=self._scale)
+        self.setCursor(QCursor(Qt.ArrowCursor))
+
+        if self.capture_only:
+            # 纯截图：不发起识别与翻译，裁剪图本身就是结果
+            self.show_result({
+                'original_text': '', 'translated_text': '',
+                'blocks': [], 'block_texts': [],
+                'image': screenshot, 'region': QRect(rect),
+                'languages': [], 'target_lang': None,
+                'request_id': self._request_id, 'error': None,
+            })
+            return
+
+        # 遮罩不关闭：先用本次裁剪图冻结选区做加载提示，结果回来后就地覆盖
         self._loading = True
         self._hide_toolbar()
-        self.setCursor(QCursor(Qt.ArrowCursor))
         self.region_selected.emit(screenshot, QRect(rect))
+        self._start_loading_spinner()
         self.update()
 
     def keyPressEvent(self, event):
@@ -2042,6 +2177,7 @@ class ScreenshotWidget(QWidget):
         self._frozen_pixmap = None
         self._crop_pixmap = None
         self.full_screen = None
+        self._stop_loading_spinner()
         super().closeEvent(event)
 
     def _finish_after_copy(self):

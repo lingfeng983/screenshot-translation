@@ -39,9 +39,15 @@ class OCRProviderRegistry(ProviderRegistry):
 ocr_provider_registry = OCRProviderRegistry()
 
 
+# Nuitka 编译分布里没有可扫描的 .py，按此清单显式导入
+_BUILTIN_MODULES = ('mock', 'rapidocr')
+
+
 def _discover_ocr_providers():
     """自动发现并注册本包内所有 OCR provider 模块"""
-    discover_providers(ocr_provider_registry, __import__(__name__, fromlist=['']))
+    discover_providers(
+        ocr_provider_registry, __import__(__name__, fromlist=['']),
+        fallback_modules=_BUILTIN_MODULES)
 
 
 _discover_ocr_providers()

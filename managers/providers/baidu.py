@@ -6,8 +6,6 @@
 
 import time
 
-import requests
-
 from ..provider_common import (
     ProviderUnavailableError, describe_error, make_md5_sign,
     raise_business_error, raise_for_status, wrap_request_error)
@@ -47,6 +45,9 @@ class BaiduProvider(TranslationProvider):
         Returns:
             str: 翻译后的文本
         """
+        # 延迟导入：启动期加载 urllib3 要 87ms，真正发请求时再付
+        import requests
+
         if self.config_manager:
             app_id, api_key = self.config_manager.get_baidu_api_info()
         else:

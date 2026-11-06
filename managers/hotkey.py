@@ -20,7 +20,8 @@ import time
 
 import keyboard
 
-from .hotkey_native import NativeHotkeyBackend
+from .hotkey_native import (
+    HOTKEY_ID, HOTKEY_ID_CAPTURE, NativeHotkeyBackend)
 from .qt_dispatcher import qt_dispatcher
 
 logger = logging.getLogger('screenshot-translation')
@@ -40,14 +41,19 @@ class HotkeyManager:
     # 看门狗检查间隔（秒）
     _WATCHDOG_INTERVAL = 15.0
 
-    def __init__(self, screenshot_manager=None, config_manager=None):
+    def __init__(self, screenshot_manager=None, config_manager=None,
+                 action='translate'):
         """
         初始化全局快捷键管理器
 
         Args:
             screenshot_manager: 截图管理器实例
             config_manager: 配置管理器实例
+            action (str): 'translate' 触发识别翻译，'capture' 只截图不翻译
         """
+        if action not in ('translate', 'capture'):
+            raise ValueError(f"未知快捷键动作: {action}")
+        self.action = action
         self.screenshot_manager = screenshot_manager
         self.config_manager = config_manager
         self.hotkey = None
@@ -61,8 +67,10 @@ class HotkeyManager:
         self._watchdog = None
         # 最近一次注册失败的原因文案，供设置页给出针对性提示
         self.last_error = ''
-        # 原生后端实例（非 Windows 上会自动不可用）
-        self.native_backend = NativeHotkeyBackend()
+        # 原生后端实例（非 Windows 上会自动不可用）；两条热键必须用不同 ID，
+        # 否则 RegisterHotKey 后注册的会把先注册的顶掉
+        self.native_backend = NativeHotkeyBackend(
+            hotkey_id=HOTKEY_ID if action == 'translate' else HOTKEY_ID_CAPTURE)
 
         logger.debug("全局快捷键管理器初始化")
 
@@ -101,20 +109,27 @@ class HotkeyManager:
             logger.debug(traceback.format_exc())
             return False
 
+    def _default_hotkey(self):
+        """本动作的默认快捷键（配置缺项/读取失败时使用）"""
+        return 'ctrl+alt+z' if self.action == 'capture' else 'alt+z'
+
     def _load_hotkey_config(self):
         """加载快捷键配置"""
         if self.config_manager:
             try:
-                self.hotkey = self.config_manager.get_global_hotkey()
+                if self.action == 'capture':
+                    self.hotkey = self.config_manager.get_capture_hotkey()
+                else:
+                    self.hotkey = self.config_manager.get_global_hotkey()
                 logger.info(f"从配置加载快捷键: {self.hotkey}")
             except Exception as e:
                 logger.error(f"加载快捷键配置失败: {e}")
                 # 使用默认快捷键
-                self.hotkey = 'alt+z'
+                self.hotkey = self._default_hotkey()
                 logger.info(f"使用默认快捷键: {self.hotkey}")
         else:
             # 使用默认快捷键
-            self.hotkey = 'alt+z'
+            self.hotkey = self._default_hotkey()
             logger.info(f"配置管理器未初始化，使用默认快捷键: {self.hotkey}")
 
     # ---- 注册 / 注销 ----
@@ -232,7 +247,10 @@ class HotkeyManager:
             logger.error("截图管理器未初始化")
             return
         try:
-            self.screenshot_manager.start_screenshot()
+            if self.action == 'capture':
+                self.screenshot_manager.start_capture()
+            else:
+                self.screenshot_manager.start_screenshot()
         except Exception as e:
             logger.error(f"启动截图失败: {e}")
             import traceback
@@ -422,7 +440,10 @@ class HotkeyManager:
 
             # 保存到配置
             if self.config_manager:
-                self.config_manager.set_global_hotkey(hotkey)
+                if self.action == 'capture':
+                    self.config_manager.set_capture_hotkey(hotkey)
+                else:
+                    self.config_manager.set_global_hotkey(hotkey)
 
             logger.info(f"快捷键已设置为: {hotkey}")
             return True

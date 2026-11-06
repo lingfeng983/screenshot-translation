@@ -1,0 +1,260 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+文本翻译页与遮罩加载动画的用例
+
+覆盖两件事：
+1. 文本翻译页能输入、能拿到译文、失败与过期结果的处理
+2. 截图遮罩等结果时只有一个小转圈，不再把"识别并翻译中"写在选区中央
+
+用例刻意不落地到线程池与 Qt 事件循环：本机（Python 3.14 + PyQt5 5.15.10）
+上一旦在 QtCore 之后加载 onnxruntime 会直接终止进程，而"起线程 + 跨线程信号 +
+processEvents 忙等"会让这类冲突在整套用例连跑时偶发触发（实测约 20%）。
+所以提交用记录型假线程池，回投用主线程直调（qt_dispatcher 在主线程就是同步执行），
+既覆盖了参数、状态与回填，也不把用例变成概率性崩溃。
+"""
+
+import os
+
+from PyQt5.QtCore import QRect, Qt
+from PyQt5.QtGui import QKeyEvent
+from PyQt5.QtWidgets import QApplication
+
+from managers.translation import TRANSLATION_FAILURE_PREFIX
+
+
+class _FakeConfig:
+    """只提供翻译页用到的目标语言读取"""
+
+    def get_target_lang(self):
+        """默认目标语言"""
+        return 'zh'
+
+
+class _FakeTranslationManager:
+    """返回固定译文的假管理器：用例不碰网络"""
+
+    def __init__(self, reply='你好，世界'):
+        """
+        Args:
+            reply (str): perform_translation 的返回值
+        """
+        self.reply = reply
+        self.calls = []
+
+    def get_target_languages(self):
+        """目标语言列表"""
+        from managers.providers.base import TARGET_LANGUAGES
+        return TARGET_LANGUAGES
+
+    def perform_translation(self, text, target_lang=None, **kwargs):
+        """记录调用并返回预设译文"""
+        self.calls.append((text, target_lang))
+        return self.reply
+
+
+class _FakePool:
+    """
+    记录型线程池：只记下提交的参数，不真的起线程
+
+    submit 返回一个非 None 的句柄，表示"已受理"；需要模拟拒收时传 accept=False。
+    """
+
+    def __init__(self, accept=True):
+        self.accept = accept
+        self.calls = []
+
+    def submit(self, func, *args):
+        """记录一次提交"""
+        self.calls.append((func, args))
+        return object() if self.accept else None
+
+
+class _FakeMainApp:
+    """翻译页只需要配置与翻译管理器两个依赖"""
+
+    def __init__(self, manager):
+        self.config_manager = _FakeConfig()
+        self.translation_manager = manager
+
+
+def _make_window(qapp, manager):
+    """建一个不显示的翻译页（用例不弹窗，避免打断人）"""
+    from managers.translate_window import TranslateWindow
+    return TranslateWindow(_FakeMainApp(manager))
+
+
+def _use_pool(monkeypatch, pool):
+    """把窗口模块里的线程池换成记录型假池"""
+    import managers.translate_window as tw
+    monkeypatch.setattr(tw, 'thread_pool_manager', pool, raising=True)
+
+
+def test_translate_empty_input_does_not_start(qapp, monkeypatch):
+    """空输入直接提示，不进忙碌态、也不发请求"""
+    pool = _FakePool()
+    _use_pool(monkeypatch, pool)
+    manager = _FakeTranslationManager()
+    window = _make_window(qapp, manager)
+    try:
+        window._on_translate()
+        assert window.status_label.text() == '请先输入要翻译的文本'
+        assert window._busy is False
+        assert pool.calls == []
+    finally:
+        window.close()
+
+
+def test_translate_submits_text_and_language(qapp, monkeypatch):
+    """提交给后台的是去空白后的原文与当前目标语言，同时进入忙碌态"""
+    pool = _FakePool()
+    _use_pool(monkeypatch, pool)
+    manager = _FakeTranslationManager()
+    window = _make_window(qapp, manager)
+    try:
+        window.source_edit.setPlainText('  Hello, world  ')
+        window._on_translate()
+
+        assert len(pool.calls) == 1, '没有提交翻译任务'
+        _func, args = pool.calls[0]
+        assert args == ('Hello, world', 'zh', 1), f'提交参数不对: {args}'
+
+        assert window._busy is True
+        assert window.translate_button.isEnabled() is False
+        assert window.lang_combo.isEnabled() is False
+        assert window.spinner._timer.isActive() is True, '忙碌时转圈没转起来'
+    finally:
+        window.close()
+
+
+def test_translate_rejected_submission_recovers(qapp, monkeypatch):
+    """线程池拒收时当场复原按钮，并给出可重试提示"""
+    _use_pool(monkeypatch, _FakePool(accept=False))
+    window = _make_window(qapp, _FakeTranslationManager())
+    try:
+        window.source_edit.setPlainText('Hello')
+        window._on_translate()
+        assert window._busy is False
+        assert window.translate_button.isEnabled() is True
+        assert '后台任务无法启动' in window.status_label.text()
+    finally:
+        window.close()
+
+
+def test_translate_result_fills_and_stops_spinner(qapp):
+    """后台译文回投主线程后回填结果区，按钮恢复、转圈停止"""
+    manager = _FakeTranslationManager(reply='你好，世界')
+    window = _make_window(qapp, manager)
+    try:
+        window._request_id = 1
+        window._set_busy(True)
+        # 直接在主线程跑后台函数：qt_dispatcher 判定已在主线程，同步执行回调
+        window._run_translation('Hello, world', 'zh', 1)
+
+        assert manager.calls == [('Hello, world', 'zh')]
+        assert window.result_edit.toPlainText() == '你好，世界'
+        assert window._busy is False
+        assert window.spinner._timer.isActive() is False
+        assert window.copy_button.isEnabled() is True
+        assert window.translate_button.isEnabled() is True
+    finally:
+        window.close()
+
+
+def test_translate_failure_shows_error_status(qapp):
+    """翻译链全挂时给出红字提示，结果区保持空白"""
+    manager = _FakeTranslationManager(reply=f'{TRANSLATION_FAILURE_PREFIX}] hi')
+    window = _make_window(qapp, manager)
+    try:
+        window._request_id = 1
+        window._set_busy(True)
+        window._run_translation('hi', 'zh', 1)
+
+        assert '翻译失败' in window.status_label.text(), '失败时没有可见提示'
+        assert window.status_label.objectName() == 'statusError'
+        assert window.result_edit.toPlainText() == ''
+        assert window.copy_button.isEnabled() is False
+        assert window.spinner._timer.isActive() is False
+    finally:
+        window.close()
+
+
+def test_ctrl_enter_triggers_translation(qapp, monkeypatch):
+    """输入框里 Ctrl+Enter 等同于点翻译按钮"""
+    pool = _FakePool()
+    _use_pool(monkeypatch, pool)
+    window = _make_window(qapp, _FakeTranslationManager())
+    try:
+        window.source_edit.setPlainText('Hello')
+        event = QKeyEvent(QKeyEvent.KeyPress, Qt.Key_Return, Qt.ControlModifier)
+        QApplication.sendEvent(window.source_edit, event)
+        assert pool.calls, 'Ctrl+Enter 没有触发翻译'
+    finally:
+        window.close()
+
+
+def test_stale_result_is_dropped(qapp):
+    """窗口已关（序号推进）后迟到的译文不再回填"""
+    window = _make_window(qapp, _FakeTranslationManager(reply='迟到的译文'))
+    try:
+        stale_id = window._request_id
+        window._request_id += 1        # 模拟关闭/新一轮请求
+        window._apply_result(stale_id, '迟到的译文', '')
+        assert window.result_edit.toPlainText() == ''
+    finally:
+        window.close()
+
+
+def test_toolbar_busy_keeps_text(qapp):
+    """重译中工具条只置灰，不写出"翻译中"字样（进度交给转圈）"""
+    from managers.overlay_toolbar import OverlayToolbar
+
+    bar = OverlayToolbar(None, [('zh', '中文')], current_lang='zh')
+    try:
+        assert bar.retranslate_button.text() == '重译'
+        bar.set_busy(True)
+        assert bar.retranslate_button.text() == '重译'
+        assert bar.retranslate_button.isEnabled() is False
+        assert bar.lang_combo.isEnabled() is False
+
+        bar.set_busy(False)
+        assert bar.retranslate_button.isEnabled() is True
+        assert bar.lang_combo.isEnabled() is True
+    finally:
+        bar.deleteLater()
+
+
+def test_overlay_loading_spinner_replaces_text(qapp):
+    """遮罩等结果时只有转圈：定时器在跑、圆盘位置已知，源码里不再有提示文字"""
+    from managers.screenshot import ScreenshotWidget
+
+    widget = ScreenshotWidget()
+    try:
+        widget._result_rect = QRect(10, 10, 240, 120)
+        widget._loading = True
+        widget._start_loading_spinner()
+        assert widget._spinner_timer is not None
+        assert widget._spinner_timer.isActive(), '加载动画定时器未启动'
+
+        widget.grab()      # 走一次绘制，圆盘位置才会被记下来
+        assert widget._spinner_rect is not None
+        assert not widget._spinner_rect.isEmpty()
+
+        angle = widget._spinner_angle
+        widget._tick_loading_spinner()
+        assert widget._spinner_angle != angle, '角度没有推进，动画是静止的'
+
+        widget._stop_loading_spinner()
+        assert widget._spinner_timer.isActive() is False
+    finally:
+        widget.close()
+
+    source_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        'managers', 'screenshot.py')
+    with open(source_path, encoding='utf-8') as fp:
+        source = fp.read()
+    # 加载态走的是转圈绘制，不再走 "文字胶囊"
+    assert '_draw_loading_spinner(painter, rect)' in source, '加载态没有画转圈'
+    assert "_draw_pill(painter, rect, '识别并翻译中" not in source, \
+        '加载态又出现了文字提示'

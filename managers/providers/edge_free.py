@@ -10,8 +10,6 @@ Edge 免费翻译提供者（微软翻译，国内可直连，无需API密钥）
 注意：此为 Edge 前端使用的非公开端点，上层已内置重试与降级机制。
 """
 
-import requests
-
 from ..provider_common import (
     ProviderUnavailableError, describe_error, raise_for_status,
     wrap_request_error)
@@ -48,6 +46,9 @@ class EdgeFreeProvider(TranslationProvider):
 
     def _translate_chunk(self, text, source, target):
         """翻译单个文本块"""
+        # 延迟导入：启动期加载 urllib3 要 87ms，真正发请求时再付
+        import requests
+
         to_lang = _TARGET_MAP.get(target, target)
         # from 留空即自动检测源语言
         from_lang = '' if not source or source == 'auto' else source

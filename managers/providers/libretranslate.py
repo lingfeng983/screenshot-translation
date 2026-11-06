@@ -4,8 +4,6 @@
 LibreTranslate 提供者（开源免费，可自建服务）
 """
 
-import requests
-
 from ..provider_common import (
     ProviderUnavailableError, describe_error, raise_for_status,
     wrap_request_error)
@@ -41,6 +39,9 @@ class LibreTranslateProvider(TranslationProvider):
         Returns:
             str: 翻译后的文本
         """
+        # 延迟导入：启动期加载 urllib3 要 87ms，真正发请求时再付
+        import requests
+
         url = self._get_secret('libretranslate_url') or DEFAULT_URL
         target = self._target_map.get(target, target)
 

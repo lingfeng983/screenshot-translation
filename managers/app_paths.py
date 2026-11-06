@@ -21,9 +21,15 @@ logger = logging.getLogger('screenshot-translation')
 USER_DATA_DIR_NAME = '.screenshot-translation'
 
 
+def _is_nuitka() -> bool:
+    """是否由 Nuitka 编译（模块字典里有 __compiled__，且没有 _MEIPASS）"""
+    return '__compiled__' in globals()
+
+
 def _is_frozen() -> bool:
-    """是否运行在 PyInstaller 打包环境中"""
-    return getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS')
+    """是否运行在打包环境中（PyInstaller 或 Nuitka standalone）"""
+    return (getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS')) \
+        or _is_nuitka()
 
 
 def app_root() -> str:
@@ -43,8 +49,9 @@ def bundled_root() -> str:
     - 源码运行 → 项目根（resources/ 就在这里）
     - exe 运行 → sys._MEIPASS（PyInstaller 解包临时目录，含 add-data 资源）
     """
-    if _is_frozen():
+    if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
         return sys._MEIPASS
+    # Nuitka standalone 的 data 文件与可执行文件同目录
     return app_root()
 
 

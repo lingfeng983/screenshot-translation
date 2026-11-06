@@ -243,6 +243,7 @@ class ConfigManager:
             return
 
         self.config.set('Hotkey', 'global_hotkey', 'alt+z')  # 默认快捷键
+        self.config.set('Hotkey', 'capture_hotkey', 'ctrl+alt+z')  # 纯截图快捷键
 
     def _set_startup_defaults(self):
         """设置 [Startup] 段默认配置值"""
@@ -508,6 +509,26 @@ class ConfigManager:
             hotkey (str): 快捷键组合
         """
         self._set('Hotkey', 'global_hotkey', hotkey)
+        self.save_config()
+
+    def get_capture_hotkey(self):
+        """
+        获取纯截图（不翻译）的全局快捷键
+
+        Returns:
+            str: 快捷键组合
+        """
+        return self.config.get('Hotkey', 'capture_hotkey',
+                               fallback='ctrl+alt+z')
+
+    def set_capture_hotkey(self, hotkey):
+        """
+        设置纯截图（不翻译）的全局快捷键
+
+        Args:
+            hotkey (str): 快捷键组合
+        """
+        self._set('Hotkey', 'capture_hotkey', hotkey)
         self.save_config()
 
     # 启动行为配置

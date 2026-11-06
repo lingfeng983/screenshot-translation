@@ -46,5 +46,7 @@ resources/tessdata/
 
 # ===== 工具本地目录 =====
 .freebuff/
+# 项目本地记忆/会话数据（非交付物，发版时 git add -A 不能带进仓库）
+.workbuddy/
 # 开发期探针脚本与目视验证截图
 scratch/

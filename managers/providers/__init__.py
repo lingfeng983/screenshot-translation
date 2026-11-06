@@ -45,9 +45,18 @@ class TranslationProviderRegistry(ProviderRegistry):
 provider_registry = TranslationProviderRegistry()
 
 
+# Nuitka 编译分布里没有可扫描的 .py，按此清单显式导入；新增 provider
+# 时记得同步，否则只有 Nuitka 构建缺这个 provider
+_BUILTIN_MODULES = (
+    'baidu', 'bing', 'edge_free', 'google_free', 'libretranslate', 'youdao',
+)
+
+
 def _discover_providers():
     """自动发现并注册本包内所有翻译 provider 模块"""
-    discover_providers(provider_registry, __import__(__name__, fromlist=['']))
+    discover_providers(
+        provider_registry, __import__(__name__, fromlist=['']),
+        fallback_modules=_BUILTIN_MODULES)
 
 
 _discover_providers()

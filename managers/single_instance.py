@@ -31,7 +31,8 @@ ALLOW_MULTI_ENV = 'ST_ALLOW_MULTI_INSTANCE'
 
 ALREADY_RUNNING_TEXT = (
     "截图翻译已经在运行中（系统托盘里有它的图标）。\n\n"
-    "同一时间只能开一个实例：请直接使用托盘图标或快捷键 Alt+Z，"
+    "同一时间只能开一个实例：请直接使用托盘图标或快捷键"
+    "（默认 Alt+Z 翻译 / Ctrl+Alt+Z 仅截图），"
     "不要重复启动。")
 
 

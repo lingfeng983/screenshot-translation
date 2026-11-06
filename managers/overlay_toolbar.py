@@ -69,15 +69,18 @@ class OverlayToolbar(QWidget):
     retranslate_clicked = pyqtSignal()
     close_clicked = pyqtSignal()
 
-    def __init__(self, parent, languages, current_lang=..., mode=result_render.MODE_TRANSLATED):
+    def __init__(self, parent, languages, current_lang=...,
+                 mode=result_render.MODE_TRANSLATED, capture_only=False):
         """
         Args:
             parent: 宿主遮罩窗口
             languages (list[tuple[str, str]]): (语言代码, 显示名) 列表
             current_lang: 初始选中语言；传 ... 表示不预置
             mode (str): 初始展示模式
+            capture_only (bool): 纯截图模式：只保留保存/复制/钉住/关闭
         """
         super().__init__(parent)
+        self.capture_only = bool(capture_only)
         self.setObjectName('OverlayToolbar')
         self.setAttribute(Qt.WA_StyledBackground, True)
         self.setStyleSheet(_TOOLBAR_QSS)
@@ -93,83 +96,109 @@ class OverlayToolbar(QWidget):
         layout.setContentsMargins(6, 4, 6, 4)
         layout.setSpacing(2)
 
-        for mode_key in result_render.MODES:
-            button = self._make_button(result_render.MODE_LABELS[mode_key], checkable=True)
-            button.clicked.connect(
-                lambda _checked, key=mode_key: self._on_mode_clicked(key))
-            self._mode_buttons[mode_key] = button
-            layout.addWidget(button)
+        self.lang_combo = None
+        self.text_original_button = None
+        self.text_translated_button = None
+        self.retranslate_button = None
 
-        layout.addSpacing(6)
+        if not self.capture_only:
+            for mode_key in result_render.MODES:
+                button = self._make_button(result_render.MODE_LABELS[mode_key], checkable=True)
+                button.clicked.connect(
+                    lambda _checked, key=mode_key: self._on_mode_clicked(key))
+                self._mode_buttons[mode_key] = button
+                layout.addWidget(button)
 
-        self.lang_combo = QComboBox()
-        self.lang_combo.setFocusPolicy(Qt.NoFocus)
-        for code, name in languages:
-            self.lang_combo.addItem(name if name else code, code)
-        if current_lang is not ...:
-            index = self.lang_combo.findData(current_lang)
-            if index >= 0:
-                self.lang_combo.setCurrentIndex(index)
-        # 连接放在初始选择之后，避免创建工具条时就触发重译
-        self.lang_combo.currentIndexChanged.connect(self._on_lang_changed)
-        # 下拉是独立顶层窗口，选完可能不把键盘焦点还给遮罩：那样 ESC/T/R/Ctrl+C
-        # 全部失灵，只能鼠标点回去
-        self.lang_combo.activated.connect(self._reactivate_host)
-        layout.addWidget(self.lang_combo)
+            layout.addSpacing(6)
 
-        layout.addSpacing(6)
+            self.lang_combo = QComboBox()
+            self.lang_combo.setFocusPolicy(Qt.NoFocus)
+            for code, name in languages:
+                self.lang_combo.addItem(name if name else code, code)
+            if current_lang is not ...:
+                index = self.lang_combo.findData(current_lang)
+                if index >= 0:
+                    self.lang_combo.setCurrentIndex(index)
+            # 连接放在初始选择之后，避免创建工具条时就触发重译
+            self.lang_combo.currentIndexChanged.connect(self._on_lang_changed)
+            # 下拉是独立顶层窗口，选完可能不把键盘焦点还给遮罩：那样 ESC/T/R/Ctrl+C
+            # 全部失灵，只能鼠标点回去
+            self.lang_combo.activated.connect(self._reactivate_host)
+            layout.addWidget(self.lang_combo)
 
-        self.text_original_button = self._make_icon_button(
-            'text', '原', '提取原文到剪贴板', self.text_copy_clicked, 'original')
-        layout.addWidget(self.text_original_button)
+            layout.addSpacing(6)
 
-        self.text_translated_button = self._make_icon_button(
-            'text', '译', '提取译文到剪贴板', self.text_copy_clicked, 'translated')
-        layout.addWidget(self.text_translated_button)
+            self.text_original_button = self._make_icon_button(
+                'text', '原', '提取原文到剪贴板', self.text_copy_clicked, 'original')
+            layout.addWidget(self.text_original_button)
 
-        self.save_original_button = self._make_icon_button(
-            'save', '原', '保存原图', self.image_save_clicked, 'original')
-        layout.addWidget(self.save_original_button)
+            self.text_translated_button = self._make_icon_button(
+                'text', '译', '提取译文到剪贴板', self.text_copy_clicked, 'translated')
+            layout.addWidget(self.text_translated_button)
 
-        self.save_translated_button = self._make_icon_button(
-            'save', '译', '保存译图', self.image_save_clicked, 'translated')
-        layout.addWidget(self.save_translated_button)
+            self.save_original_button = self._make_icon_button(
+                'save', '原', '保存原图', self.image_save_clicked, 'original')
+            layout.addWidget(self.save_original_button)
 
-        self.copy_original_image_button = self._make_icon_button(
-            'copy', '原', '复制原图到剪贴板', self.image_copy_clicked, 'original')
-        layout.addWidget(self.copy_original_image_button)
+            self.save_translated_button = self._make_icon_button(
+                'save', '译', '保存译图', self.image_save_clicked, 'translated')
+            layout.addWidget(self.save_translated_button)
 
-        self.copy_translated_image_button = self._make_icon_button(
-            'copy', '译', '复制译图到剪贴板', self.image_copy_clicked, 'translated')
-        layout.addWidget(self.copy_translated_image_button)
+            self.copy_original_image_button = self._make_icon_button(
+                'copy', '原', '复制原图到剪贴板', self.image_copy_clicked, 'original')
+            layout.addWidget(self.copy_original_image_button)
 
-        layout.addSpacing(4)
+            self.copy_translated_image_button = self._make_icon_button(
+                'copy', '译', '复制译图到剪贴板', self.image_copy_clicked, 'translated')
+            layout.addWidget(self.copy_translated_image_button)
+
+            layout.addSpacing(4)
+        else:
+            self.save_original_button = self._make_icon_button(
+                'save', None, '保存截图', self.image_save_clicked, 'original')
+            layout.addWidget(self.save_original_button)
+
+            self.copy_original_image_button = self._make_icon_button(
+                'copy', None, '复制截图到剪贴板', self.image_copy_clicked, 'original')
+            layout.addWidget(self.copy_original_image_button)
+
+            self.save_translated_button = None
+            self.copy_translated_image_button = None
+            layout.addSpacing(4)
 
         self.pin_button = self._make_button('钉住')
         self.pin_button.clicked.connect(self.pin_clicked.emit)
         layout.addWidget(self.pin_button)
 
-        self.retranslate_button = self._make_button('重译')
-        self.retranslate_button.clicked.connect(self.retranslate_clicked.emit)
-        layout.addWidget(self.retranslate_button)
+        if not self.capture_only:
+            self.retranslate_button = self._make_button('重译')
+            self.retranslate_button.clicked.connect(self.retranslate_clicked.emit)
+            layout.addWidget(self.retranslate_button)
 
         self.close_button = self._make_button('×')
         self.close_button.setFocusPolicy(Qt.NoFocus)
         self.close_button.clicked.connect(self.close_clicked.emit)
         layout.addWidget(self.close_button)
 
-        # 窄选区优先省掉图片操作，再省文本提取；模式切换与关闭始终保留
-        self._trimmable = [
-            self.lang_combo,
-            self.copy_translated_image_button,
-            self.copy_original_image_button,
-            self.save_translated_button,
-            self.save_original_button,
-            self.text_translated_button,
-            self.text_original_button,
-            self.pin_button,
-            self.retranslate_button,
-        ]
+        if self.capture_only:
+            # 宽度不够时先省复制，再省保存；钉住与关闭始终保留
+            self._trimmable = [
+                self.copy_original_image_button,
+                self.save_original_button,
+                self.pin_button,
+            ]
+        else:
+            self._trimmable = [
+                self.lang_combo,
+                self.copy_translated_image_button,
+                self.copy_original_image_button,
+                self.save_translated_button,
+                self.save_original_button,
+                self.text_translated_button,
+                self.text_original_button,
+                self.pin_button,
+                self.retranslate_button,
+            ]
 
         self.set_mode(mode, emit=False)
 
@@ -243,17 +272,27 @@ class OverlayToolbar(QWidget):
 
     def current_language(self):
         """工具条上选中的目标语言代码"""
+        if self.lang_combo is None:
+            return None
         return self.lang_combo.currentData()
 
     def current_language_text(self):
         """工具条上选中的目标语言显示名"""
+        if self.lang_combo is None:
+            return ''
         return self.lang_combo.currentText()
 
     def set_busy(self, busy):
-        """重译进行中：禁用重译按钮并改写文案"""
-        self.retranslate_button.setText('翻译中…' if busy else '重译')
-        self.retranslate_button.setEnabled(not busy)
-        self.lang_combo.setEnabled(not busy)
+        """
+        请求进行中：只禁用控件，不改按钮文案
+
+        进度统一由遮罩上的小转圈表达；把按钮写成"翻译中…"既多一行要读的字，
+        也会让工具条宽度跳一下。
+        """
+        if self.retranslate_button is not None:
+            self.retranslate_button.setEnabled(not busy)
+        if self.lang_combo is not None:
+            self.lang_combo.setEnabled(not busy)
 
     def fit_width(self, max_width):
         """

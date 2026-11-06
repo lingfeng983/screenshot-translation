@@ -275,30 +275,44 @@ class ProviderRegistry:
         return [self._providers[n] for n in self._order]
 
 
-def discover_providers(registry, package):
+def _load_provider_module(registry, package, name):
+    """导入单个 provider 模块并调用它的 register(registry)"""
+    try:
+        module = importlib.import_module(f'.{name}', package.__name__)
+        register_fn = getattr(module, 'register', None)
+        if callable(register_fn):
+            register_fn(registry)
+        else:
+            logger.debug(f"模块 {name} 未定义 register 函数，跳过")
+    except Exception as e:
+        logger.error(f"加载{registry.label}模块 {name} 失败: {e}")
+
+
+def discover_providers(registry, package, fallback_modules=()):
     """
     自动发现并注册包内所有 provider 模块
 
     约定：模块需定义 register(registry) 函数；以 _ 开头的模块跳过；
     单个模块加载失败不影响其他模块与主程序。
 
+    Nuitka 这类原生编译分布没有可扫描的 .py 文件，pkgutil 看不到任何模块，
+    此时按调用方给的 fallback_modules 清单显式导入（PyInstaller 的
+    FrozenImporter 支持 iter_modules，仍走自动扫描）。
+
     Args:
         registry: ProviderRegistry 实例
         package: 要扫描的包模块对象
+        fallback_modules (iterable[str]): 扫不到模块时按需导入的模块名
     """
+    scanned = False
     for module_info in pkgutil.iter_modules(package.__path__):
+        scanned = True
         if module_info.name.startswith('_'):
             continue
-        try:
-            module = importlib.import_module(
-                f'.{module_info.name}', package.__name__)
-            register_fn = getattr(module, 'register', None)
-            if callable(register_fn):
-                register_fn(registry)
-            else:
-                logger.debug(f"模块 {module_info.name} 未定义 register 函数，跳过")
-        except Exception as e:
-            logger.error(f"加载{registry.label}模块 {module_info.name} 失败: {e}")
+        _load_provider_module(registry, package, module_info.name)
+    if not scanned:
+        for name in fallback_modules:
+            _load_provider_module(registry, package, name)
 
 
 class BaseProvider:

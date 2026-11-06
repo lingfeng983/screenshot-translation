@@ -9,8 +9,6 @@
 Ocp-Apim-Subscription-Region 头，否则一律 401。区域因此做成可选项。
 """
 
-import requests
-
 from ..provider_common import (
     ProviderRejectedError, ProviderUnavailableError, describe_error,
     raise_for_status, wrap_request_error)
@@ -42,6 +40,9 @@ class BingProvider(TranslationProvider):
         Returns:
             str: 翻译后的文本
         """
+        # 延迟导入：启动期加载 urllib3 要 87ms，真正发请求时再付
+        import requests
+
         api_key = self._require_key(
             self._get_secret('bing_api_key'), "必应翻译API密钥未设置")
         # 非密钥项：环境变量 BING_REGION 也认，方便自建部署

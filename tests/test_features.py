@@ -1088,6 +1088,69 @@ def test_app_paths_user_data():
     print("✅ 打包态数据目录测试通过\n")
 
 
+def test_app_paths_nuitka_standalone():
+    """Nuitka 编译态：没有 _MEIPASS，数据目录与只读资源都按 exe 目录解析"""
+    print("=== 测试 Nuitka 编译态路径 ===")
+    import tempfile
+    from managers import app_paths
+
+    env_names = ('HOME', 'USERPROFILE', 'HOMEDRIVE', 'HOMEPATH')
+    saved_env = {name: os.environ.get(name) for name in env_names}
+    saved_executable = sys.executable
+    try:
+        with tempfile.TemporaryDirectory() as home, \
+                tempfile.TemporaryDirectory() as appdir:
+            os.environ['HOME'] = home
+            os.environ['USERPROFILE'] = home
+            os.environ.pop('HOMEDRIVE', None)
+            os.environ.pop('HOMEPATH', None)
+            sys.executable = os.path.join(appdir, 'ScreenshotTranslator.exe')
+            app_paths.__dict__['__compiled__'] = object()
+            try:
+                assert app_paths._is_frozen(), "没识别出 Nuitka 编译态"
+                assert app_paths.app_root() == appdir
+                assert app_paths.bundled_root() == appdir, \
+                    "Nuitka 的 data 文件与 exe 同目录"
+                assert app_paths.data_dir() == os.path.join(
+                    home, '.screenshot-translation')
+            finally:
+                app_paths.__dict__.pop('__compiled__', None)
+            assert not app_paths._is_frozen(), "清掉标记后不应再算编译态"
+    finally:
+        for name, value in saved_env.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        sys.executable = saved_executable
+    print("✅ Nuitka 编译态路径测试通过\n")
+
+
+def test_provider_discovery_falls_back_when_no_py_files():
+    """Nuitka 分布没有 .py 可扫描：按内置清单显式导入 provider"""
+    print("=== 测试无文件分布的 provider 发现 ===")
+    from managers import ocr_providers, provider_common, providers
+
+    saved_iter = provider_common.pkgutil.iter_modules
+    provider_common.pkgutil.iter_modules = lambda path: iter(())
+    try:
+        trans = provider_common.ProviderRegistry(label='测试翻译')
+        provider_common.discover_providers(
+            trans, providers, fallback_modules=providers._BUILTIN_MODULES)
+        ocr = provider_common.ProviderRegistry(label='测试OCR')
+        provider_common.discover_providers(
+            ocr, ocr_providers, fallback_modules=ocr_providers._BUILTIN_MODULES)
+    finally:
+        provider_common.pkgutil.iter_modules = saved_iter
+
+    assert set(trans.names()) >= {'edge_free', 'baidu', 'bing',
+                                  'google_free', 'libretranslate', 'youdao'}, \
+        f"扫描不到文件时翻译 provider 缺失: {trans.names()}"
+    assert set(ocr.names()) >= {'mock', 'rapidocr'}, \
+        f"扫描不到文件时 OCR provider 缺失: {ocr.names()}"
+    print("✅ 无文件分布 provider 发现测试通过\n")
+
+
 def test_fixed_light_style_system():
     """界面固定浅色：只生成浅色 QSS，主题配置入口已移除"""
     print("=== 测试固定浅色样式系统 ===")
@@ -2092,8 +2155,9 @@ def test_screenshot_stale_widget():
 
     class FakeWidget:
         """只实现 _run_screenshot 会用到的接口"""
-        def __init__(self, config_manager=None):
+        def __init__(self, config_manager=None, capture_only=False):
             self.config_manager = config_manager
+            self.capture_only = capture_only
             self.region_selected = FakeSignal()
             self.retranslate_requested = FakeSignal()
             self.retry_requested = FakeSignal()
@@ -3293,6 +3357,179 @@ def test_publish_run_merges_child_stderr():
     assert captured.get('stderr') == sp.STDOUT
     assert captured.get('stdout') == sp.PIPE
     print("✅ 发版脚本子进程 stderr 归并测试通过\n")
+
+
+def test_capture_hotkey_config_and_native_id():
+    """纯截图热键：独立配置项，且原生注册用与翻译热键不同的 ID"""
+    print("=== 测试纯截图热键配置与原生 ID ===")
+    import ctypes
+    from ctypes import wintypes
+    import tempfile
+
+    from config import ConfigManager
+    from managers.hotkey_native import (
+        HOTKEY_ID, HOTKEY_ID_CAPTURE, WM_HOTKEY, NativeHotkeyBackend)
+
+    _ensure_qt_app()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, 'config.ini')
+        manager = ConfigManager(path)
+        assert manager.get_capture_hotkey() == 'ctrl+alt+z', "纯截图默认快捷键不符"
+        manager.set_capture_hotkey('ctrl+alt+s')
+        assert ConfigManager(path).get_capture_hotkey() == 'ctrl+alt+s', \
+            "纯截图快捷键没有落盘"
+
+    class FakeUser32:
+        """只记录 RegisterHotKey 的 ID"""
+        def __init__(self):
+            self.registered = []
+
+        def RegisterHotKey(self, hwnd, hotkey_id, modifiers, vk):
+            self.registered.append(hotkey_id)
+            return 1
+
+        def UnregisterHotKey(self, hwnd, hotkey_id):
+            return 1
+
+        def GetLastError(self):
+            return 0
+
+    fake = FakeUser32()
+    backend = NativeHotkeyBackend(fake, hotkey_id=HOTKEY_ID_CAPTURE)
+    fired = []
+    try:
+        assert backend.register('ctrl+alt+s', lambda: fired.append(1)) is True
+        assert fake.registered == [HOTKEY_ID_CAPTURE], \
+            "纯截图热键没有使用独立的热键 ID（会顶掉翻译热键）"
+
+        msg = wintypes.MSG()
+        msg.message = WM_HOTKEY
+        msg.wParam = HOTKEY_ID_CAPTURE
+        pointer = ctypes.cast(ctypes.pointer(msg), ctypes.c_void_p).value
+        assert backend._filter.nativeEventFilter(
+            b'windows_generic_MSG', pointer) == (True, 0)
+        assert fired == [1], "纯截图热键的 WM_HOTKEY 没触发回调"
+
+        # 翻译热键的消息不能被截图后端吞掉
+        msg.wParam = HOTKEY_ID
+        assert backend._filter.nativeEventFilter(
+            b'windows_generic_MSG', pointer)[0] is False
+    finally:
+        backend.unregister()
+    print("✅ 纯截图热键配置与原生 ID 测试通过\n")
+
+
+def test_capture_hotkey_manager_routes_to_capture_only():
+    """capture 动作必须调用 start_capture，而不是翻译截图流程"""
+    print("=== 测试纯截图热键动作路由 ===")
+    from managers.hotkey import HotkeyManager
+
+    class FakeScreenshot:
+        def __init__(self):
+            self.calls = []
+
+        def start_screenshot(self):
+            self.calls.append('translate')
+
+        def start_capture(self):
+            self.calls.append('capture')
+
+    shot = FakeScreenshot()
+    manager = HotkeyManager(shot, None, action='capture')
+    assert manager._default_hotkey() == 'ctrl+alt+z', "纯截图默认快捷键不符"
+    manager._last_fire_ts = 0
+    manager._fire()
+    assert shot.calls == ['capture'], f"纯截图热键触发了错误动作: {shot.calls}"
+
+    translate = HotkeyManager(FakeScreenshot(), None)
+    translate.last_error = ''
+    assert translate._default_hotkey() == 'alt+z', "翻译默认快捷键被改动"
+    print("✅ 纯截图热键动作路由测试通过\n")
+
+
+def test_tray_capture_menu_routes_to_capture_only():
+    """托盘"仅截图"菜单项走 start_capture，不触发翻译流程"""
+    print("=== 测试托盘仅截图菜单 ===")
+    from managers.tray import SystemTrayManager
+
+    class FakeShot:
+        def __init__(self):
+            self.calls = []
+
+        def start_screenshot(self):
+            self.calls.append('translate')
+
+        def start_capture(self):
+            self.calls.append('capture')
+
+    shot = FakeShot()
+    tray = SystemTrayManager(screenshot_manager=shot)
+    tray._on_start_capture()
+    assert shot.calls == ['capture'], f"托盘菜单触发了错误动作: {shot.calls}"
+    print("✅ 托盘仅截图菜单测试通过\n")
+
+
+def test_pure_capture_widget_skips_ocr_and_uses_capture_toolbar():
+    """纯截图：框选后直接展示原图，不发识别请求，工具条只留图片操作"""
+    print("=== 测试纯截图遮罩流程 ===")
+    from PyQt5.QtCore import QPoint, QRect
+    from PIL import Image
+
+    from managers.screenshot import ScreenshotWidget
+
+    _ensure_qt_app()
+    widget = ScreenshotWidget(capture_only=True)
+    try:
+        widget.full_screen = Image.new('RGB', (200, 120), 'white')
+        widget._grab_scale = 1.0
+        widget._grab_scale_y = 1.0
+        widget.screen_width = 200
+        widget.screen_height = 120
+        widget._desktop_rect = QRect(0, 0, 200, 120)
+        widget._snap_threshold = 0
+        widget.begin = QPoint(10, 10)
+        widget.end = QPoint(110, 70)
+
+        emitted = []
+        widget.region_selected.connect(lambda *args: emitted.append(args))
+        widget._confirm_selection()
+
+        assert not emitted, "纯截图仍然发起了识别翻译请求"
+        payload = widget.current_payload()
+        assert payload is not None, "纯截图没有生成结果"
+        assert payload['image'].size == (100, 60), "纯截图裁剪尺寸不符"
+        assert payload['blocks'] == [] and payload['block_texts'] == []
+        assert widget._loading is False, "纯截图不应停在加载态"
+        assert widget._card_info() is None, "纯截图不该弹出空文本卡片"
+
+        toolbar = widget._toolbar
+        assert toolbar is not None and toolbar.capture_only, "没有创建纯截图工具条"
+        assert not toolbar._mode_buttons, "纯截图工具条不该有原文/双语/译文切换"
+        assert toolbar.lang_combo is None, "纯截图工具条不该有语言下拉"
+        assert toolbar.retranslate_button is None, "纯截图工具条不该有重译"
+        assert toolbar.save_original_button is not None
+        assert toolbar.copy_original_image_button is not None
+
+        # 纯截图的键盘映射：Ctrl+C/S 作用于原图，P 钉住，T/R 无效
+        from PyQt5.QtCore import Qt
+        from PyQt5.QtTest import QTest
+
+        calls = []
+        widget._copy_image = lambda kind: calls.append(('copy', kind))
+        widget._save_image = lambda kind: calls.append(('save', kind))
+        widget._pin_result = lambda: calls.append(('pin', None))
+        widget._copy_result = lambda: calls.append(('copy_result', None))
+        QTest.keyClick(widget, Qt.Key_C, Qt.ControlModifier)
+        QTest.keyClick(widget, Qt.Key_S, Qt.ControlModifier)
+        QTest.keyClick(widget, Qt.Key_P)
+        QTest.keyClick(widget, Qt.Key_T)
+        QTest.keyClick(widget, Qt.Key_R)
+        assert calls == [('copy', 'original'), ('save', 'original'),
+                         ('pin', None)], f"纯截图键盘映射不符: {calls}"
+    finally:
+        widget.close()
+    print("✅ 纯截图遮罩流程测试通过\n")
 
 
 def main():

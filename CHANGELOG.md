@@ -2,6 +2,36 @@
 
 所有显著改动记录于此。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [v1.8.0] — 2026-11-06
+
+### 新增
+- **文本翻译页（输入翻译）**：托盘菜单新增"文本翻译"，打开独立的极简页面——
+  左侧输入原文、右侧看译文，`Ctrl+Enter` 直接翻译，右上角单独切换目标语言
+  （已有译文时切换自动重译），译文只读可选中并支持一键复制。翻译链路复用
+  `TranslationManager`，接口、降级与缓存与截图翻译完全一致
+  （`managers/translate_window.py`、`main.py`、`managers/tray.py`）
+- **纯截图快捷键（不翻译）**：新增全局快捷键 `Ctrl+Alt+Z`（配置项
+  `[Hotkey] capture_hotkey`），框选后只展示原图与保存/复制/钉住/关闭的精简工具条，
+  不跑 OCR、不发起网络请求；托盘菜单同步新增"仅截图（不翻译）"
+  （`managers/hotkey.py`、`managers/hotkey_native.py`、`managers/screenshot.py`、
+  `managers/overlay_toolbar.py`、`managers/tray.py`）
+- **两条快捷键独立配置与状态**：设置页拆成"翻译快捷键 / 截图快捷键"两行，
+  各自显示原生/钩子注册状态；保存时若两者填了同一组合会直接拒绝，避免一次按键
+  同时弹出两个遮罩（`main.py`、`config.py`）
+
+### 变更
+- **加载态改成小转圈**：截图框选后选区中央不再显示"识别并翻译中…"文字，改为一个
+  深色圆盘里旋转的弧；动画定时器只重绘圆盘那一小块，不整屏重画。重译失败后的
+  重试同样走这个动画（`managers/screenshot.py`）
+- **启动导入精简**：`requests` 从六个翻译 provider 与 `TranslationManager` 的模块级
+  导入移到函数内，冷启动不再加载 requests 及其依赖；ONNX Runtime 仍在 Qt 之前导入
+  （本机实测顺序反过来会在其初始化阶段直接崩溃）（`managers/providers/*.py`、
+  `managers/translation.py`）
+- **打包路径兼容 Nuitka**：路径层识别 Nuitka 编译态（模块内 `__compiled__`），
+  可写文件仍落 `~/.screenshot-translation`，只读资源取 exe 同目录；provider 自动
+  发现扫不到 `.py` 时按内置清单显式导入，Nuitka 产物不再出现"一个 provider 都没有"
+  （`managers/app_paths.py`、`managers/provider_common.py`）
+
 ## [v1.7.0] — 2026-11-03
 
 ### 新增

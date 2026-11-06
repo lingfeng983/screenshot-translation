@@ -12,8 +12,6 @@ import logging
 import threading
 import time
 
-import requests
-
 from .cache_manager import cache_manager
 from .error_handler import error_handler
 from .provider_common import ProviderChainManager
@@ -247,6 +245,8 @@ class TranslationManager(ProviderChainManager):
         """
         session = getattr(self._session_local, 'session', None)
         if session is None:
+            # 延迟导入：启动期不需要 urllib3，首个翻译请求（或预热）时再付
+            import requests
             session = requests.Session()
             self._session_local.session = session
             with self._session_lock:

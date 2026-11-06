@@ -160,6 +160,14 @@ class SystemTrayManager:
                 self._on_start_screenshot
             ),
             pystray.MenuItem(
+                "仅截图（不翻译）",
+                self._on_start_capture
+            ),
+            pystray.MenuItem(
+                "文本翻译",
+                self._on_open_translate
+            ),
+            pystray.MenuItem(
                 "设置",
                 self._on_open_config
             ),
@@ -228,6 +236,35 @@ class SystemTrayManager:
                 logger.debug(traceback.format_exc())
         else:
             logger.error("截图管理器未初始化")
+
+    def _on_start_capture(self, icon=None, item=None):
+        """仅截图菜单项回调：框选后不识别、不翻译"""
+        logger.info("托盘菜单：仅截图")
+        if self.screenshot_manager:
+            try:
+                self.screenshot_manager.start_capture()
+            except Exception as e:
+                logger.error(f"启动仅截图失败: {e}")
+                import traceback
+                logger.debug(traceback.format_exc())
+        else:
+            logger.error("截图管理器未初始化")
+
+    def _on_open_translate(self, icon=None, item=None):
+        """
+        "文本翻译"菜单项回调：打开输入翻译页面
+        """
+        logger.info("托盘菜单：文本翻译")
+        if self.main_app:
+            try:
+                # open_translate_window 内部已负责调度到主线程
+                self.main_app.open_translate_window()
+            except Exception as e:
+                logger.error(f"打开文本翻译页失败: {e}")
+                import traceback
+                logger.debug(traceback.format_exc())
+        else:
+            logger.error("主应用未初始化")
 
     def _on_open_config(self, icon=None, item=None):
         """

@@ -35,8 +35,10 @@ MOD_NOREPEAT = 0x4000
 
 WM_HOTKEY = 0x0312
 
-# 本进程的热键ID：WM_HOTKEY 的 wParam 用它区分，取值本身无含义
+# 本进程的热键ID：WM_HOTKEY 的 wParam 用它区分，取值本身无含义。
+# 翻译与纯截图各用一个：RegisterHotKey 的 ID 在同一线程内必须唯一。
 HOTKEY_ID = 0x4A5A
+HOTKEY_ID_CAPTURE = 0x4A5B
 
 # RegisterHotKey 失败的常见 GetLastError 码
 ERROR_HOTKEY_ALREADY_REGISTERED = 1400   # 已被其它进程注册
@@ -222,13 +224,16 @@ class NativeHotkeyBackend:
 
     name = 'native'
 
-    def __init__(self, user32_handle=None):
+    def __init__(self, user32_handle=None, hotkey_id=HOTKEY_ID):
         """
         Args:
             user32_handle: user32 句柄，None 时按平台自动获取
                 （测试注入假句柄用，非 Windows 上为 None）
+            hotkey_id (int): RegisterHotKey 的热键ID，同一线程内每个后端
+                必须不同，否则后注册的会覆盖先注册的
         """
         self._user32_handle = user32_handle
+        self._hotkey_id = hotkey_id
         self._callback = None
         self._filter = None
         self._app = None
@@ -287,7 +292,7 @@ class NativeHotkeyBackend:
         modifiers, vk_code = parsed
         try:
             # hwnd 传 None：WM_HOTKEY 投递到本线程消息队列，由 Qt 事件分发器处理
-            if not handle.RegisterHotKey(None, HOTKEY_ID, modifiers, vk_code):
+            if not handle.RegisterHotKey(None, self._hotkey_id, modifiers, vk_code):
                 self.last_error = self._register_failure_reason(
                     hotkey, self._failure_code(used_err_capturing))
                 logger.warning(self.last_error)
@@ -300,7 +305,7 @@ class NativeHotkeyBackend:
             self._app = app
             self._callback = callback
 
-            self._filter = _HotkeyEventFilter(HOTKEY_ID, self._on_message)
+            self._filter = _HotkeyEventFilter(self._hotkey_id, self._on_message)
             # installNativeEventFilter 是 void（PyQt 给 None），没有可校验的成败
             # 信号：能不能收到 WM_HOTKEY 只能靠过滤器活着。Python 侧一丢引用
             # Qt 就再也不回调，所以必须先存进 self 再安装
@@ -368,7 +373,7 @@ class NativeHotkeyBackend:
             try:
                 handle = self._handle()
                 if handle is not None:
-                    handle.UnregisterHotKey(None, HOTKEY_ID)
+                    handle.UnregisterHotKey(None, self._hotkey_id)
             except Exception as e:
                 logger.debug(f"注销原生快捷键失败: {e}")
         self._registered = False

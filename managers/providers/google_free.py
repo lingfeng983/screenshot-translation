@@ -9,8 +9,6 @@ Google 免费翻译（Copyfish 同款接口）
 
 import logging
 
-import requests
-
 from ..provider_common import (
     ProviderUnavailableError, describe_error, raise_for_status,
     wrap_request_error)
@@ -40,6 +38,9 @@ class GoogleFreeProvider(TranslationProvider):
         Returns:
             str: 翻译后的文本
         """
+        # 延迟导入：启动期加载 urllib3 要 87ms，真正发请求时再付
+        import requests
+
         def translate_chunk(chunk):
             """翻译单个文本块"""
             params = {

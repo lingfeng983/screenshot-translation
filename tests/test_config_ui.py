@@ -226,6 +226,31 @@ def test_save_writes_config_and_syncs_managers(win, qapp, main_app, no_modal_box
         "OCR 引擎应固定为本地 RapidOCR"
 
 
+def test_capture_hotkey_saved_and_duplicate_rejected(
+        win, qapp, main_app, no_modal_boxes):
+    """截图快捷键可独立保存；和翻译快捷键相同时必须当场拦下"""
+    assert win.capture_hotkey_edit.text() == \
+        main_app.config_manager.get_capture_hotkey()
+    assert hasattr(win, 'capture_hotkey_status_label'), "缺少截图快捷键状态行"
+
+    win.capture_hotkey_edit.setText('ctrl+alt+s')
+    win._on_save()
+    assert no_modal_boxes and no_modal_boxes[-1] == "保存成功", \
+        f"截图快捷键保存未成功: {no_modal_boxes}"
+    assert win.config_manager.get_capture_hotkey() == 'ctrl+alt+s'
+    assert win.config_manager.get_global_hotkey() == 'alt+z', \
+        "保存截图快捷键时误改了翻译快捷键"
+
+    # 同一组合：键盘钩子后端会一次按键触发两个动作，保存前就该拒绝
+    win.hotkey_edit.setText('ctrl+alt+s')
+    win.capture_hotkey_edit.setText('ctrl+alt+s')
+    win._on_save()
+    assert no_modal_boxes[-1] == "快捷键重复", \
+        f"重复快捷键未被拦下: {no_modal_boxes}"
+    assert win.config_manager.get_capture_hotkey() == 'ctrl+alt+s', \
+        "重复检查失败后不该写入任何热键"
+
+
 def test_fixed_light_theme_without_theme_controls(win, qapp):
     """界面固定浅色：设置页不再有主题切换，也不再带标题栏“？”按钮"""
     from PyQt5.QtCore import Qt
@@ -959,6 +984,10 @@ def test_toolbar_icon_actions_emit_kind(overlay, qapp):
     overlay.show_result(_result_payload())
     toolbar = overlay._toolbar
     seen = []
+    # 宿主槽会弹保存对话框/异步写剪贴板，这里只验证工具条带出的对象类型
+    toolbar.text_copy_clicked.disconnect()
+    toolbar.image_save_clicked.disconnect()
+    toolbar.image_copy_clicked.disconnect()
     toolbar.text_copy_clicked.connect(lambda kind: seen.append(('text', kind)))
     toolbar.image_save_clicked.connect(lambda kind: seen.append(('save', kind)))
     toolbar.image_copy_clicked.connect(lambda kind: seen.append(('copy', kind)))
