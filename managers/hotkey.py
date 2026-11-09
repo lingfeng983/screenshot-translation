@@ -215,6 +215,8 @@ class HotkeyManager:
                 args=[]
             )
             self._backend = 'keyboard'
+            # 看门狗重建成功要把旧失败原因清掉，否则状态行一直显示过期错误
+            self.last_error = ''
             logger.info(f"快捷键已用键盘钩子注册: {self.hotkey}")
             return True
 

@@ -32,6 +32,7 @@ from PyQt5.QtWidgets import (
 # 配置日志（全局唯一入口，其他模块只使用 logging.getLogger）
 # 日志路径按运行形态定位：源码→项目根，exe→~/.screenshot-translation（可写）
 from managers import app_paths, autostart, result_render, single_instance, styles, update_checker
+from managers.hotkey_native import parse_hotkey
 from managers.provider_common import redact_url_query
 
 
@@ -177,8 +178,20 @@ class MainApp:
 
 
     def _setup_exception_handler(self):
-        """安装全局未捕获异常钩子"""
+        """安装全局未捕获异常钩子（主线程 + 工作线程）"""
         sys.excepthook = self._exception_handler
+
+        def handle_thread_exception(args):
+            # 线程池等子线程的未捕获异常默认打到 stderr；console=False 的打包
+            # 程序没有控制台，整条栈都会丢，必须转进日志。
+            if issubclass(args.exc_type, SystemExit):
+                return
+            # 只记日志：从工作线程弹模态框既会打断用户，也可能卡住退出流程
+            error_handler.handle_error(
+                args.exc_value, "后台线程未捕获异常",
+                show_message=False, tb=args.exc_traceback)
+
+        threading.excepthook = handle_thread_exception
 
     def _exception_handler(self, exc_type, exc_value, exc_traceback):
         """
@@ -375,8 +388,14 @@ class MainApp:
         except Exception as e:
             error = str(e) or e.__class__.__name__
             logger.warning(f"检查更新失败: {error}")
-        qt_dispatcher.dispatch_to_main_thread(
-            self._apply_update_result, info, error, interactive)
+        try:
+            qt_dispatcher.dispatch_to_main_thread(
+                self._apply_update_result, info, error, interactive)
+        except Exception:
+            # 回投失败时 _apply_update_result 不会跑，标志得自己复位，
+            # 否则之后每次更新检查都被当成「还在检查」而跳过
+            logger.exception("更新检查结果回投失败")
+            self._update_checking = False
 
     def _apply_update_result(self, info, error, interactive):
         """主线程：按检查结果推送通知或给出交互提示"""
@@ -1263,6 +1282,8 @@ class ConfigWindow(QDialog):
                 self.test_result_label.setText("❌ 后台任务无法启动，请稍后重试")
         except Exception as e:
             logger.error(f"测试翻译失败: {e}")
+            # 按钮在提交前已禁用，异常路径同样要复原，否则测试页从此点不动
+            self.test_button.setEnabled(True)
             self.test_result_label.setText(f"❌ {str(e)[:60]}")
 
     def _run_test_translation(self, api_type, target_lang):
@@ -1283,7 +1304,11 @@ class ConfigWindow(QDialog):
         except Exception as e:
             logger.error(f"测试翻译失败: {e}")
             text = f"❌ {str(e)[:60]}"
-        qt_dispatcher.dispatch_to_main_thread(self._finish_test_translation, text)
+        try:
+            qt_dispatcher.dispatch_to_main_thread(
+                self._finish_test_translation, text)
+        except Exception:
+            logger.exception("测试翻译结果回投失败")
 
     def _finish_test_translation(self, text):
         """主线程回填测试结果并恢复按钮"""
@@ -1404,9 +1429,16 @@ class ConfigWindow(QDialog):
                  self.repeat_hotkey_edit,
                  self.config_manager.get_repeat_hotkey),
             )
-            normalized = [value.replace(' ', '').lower()
-                          for _label, value, _edit, _getter in entries
-                          if value.strip()]
+            # 按解析结果归一化，而不是比字面串：ctrl/control、win/windows 别名，
+            # 以及修饰键顺序不同（ctrl+alt+z / alt+ctrl+z）都是同一个组合，
+            # 只比字面会漏判，键盘钩子后端会一次按键触发多个动作。
+            normalized = []
+            for _label, value, _edit, _getter in entries:
+                if not value.strip():
+                    continue
+                raw = value.replace(' ', '').lower()
+                parsed = parse_hotkey(raw)
+                normalized.append(parsed if parsed is not None else raw)
             if len(set(normalized)) != len(normalized):
                 QMessageBox.warning(
                     self, "快捷键重复",
@@ -1533,7 +1565,10 @@ class ConfigWindow(QDialog):
             hints = []
             for manager in (self.main_app.hotkey_manager,
                             self.main_app.capture_hotkey_manager,
-                            getattr(self.main_app, 'text_hotkey_manager', None)):
+                            getattr(self.main_app, 'text_hotkey_manager', None),
+                            getattr(self.main_app, 'fullscreen_hotkey_manager', None),
+                            getattr(self.main_app, 'window_hotkey_manager', None),
+                            getattr(self.main_app, 'repeat_hotkey_manager', None)):
                 if manager:
                     hints.append(manager.native_conflict_hint())
             conflict_hint = '\n'.join(hint for hint in hints if hint)

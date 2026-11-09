@@ -533,7 +533,6 @@ def test_screenshot_overlay_multi_screen():
 
     from PyQt5.QtCore import QPoint, QRect, QSize
     from PyQt5.QtGui import QColor
-    from PyQt5.QtWidgets import QApplication
 
     from managers.screenshot import ScreenshotWidget, desktop_bounds
 
@@ -609,7 +608,7 @@ def test_result_render_layout():
     from managers.text_block import TextBlock
 
     # 必须持有引用：QApplication 被回收后 Qt 字体度量会直接崩
-    app = QApplication.instance() or QApplication(sys.argv)
+    app = QApplication.instance() or QApplication(sys.argv)  # noqa: F841
     upper = TextBlock('one', 0, 0, 200, 20)
     lower = TextBlock('two', 0, 30, 200, 20)
     aside = TextBlock('x', 300, 40, 100, 20)
@@ -943,7 +942,7 @@ def test_result_render_cache():
     import managers.result_render as rr
     from managers.text_block import TextBlock
 
-    app = QApplication.instance() or QApplication(sys.argv)
+    app = QApplication.instance() or QApplication(sys.argv)  # noqa: F841
     blocks = [TextBlock('one', 4, 4, 120, 16), TextBlock('two', 4, 26, 150, 16)]
     texts = ['译文一 translated', '译文二 more translated text']
     image_a = Image.new('RGB', (220, 80), 'white')
@@ -1979,7 +1978,7 @@ def test_hotkey_backend_fallback_and_watchdog():
         def remove_hotkey(self, handle):
             self._hotkeys = {k: v for k, v in self._hotkeys.items() if v is not handle}
 
-    app = QApplication.instance() or QApplication(sys.argv)
+    app = QApplication.instance() or QApplication(sys.argv)  # noqa: F841
     saved_keyboard = hotkey_mod.keyboard
     try:
         # 1) 原生注册被占用（返回 0）→ 自动回退键盘钩子，而不是彻底失效
@@ -2099,7 +2098,7 @@ def test_hotkey_conflict_prompt_reasons():
         def set_global_hotkey(self, hotkey):
             pass
 
-    app = QApplication.instance() or QApplication(sys.argv)
+    app = QApplication.instance() or QApplication(sys.argv)  # noqa: F841
     saved_keyboard = hotkey_mod.keyboard
     try:
         hotkey_mod.keyboard = FakeKeyboard()
@@ -2627,7 +2626,6 @@ def test_overlay_paint_never_raises():
     from PyQt5.QtGui import QPixmap
 
     import managers.result_render as result_render
-    import managers.screenshot as screenshot_mod
     from managers.screenshot import ScreenshotWidget
 
     _ensure_qt_app()

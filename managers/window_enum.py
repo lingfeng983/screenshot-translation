@@ -48,6 +48,19 @@ def get_visible_window_rects(exclude_hwnd=0, screen_size=None):
         from ctypes import wintypes
 
         user32 = ctypes.windll.user32
+        # 显式声明签名：没有 argtypes 时 ctypes 按 C int（32 位）传 HWND，
+        # 64 位句柄的高位会被砍掉；GetWindowLongW 等返回/入参同理。
+        user32.GetSystemMetrics.argtypes = [ctypes.c_int]
+        user32.GetSystemMetrics.restype = ctypes.c_int
+        user32.IsWindowVisible.argtypes = [wintypes.HWND]
+        user32.IsWindowVisible.restype = wintypes.BOOL
+        user32.IsIconic.argtypes = [wintypes.HWND]
+        user32.IsIconic.restype = wintypes.BOOL
+        user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
+        user32.GetWindowLongW.restype = ctypes.c_long
+        user32.GetWindowRect.argtypes = [wintypes.HWND,
+                                          ctypes.POINTER(wintypes.RECT)]
+        user32.GetWindowRect.restype = wintypes.BOOL
         rects = []
 
         # 屏幕面积（用于全屏宿主过滤）
@@ -58,6 +71,11 @@ def get_visible_window_rects(exclude_hwnd=0, screen_size=None):
         # 回调：对每个顶层窗口收集矩形
         _CB = ctypes.WINFUNCTYPE(
             wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        user32.EnumWindows.argtypes = [_CB, wintypes.LPARAM]
+        user32.EnumWindows.restype = wintypes.BOOL
+        user32.EnumChildWindows.argtypes = [wintypes.HWND, _CB,
+                                             wintypes.LPARAM]
+        user32.EnumChildWindows.restype = wintypes.BOOL
 
         def _on_window(hwnd, _lparam):
             try:
@@ -182,6 +200,12 @@ def get_foreground_window_rect():
         from ctypes import wintypes
 
         user32 = ctypes.windll.user32
+        # restype 默认 c_int：64 位 HWND 会被截断，随后传给 GetWindowRect 的
+        # 就是无效句柄（活动窗口截图会静默退回交互框选）
+        user32.GetForegroundWindow.restype = wintypes.HWND
+        user32.GetWindowRect.argtypes = [wintypes.HWND,
+                                          ctypes.POINTER(wintypes.RECT)]
+        user32.GetWindowRect.restype = wintypes.BOOL
         hwnd = user32.GetForegroundWindow()
         if not hwnd:
             return None

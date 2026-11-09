@@ -39,6 +39,8 @@ class ConfigManager:
         # 批量写盘：配置窗口保存时几十个 setter 只需落盘一次
         self._batch_depth = 0
         self._pending_changes = False
+        # 嵌套在 persist=False 批次里的深度：这批改动不能被外层写盘带走
+        self._no_persist_depth = 0
         # 最近一次落盘是否成功：写盘失败会被 _write_config 兜住（不能让设置
         # 窗口直接崩），但用户必须知道改动没进文件
         self.write_ok = True
@@ -55,12 +57,23 @@ class ConfigManager:
         Args:
             persist (bool): 退出时是否写盘。False 用于"测试翻译"这类只想让
                 未保存的表单值当场生效的场合——没点保存就改用户的配置文件
-                是不该发生的
+                是不该发生的。不能嵌套在会落盘的 batch() 里（整份内存配置
+                会被一起写盘），嵌套时直接抛 RuntimeError。
         """
+        if not persist and self._batch_depth > 0:
+            # 外层批次退出时会把整个 config 对象序列化落盘，内层「只活内存」
+            # 的改动无法被单独排除。与其静默写进文件，不如当场拦下。
+            raise RuntimeError(
+                "batch(persist=False) 不能嵌套在 batch() 内：外层落盘会把"
+                "整个内存配置一起写盘，无法只排除内层的改动")
+        if not persist:
+            self._no_persist_depth += 1
         self._batch_depth += 1
         try:
             yield self
         finally:
+            if not persist:
+                self._no_persist_depth -= 1
             self._batch_depth -= 1
             if self._batch_depth == 0:
                 if persist and self._pending_changes:
@@ -338,7 +351,10 @@ class ConfigManager:
             bool: 配置当前处于"已全部落盘"的状态（batch 里延后写盘时也算成功）
         """
         if self._batch_depth > 0:
-            self._pending_changes = True
+            # persist=False 的内层批次里的改动只活在内存：不记「待写盘」，
+            # 否则外层批次退出落盘时会把它们一起写进 config.ini。
+            if self._no_persist_depth == 0:
+                self._pending_changes = True
             return True
         return self._write_config()
 

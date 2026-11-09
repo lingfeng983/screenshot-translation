@@ -126,6 +126,10 @@ class RapidOCRProvider(OCRProvider):
         scores = getattr(output, 'scores', None)
         if boxes is None or txts is None:
             raise ProviderEmptyResultError("RapidOCR 未识别到任何文本")
+        if scores is None:
+            # 部分版本/配置不返回置信度：按满分放行，避免后面 zip(txts, None, boxes)
+            # 抛 TypeError 被误报成「引擎坏了」。
+            scores = [1.0] * len(txts)
 
         threshold = self._score_threshold()
         lines = []

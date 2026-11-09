@@ -152,8 +152,16 @@ def scroll_down(center, step=3):
     if sys.platform != 'win32':
         return False
     import ctypes
+    from ctypes import wintypes
     try:
         user32 = ctypes.windll.user32
+        # 显式声明签名：SetCursorPos 入参是 int，mouse_event 的 dwData 是
+        # DWORD、dwExtraInfo 是 ULONG_PTR，缺 argtypes 时全按 C int 传。
+        user32.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
+        user32.SetCursorPos.restype = wintypes.BOOL
+        user32.mouse_event.argtypes = [wintypes.DWORD, wintypes.DWORD,
+                                       wintypes.DWORD, wintypes.DWORD,
+                                       ctypes.c_void_p]
         user32.SetCursorPos(int(center[0]), int(center[1]))
         delta = ctypes.c_uint32(_WHEEL_DELTA).value
         for _ in range(max(1, int(step))):
@@ -171,8 +179,11 @@ def _cursor_pos():
     import ctypes
     from ctypes import wintypes
     try:
+        user32 = ctypes.windll.user32
+        user32.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
+        user32.GetCursorPos.restype = wintypes.BOOL
         point = wintypes.POINT()
-        if ctypes.windll.user32.GetCursorPos(ctypes.byref(point)):
+        if user32.GetCursorPos(ctypes.byref(point)):
             return (point.x, point.y)
     except Exception:
         pass
@@ -183,8 +194,12 @@ def _restore_cursor(pos):
     if not pos or sys.platform != 'win32':
         return
     import ctypes
+    from ctypes import wintypes
     try:
-        ctypes.windll.user32.SetCursorPos(int(pos[0]), int(pos[1]))
+        user32 = ctypes.windll.user32
+        user32.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
+        user32.SetCursorPos.restype = wintypes.BOOL
+        user32.SetCursorPos(int(pos[0]), int(pos[1]))
     except Exception:
         pass
 

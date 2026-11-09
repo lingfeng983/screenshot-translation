@@ -277,7 +277,8 @@ def api_request(url, token, data=None, content_type=None, method=None):
     req.add_header("X-GitHub-Api-Version", "2022-11-28")
     if content_type:
         req.add_header("Content-Type", content_type)
-    with urlopen(req) as resp:
+    # 上传安装包（几十 MB）或 API 卡住时不能无限等，给一个整体超时
+    with urlopen(req, timeout=90) as resp:
         raw = resp.read().decode("utf-8")
         return json.loads(raw) if raw else {}
 

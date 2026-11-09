@@ -32,7 +32,9 @@ class MockOCRProvider(OCRProvider):
             str: 提示文本
         """
         logger.warning("使用模拟OCR识别")
-        text = "[OCR识别不可用：请检查OCR引擎配置（本地OCR组件不可用或密钥未填写）]"
+        # 与 ocr.OCR_NOTICE_TEXTS[0] 保持同一句：OCR 已固定为本地 RapidOCR，
+        # 不再有密钥可填，旧文案里的「密钥未填写」是误导
+        text = "[OCR识别不可用：请检查本地OCR组件是否完整]"
         logger.info(f"模拟OCR识别结果: {text}")
         return text
 

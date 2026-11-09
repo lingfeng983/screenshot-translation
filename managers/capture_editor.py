@@ -20,9 +20,8 @@ from PyQt5.QtWidgets import QLineEdit
 from . import capture_magnifier
 from . import result_render
 from .capture_annotation import (
-    FONT_CHOICES, PRESET_COLORS, TOOLS, TOOL_ARROW, TOOL_ELLIPSE,
-    TOOL_HIGHLIGHT, TOOL_LINE, TOOL_MOSAIC, TOOL_PEN, TOOL_RECT,
-    TOOL_SELECT, TOOL_STEP, TOOL_TEXT, Shape, _MAX_SHAPES)
+    FONT_CHOICES, PRESET_COLORS, TOOLS, TOOL_HIGHLIGHT,
+    TOOL_PEN, TOOL_SELECT, TOOL_STEP, TOOL_TEXT, Shape, _MAX_SHAPES)
 
 logger = logging.getLogger('screenshot-translation')
 
@@ -278,7 +277,13 @@ class CaptureEditor:
 
     def key_press(self, event):
         if self._text_input is not None:
-            return False        # 正在输入文字，交给 QLineEdit
+            # QLineEdit 不消费 ESC，事件会冒泡到遮罩的 keyPressEvent；不在这里
+            # 拦住的话，按 ESC 取消的是整张截图（连同已画好的标注），而不是
+            # 仅仅放弃这次文字输入。
+            if event.key() == Qt.Key_Escape:
+                self._close_text_input(commit=False)
+                return True
+            return False        # 其余按键（含 Ctrl+Z 的文本撤销）交给 QLineEdit
         ctrl = bool(event.modifiers() & Qt.ControlModifier)
         key = event.key()
         if ctrl and key == Qt.Key_Z:

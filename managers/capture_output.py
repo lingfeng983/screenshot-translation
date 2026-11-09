@@ -9,6 +9,7 @@
 
 from datetime import datetime
 import os
+import re
 
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QPixmap
@@ -27,6 +28,9 @@ _FILTERS = {
     'webp': 'WebP 图片 (*.webp)',
 }
 _FORMAT_NAMES = {'png': 'PNG', 'jpg': 'JPG', 'webp': 'WEBP'}
+# Windows 文件名非法字符与控制字符；文件名模板来自配置，必须当作外部输入清理，
+# 否则带 ../ 的模板会把截图写到保存目录之外。
+_INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
 
 def default_directory():
@@ -49,6 +53,11 @@ def build_filename(template=None, ext='png'):
         name = datetime.now().strftime(template)
     except Exception:
         name = datetime.now().strftime(_TEMPLATE_DEFAULT)
+    # 先抹掉非法字符，再只取文件名部分：模板里的路径分隔符/.. 不能变成
+    # 保存目录之外的路径。
+    name = os.path.basename(_INVALID_FILENAME_CHARS.sub('_', name)).strip(' .')
+    if not name:
+        name = datetime.now().strftime(_TEMPLATE_DEFAULT)
     # 模板可能自带扩展名，避免重复
     if name.lower().endswith(('.' + ext, '.jpeg')):
         name = os.path.splitext(name)[0]
@@ -58,6 +67,10 @@ def build_filename(template=None, ext='png'):
 def _flatten_for_jpg(pixmap):
     """JPG 不支持透明：铺白底再合成"""
     out = QPixmap(pixmap.width(), pixmap.height())
+    # 必须和源图声明同样的倍率：QPainter 按逻辑坐标绘制，带 dpr 的源图会被
+    # 按「物理像素 / 倍率」的尺寸贴进来，高分屏上只剩左上角 1/倍率² 的内容，
+    # 其余全是白底。声明后逻辑画布正好等于源图的逻辑尺寸，才是 1:1 合成。
+    out.setDevicePixelRatio(pixmap.devicePixelRatio() or 1.0)
     out.fill(Qt.white)
     from PyQt5.QtGui import QPainter
     painter = QPainter(out)
@@ -112,12 +125,15 @@ def save_pixmap(pixmap, *, fmt='png', quality=_QUALITY_DEFAULT,
             parent, title, default_path, _FILTERS.get(fmt, _FILTERS['png']))
         if not path:
             return None
-        # 用户手改了扩展名时按扩展名纠正格式
+        # 用户手改了扩展名时按扩展名纠正格式；写了不认识的扩展名就换成
+        # 与编码一致的那个，别把 JPEG 数据存成 .bmp。
         suffix = os.path.splitext(path)[1].lower().lstrip('.')
         if suffix == 'jpeg':
             suffix = 'jpg'
         if suffix in FORMATS:
             fmt = suffix
+        else:
+            path = os.path.splitext(path)[0] + f'.{fmt}'
 
     target = pixmap
     if fmt == 'jpg':

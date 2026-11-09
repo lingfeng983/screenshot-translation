@@ -14,7 +14,7 @@ import pytest
 from PIL import Image, ImageDraw
 
 from PyQt5.QtCore import QPoint, QPointF, QRect, Qt
-from PyQt5.QtGui import QPainter, QPixmap
+from PyQt5.QtGui import QImage, QPainter, QPixmap
 
 from managers import capture_magnifier, capture_output, capture_scroll
 from managers import capture_ocr
@@ -471,3 +471,213 @@ def test_widget_mouse_events_route_to_editor(qapp):
         assert widget._begin_result_drag(QPoint(10, 30)) is False
     finally:
         widget.close()
+
+
+# ---------------------------------------------------------------- 评审回归
+# 下面这些用例对应全量评审里逐条复现过的问题，改动前都会失败。
+
+
+def test_output_jpg_high_dpr_keeps_full_content(qapp, tmp_path):
+    """高分屏 dpr>1 时 JPG 铺白底不能只剩左上角 1/倍率² 的内容"""
+    pixmap = QPixmap(200, 100)
+    pixmap.fill(Qt.red)
+    pixmap.setDevicePixelRatio(2.0)
+    path = capture_output.save_pixmap(
+        pixmap, fmt='jpg', directory=str(tmp_path),
+        template='hidpi_dpr', quick=True)
+    assert path and path.endswith('.jpg')
+    image = QImage(path)
+    assert not image.isNull()
+    # 右半边曾经是白底，现在必须也是红色
+    assert image.pixelColor(150, 50).red() > 200
+    assert image.pixelColor(150, 50).green() < 60
+
+
+def test_editor_escape_only_cancels_text_input(qapp):
+    """文字输入框里按 ESC 只放弃这次输入，不能取消整张截图"""
+    from PyQt5.QtTest import QTest
+    from PyQt5.QtWidgets import QWidget
+
+    class Host(QWidget):
+        """按 ScreenshotWidget.keyPressEvent 的真实顺序委派"""
+
+        def __init__(self):
+            super().__init__()
+            self.cancelled = False
+            self.editor = None
+            self._result_rect = QRect(0, 0, 200, 120)
+            self._scale = 1.0
+            self._grab_scale = 1.0
+            self.full_screen = Image.new('RGB', (200, 120), 'black')
+            self._result = {}
+
+        def update(self):
+            pass
+
+        def setFocus(self):
+            pass
+
+        def keyPressEvent(self, event):
+            if self.editor is not None and self.editor.key_press(event):
+                return
+            if event.key() == Qt.Key_Escape:
+                self.cancelled = True
+
+    host = Host()
+    editor = CaptureEditor(host)
+    host.editor = editor
+    try:
+        editor.set_tool('text')
+        assert editor.mouse_press(QPointF(20, 20), Qt.LeftButton) is True
+        assert editor._text_input is not None
+        QTest.keyClick(editor._text_input[0], Qt.Key_Escape)
+        assert editor._text_input is None, 'ESC 没有关掉文字输入框'
+        assert host.cancelled is False, 'ESC 把整张截图取消了'
+        assert editor.shapes == [], 'ESC 不该误落笔'
+    finally:
+        host.close()
+
+
+def test_mock_ocr_notice_is_recognized_as_notice(qapp):
+    """mock 引擎的降级提示必须与判定表一致，不能被当原文或取字结果"""
+    from managers.ocr import OCR_NOTICE_TEXTS, is_ocr_notice
+    from managers.ocr_providers.mock import MockOCRProvider
+
+    text = MockOCRProvider().recognize(None)
+    assert text == OCR_NOTICE_TEXTS[0]
+    assert is_ocr_notice(text) is True
+    # 各家兜底路径的失败文案按前缀也要认出来
+    assert is_ocr_notice('[OCR识别失败：组件缺失]') is True
+
+    class FakeOCR:
+        def perform_ocr_with_blocks(self, image):
+            return text, []
+
+    assert capture_ocr.extract_text(Image.new('RGB', (10, 10)), FakeOCR()) == ''
+
+
+def test_mosaic_is_blocky_not_interpolated(qapp):
+    """马赛克必须是硬边像素块，不能是默认 BICUBIC 插值后的模糊色"""
+    source = Image.new('RGB', (120, 60))
+    pixels = source.load()
+    for x in range(120):
+        for y in range(60):
+            pixels[x, y] = (255, 0, 0) if x < 60 else (0, 0, 255)
+
+    shape = Shape('mosaic', [QPointF(0, 0), QPointF(120, 60)])
+    canvas = QPixmap(120, 60)
+    canvas.fill(Qt.white)
+    painter = QPainter(canvas)
+    shape.draw(painter, draw_scale=1.0, crop_scale=1.0, source=source)
+    painter.end()
+
+    image = canvas.toImage()
+    for x in range(120):
+        color = image.pixelColor(x, 30)
+        pure_red = (color.red() > 200 and color.green() < 60
+                    and color.blue() < 60)
+        pure_blue = (color.blue() > 200 and color.red() < 60
+                     and color.green() < 60)
+        assert pure_red or pure_blue, \
+            f'x={x} 出现插值色 {color.name()}，马赛克没有用 NEAREST'
+
+
+def test_pin_window_accepts_keyboard_focus(qapp):
+    """钉图窗口必须可聚焦，否则 ESC/Ctrl+C/Ctrl+S 收不到按键"""
+    from managers.pin_window import PinWindow
+
+    pixmap = QPixmap(40, 30)
+    pixmap.fill(Qt.red)
+    pin = PinWindow(pixmap)
+    try:
+        assert pin.focusPolicy() == Qt.StrongFocus
+    finally:
+        pin.close()
+
+
+def test_semantically_equal_hotkeys_normalize_equal():
+    """修饰键别名/顺序不同是同一个组合，重复校验不能只比字面串"""
+    from managers.hotkey_native import parse_hotkey
+
+    for first, second in (('ctrl+alt+z', 'alt+ctrl+z'),
+                          ('control+alt+z', 'ctrl+alt+z'),
+                          ('win+shift+a', 'windows+shift+a')):
+        assert parse_hotkey(first) == parse_hotkey(second)
+
+
+def test_output_filename_template_is_sanitized():
+    """文件名模板不能带路径穿越或 Windows 非法字符"""
+    import os
+
+    name = capture_output.build_filename('../../evil', 'png')
+    assert '/' not in name and '\\' not in name
+    assert name == os.path.basename(name)
+    assert name.endswith('.png')
+
+    name = capture_output.build_filename('a:b*c?d|e', 'png')
+    assert all(char not in name for char in '\\/:*?"<>|')
+    assert name.endswith('.png')
+
+
+def test_magnifier_pixel_handles_grayscale_and_palette(qapp):
+    """取色不能依赖整图 convert('RGB')，灰度/调色板模式也要还原成 RGB"""
+    gray = Image.new('L', (20, 20), 77)
+    assert capture_magnifier.pixel_at(gray, 5, 5, 1.0) == (77, 77, 77)
+
+    palette = Image.new('P', (20, 20), 1)
+    palette.putpalette([0, 0, 0, 10, 20, 30] + [0] * (256 * 3 - 6))
+    assert capture_magnifier.pixel_at(palette, 5, 5, 1.0) == (10, 20, 30)
+
+
+def test_scroll_cancel_banner_sets_event(qapp):
+    """滚动截图期间的可点取消横幅要能置位取消事件并正常收起"""
+    import threading
+    from PyQt5.QtTest import QTest
+    from managers.screenshot import ScreenshotWidget
+
+    widget = ScreenshotWidget(capture_only=True)
+    try:
+        widget._result_rect = QRect(10, 10, 60, 40)
+        event = threading.Event()
+        widget.show_scroll_banner(event)
+        banner = widget._scroll_banner
+        assert banner is not None, '小选区下应有可点击的取消横幅'
+        QTest.mouseClick(banner, Qt.LeftButton)
+        assert event.is_set(), '点击横幅没有置位取消事件'
+        widget.hide_scroll_banner()
+        assert widget._scroll_banner is None
+    finally:
+        widget.close()
+
+
+def test_nested_no_persist_batch_is_rejected(tmp_path):
+    """persist=False 嵌套在会落盘的批次里必须显式拒绝，不能静默写盘"""
+    from config import ConfigManager
+
+    cm = ConfigManager(str(tmp_path / 'config.ini'))
+    with pytest.raises(RuntimeError):
+        with cm.batch():
+            with cm.batch(persist=False):
+                pass
+
+
+def test_ocr_failure_keeps_error_local(qapp):
+    """识别失败的异常只按本次请求返回，不写实例属性（两次截图并发不串台）"""
+    from unittest.mock import patch
+    from managers.ocr import OCRManager
+
+    class FailingProvider:
+        name = 'failing_probe'
+        display_name = 'Failing'
+        deterministic_results = False
+        deadline = None
+
+        def recognize(self, image):
+            raise RuntimeError('boom')
+
+    manager = OCRManager()
+    with patch.object(manager, '_get_provider', return_value=FailingProvider()):
+        result, error, provider_cls = manager._recognize_via(
+            FailingProvider, Image.new('RGB', (4, 4)))
+    assert error is not None, '本次异常要作为返回值交给调用方'
+    assert manager._last_error is None, '异常不该落到共享实例属性上'

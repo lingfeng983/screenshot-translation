@@ -43,12 +43,19 @@ def pixel_at(source, x, y, scale=1.0):
     if px < 0 or py < 0 or px >= source.width or py >= source.height:
         return None
     try:
-        rgb = source.convert('RGB').getpixel((px, py))
+        # 直接读单像素：convert('RGB') 会把整张冻结桌面（4K 上约 25MB）复制
+        # 一遍，而放大镜每次 mouseMove 都要重绘，逐帧全图深拷贝实测约 9ms。
+        rgb = source.getpixel((px, py))
+        if isinstance(rgb, int):
+            if source.mode == 'P':
+                palette = source.getpalette()
+                index = rgb * 3
+                if palette and index + 2 < len(palette):
+                    return tuple(palette[index:index + 3])
+            return (rgb, rgb, rgb)
+        return tuple(rgb[:3])
     except Exception:
         return None
-    if isinstance(rgb, int):
-        return (rgb, rgb, rgb)
-    return tuple(rgb[:3])
 
 
 def color_hex(rgb):

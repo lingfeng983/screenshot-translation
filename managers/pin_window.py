@@ -40,6 +40,9 @@ class PinWindow(QWidget):
         self.setWindowFlags(
             Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
         self.setAttribute(Qt.WA_DeleteOnClose)
+        # QWidget 默认 NoFocus：没有焦点策略的话 ESC / Ctrl+C / Ctrl+S 的
+        # keyPressEvent 根本收不到真实按键，必须先声明可聚焦。
+        self.setFocusPolicy(Qt.StrongFocus)
         self.setWindowTitle(title)
 
         self._source = pixmap
@@ -62,6 +65,7 @@ class PinWindow(QWidget):
         self.show()
         self.raise_()
         self.activateWindow()
+        self.setFocus()
 
     def closeEvent(self, event):
         """关闭时释放模块级引用，避免钉住的图一直占内存"""

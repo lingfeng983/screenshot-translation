@@ -15,7 +15,7 @@ crop_scale 才能从原始 PIL 抓拍图里取到正确的像素块。
 from dataclasses import dataclass, field
 
 from PyQt5.QtCore import QPointF, QRectF, Qt
-from PyQt5.QtGui import QColor, QFont, QPainter, QPen, QPixmap, QPolygonF
+from PyQt5.QtGui import QColor, QFont, QPen, QPolygonF
 
 # 工具键与展示名（顺序即工具条顺序）
 TOOL_SELECT = 'select'
@@ -241,6 +241,7 @@ def _build_mosaic_tile(local_rect, crop_scale, source):
     Returns:
         QPixmap or None
     """
+    from PIL import Image
     from .result_render import pil_to_qpixmap
 
     left = int(max(0, local_rect.left() * crop_scale))
@@ -253,6 +254,9 @@ def _build_mosaic_tile(local_rect, crop_scale, source):
     small_w = max(1, (right - left) // block)
     small_h = max(1, (bottom - top) // block)
     patch = source.crop((left, top, right, bottom))
-    pixelated = patch.resize((small_w, small_h)).resize(
-        (right - left, bottom - top))
+    # 马赛克要的是硬边像素块：PIL 默认 BICUBIC 会把缩小再放大的结果插值成
+    # 一片模糊，两次都必须显式用 NEAREST。
+    nearest = Image.Resampling.NEAREST
+    pixelated = patch.resize((small_w, small_h), nearest).resize(
+        (right - left, bottom - top), nearest)
     return pil_to_qpixmap(pixelated)

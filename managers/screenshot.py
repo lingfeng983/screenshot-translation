@@ -12,9 +12,9 @@ import threading
 import time
 
 from PIL import ImageGrab
-from PyQt5.QtCore import Qt, QRect, QRectF, QPoint, QTimer, pyqtSignal
+from PyQt5.QtCore import Qt, QRect, QRectF, QPoint, QSize, QTimer, pyqtSignal
 from PyQt5.QtGui import QPainter, QPen, QColor, QCursor, QPixmap
-from PyQt5.QtWidgets import QApplication, QWidget
+from PyQt5.QtWidgets import QApplication, QHBoxLayout, QLabel, QWidget
 
 # 导入必要的模块
 from . import capture_magnifier
@@ -63,6 +63,34 @@ class _RequestToken:
     def cancelled(self):
         """本次请求是否已被取消"""
         return self.cancel_event.is_set()
+
+
+class _ScrollCancelBanner(QWidget):
+    """
+    滚动截图期间唯一的可见取消入口
+
+    遮罩为了不挡滚轮、不进抓帧必须隐藏，用户因此看不到任何可点的地方；
+    这个小横幅放在选区之外，点一下就置位取消事件，让后台抓帧立刻收手。
+    """
+
+    def __init__(self, cancel_event):
+        super().__init__()
+        self._cancel = cancel_event
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setStyleSheet(
+            'QWidget { background: rgba(35,38,41,245); border: 1px solid #3a3d42;'
+            ' border-radius: 8px; color: #e8e8e8; font-size: 12px; }')
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(12, 7, 12, 7)
+        layout.addWidget(QLabel('长截图进行中…  点击此处取消'))
+        self.adjustSize()
+
+    def mousePressEvent(self, event):
+        if self._cancel is not None:
+            self._cancel.set()
+        self.hide()
+        event.accept()
 
 
 def desktop_bounds():
@@ -250,6 +278,12 @@ class ScreenshotManager:
             # 但引用也可能只是残留（此前关闭时没清掉，或是被外部销毁了），
             # 这种情况下按键不能被吞掉，否则用户看到的就是"快捷键没反应"
             if self._screenshot_widget is not None:
+                if self._scroll_cancel is not None:
+                    # 滚动截图期间遮罩刻意隐藏，isVisible() 为 False：此时不能再
+                    # 把它当残留引用另起一个遮罩，否则滚轮还在注入、抓帧还在跑，
+                    # 两套流程会互相打架。让用户点取消横幅收手即可。
+                    logger.info("滚动截图进行中，忽略本次截图热键")
+                    return
                 if self._widget_is_live(self._screenshot_widget):
                     logger.info("截图遮罩已显示，本次热键作为取消处理")
                     self._release_screenshot_widget()
@@ -407,8 +441,12 @@ class ScreenshotManager:
         except Exception:
             logger.exception("本地 OCR 取字失败")
             text = ''
-        qt_dispatcher.dispatch_to_main_thread(
-            self._apply_ocr_result, widget, text, request_id)
+        try:
+            qt_dispatcher.dispatch_to_main_thread(
+                self._apply_ocr_result, widget, text, request_id)
+        except Exception:
+            # 连回投都失败时遮罩的忙碌态由 widget 上的超时兜底复位
+            logger.exception("本地 OCR 取字结果回投失败")
 
     def _apply_ocr_result(self, widget, text, request_id):
         if widget is None or widget is not self._screenshot_widget:
@@ -440,6 +478,7 @@ class ScreenshotManager:
             widget.on_scroll_finished(None)
             return
         widget.set_capture_busy(True)
+        widget.show_scroll_banner(cancel_event)
 
     def _run_scroll(self, widget, context, image, request_id, options,
                     cancel_event):
@@ -450,10 +489,17 @@ class ScreenshotManager:
         except Exception:
             logger.exception("滚动截图失败")
             long_image = None
-        qt_dispatcher.dispatch_to_main_thread(
-            self._apply_scroll_result, widget, long_image, request_id)
+        try:
+            qt_dispatcher.dispatch_to_main_thread(
+                self._apply_scroll_result, widget, long_image, request_id)
+        except Exception:
+            # 连回投都失败时由 widget 上的超时兜底把隐藏的遮罩恢复回来
+            logger.exception("滚动截图结果回投失败")
 
     def _apply_scroll_result(self, widget, long_image, request_id):
+        # 任务已收手：清掉在途标记，否则之后的截图热键会被一直当成
+        # 「滚动截图进行中」而忽略。
+        self._scroll_cancel = None
         if widget is None or widget is not self._screenshot_widget:
             return
         try:
@@ -775,6 +821,10 @@ class ScreenshotWidget(QWidget):
         self._capture_editor = None
         self._capture_toolbar = None
         self._capture_busy = False
+        # 滚动截图期间遮罩隐藏，靠这条横幅给用户一个可点的取消入口
+        self._scroll_banner = None
+        # 后台结果没回投时的兜底复位（子 QTimer，随窗口一起销毁）
+        self._capture_watchdog = None
         # 框选辅助：光标位置、窗口悬停高亮、按下点（区分单击选窗口）
         self._cursor_pos = QPoint()
         self._window_hover_rect = None
@@ -1905,12 +1955,72 @@ class ScreenshotWidget(QWidget):
         self.hide()
         self.scroll_requested.emit(context, image)
 
+    def show_scroll_banner(self, cancel_event):
+        """显示可点击的取消横幅；放在选区之外，避免被长图的裁剪框收进去"""
+        self.hide_scroll_banner()
+        banner = _ScrollCancelBanner(cancel_event)
+        size = banner.sizeHint()
+        width, height = size.width(), size.height()
+        origin = self._desktop_rect.topLeft()
+        selection = QRect(self._result_rect or self.rect()).translated(origin)
+        screen = QApplication.primaryScreen()
+        area = (screen.availableGeometry() if screen is not None
+                else QRect(0, 0, self.screen_width, self.screen_height))
+        candidates = (
+            QPoint(area.right() - width - 12, area.top() + 12),
+            QPoint(area.left() + 12, area.top() + 12),
+            QPoint(area.right() - width - 12, area.bottom() - height - 12),
+            QPoint(area.left() + 12, area.bottom() - height - 12),
+        )
+        for pos in candidates:
+            if not QRect(pos, QSize(width, height)).intersects(selection):
+                banner.move(pos)
+                banner.show()
+                self._scroll_banner = banner
+                return
+        # 选区几乎占满屏幕：没有不污染抓帧的位置，退化为总时限兜底
+        banner.deleteLater()
+        logger.info("选区过大，不显示滚动截图取消横幅")
+
+    def hide_scroll_banner(self):
+        """收起取消横幅（结果回投、遮罩关闭时都要调）"""
+        banner = self._scroll_banner
+        self._scroll_banner = None
+        if banner is not None:
+            banner.hide()
+            banner.deleteLater()
+
+    def _restore_if_capture_stuck(self):
+        """结果迟迟没回投：恢复遮罩显示与编辑态，避免永久隐藏/忙碌"""
+        if not self._capture_busy:
+            return
+        logger.warning("截图后台任务结果未回投，超时复位编辑态")
+        if not self.isVisible():
+            self.show()
+            self.raise_()
+            self.activateWindow()
+            self.setFocus()
+        self.hide_scroll_banner()
+        self.set_capture_busy(False)
+        self._show_capture_toast('处理超时，请重试')
+
     def set_capture_busy(self, busy):
         """OCR / 滚动截图进行中：禁用重复发起，并显示忙碌提示"""
         self._capture_busy = bool(busy)
         if self._capture_toolbar is not None:
             self._capture_toolbar.set_busy(busy)
         self._capture_toast = '处理中…' if busy else ''
+        if busy:
+            if self._capture_watchdog is None:
+                # 子 QTimer 随窗口一起销毁，不会在窗口已关闭后回调到废对象
+                self._capture_watchdog = QTimer(self)
+                self._capture_watchdog.setSingleShot(True)
+                self._capture_watchdog.timeout.connect(
+                    self._restore_if_capture_stuck)
+            # 滚动截图本身最长 15s，留足余量；正常回投会主动停表
+            self._capture_watchdog.start(30000)
+        elif self._capture_watchdog is not None:
+            self._capture_watchdog.stop()
         self.update()
 
     def on_ocr_finished(self, text):
@@ -1930,6 +2040,10 @@ class ScreenshotWidget(QWidget):
         """滚动截图结果回投（主线程）：恢复遮罩、复制长图并按配置保存"""
         self.show()
         self.raise_()
+        # 隐藏期间键盘焦点已经丢了，不重新抢回来的话 ESC / Ctrl+S 全部失灵
+        self.activateWindow()
+        self.setFocus()
+        self.hide_scroll_banner()
         self.set_capture_busy(False)
         if image is None or image.width <= 0 or image.height <= 0:
             self._show_capture_toast('滚动截图未完成')
@@ -2742,6 +2856,9 @@ class ScreenshotWidget(QWidget):
         self._stop_loading_spinner()
         self._capture_editor = None
         self._capture_toolbar = None
+        self.hide_scroll_banner()
+        if self._capture_watchdog is not None:
+            self._capture_watchdog.stop()
         if self._toast_timer is not None:
             self._toast_timer.stop()
             self._toast_timer = None

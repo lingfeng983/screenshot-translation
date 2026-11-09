@@ -181,7 +181,7 @@ class OverlayToolbar(QWidget):
         layout.addWidget(self.close_button)
 
         if self.capture_only:
-            # 宽度不够时先省复制，再省保存；钉住与关闭始终保留
+            # 宽度不够时依次折叠复制、保存、钉住；只有关闭按钮始终保留
             self._trimmable = [
                 self.copy_original_image_button,
                 self.save_original_button,

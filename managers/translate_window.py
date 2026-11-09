@@ -317,6 +317,9 @@ class TranslateWindow(QDialog):
     def _on_language_changed(self, _index):
         """换语言：有原文就按新语言翻译，免得用户再点一次"""
         if self._busy:
+            # 结果还在飞：记下待办，等回填后按新语言补译一次，
+            # 否则用户看到的是旧语言的译文却以为已经切换了
+            self._auto_pending = True
             return
         if self._source_text():
             self._on_translate()
@@ -333,15 +336,23 @@ class TranslateWindow(QDialog):
         self.source_edit.setFocus()
 
     def _on_copy(self):
-        """把译文复制到剪贴板"""
+        """把译文复制到剪贴板（非阻塞重试，不把 GUI 线程卡在剪贴板占用上）"""
         text = self.result_edit.toPlainText().strip()
         if not text:
             return
-        if clipboard.set_text(text):
-            self._set_status('已复制')
-            QTimer.singleShot(1200, self._clear_status)
-        else:
-            self._set_status('复制失败，请手动选择文本复制', error=True)
+
+        def done(ok):
+            try:
+                if ok:
+                    self._set_status('已复制')
+                    QTimer.singleShot(1200, self._clear_status)
+                else:
+                    self._set_status('复制失败，请手动选择文本复制', error=True)
+            except RuntimeError:
+                # 回调排在事件循环里，期间窗口可能已经关掉
+                pass
+
+        clipboard.set_text_later(text, on_done=done)
 
     def _clear_status(self):
         """清掉"已复制"这类一次性提示（窗口已销毁则忽略）"""

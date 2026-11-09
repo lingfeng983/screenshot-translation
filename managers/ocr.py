@@ -37,6 +37,11 @@ OCR_NOTICE_TEXTS = (
     NO_TEXT_NOTICE,
 )
 
+# 各家兜底路径（mock 引擎、错误处理器）的提示文案都以这两个前缀开头。
+# 按前缀兜底而不是只比对整串：新增/改写一句提示时不会再因为字符串漂移，
+# 把错误提示当成原文送去翻译、或当成「取字」结果弹给用户。
+_OCR_NOTICE_PREFIXES = ('[OCR识别不可用', '[OCR识别失败')
+
 
 def is_ocr_notice(text):
     """
@@ -48,7 +53,8 @@ def is_ocr_notice(text):
     Returns:
         bool: True 表示这是提示文本，调用方应跳过翻译
     """
-    return (text or '').strip() in OCR_NOTICE_TEXTS
+    value = (text or '').strip()
+    return value in OCR_NOTICE_TEXTS or value.startswith(_OCR_NOTICE_PREFIXES)
 
 
 class OCRManager(ProviderChainManager):
@@ -233,7 +239,6 @@ class OCRManager(ProviderChainManager):
         Returns:
             tuple[str, list[TextBlock]]: (整段文本, 行块列表)
         """
-        self._last_error = None
         blocks, last_error, last_provider = self._perform_ocr_blocks(
             image, deadline, cancel_event)
         if blocks:
@@ -323,6 +328,10 @@ class OCRManager(ProviderChainManager):
             tuple[list[TextBlock], Exception 或 None, provider 类 或 None]:
                 (行块列表, 本次异常, 实际抛异常的 provider 类)
         """
+        # 异常按本次请求局部保存，绝不写实例属性：两次截图并发时共享属性会
+        # 被另一条链路覆盖，空结果判定就会串台。
+        observed = {'error': None}
+
         def factory():
             return self._get_provider(provider_cls)
 
@@ -333,20 +342,16 @@ class OCRManager(ProviderChainManager):
             try:
                 return provider.recognize_blocks(image)
             except Exception as e:
-                # 与 _recognize_via 同样记下真实异常：上层要靠它区分
-                # “引擎跑通了但图里没字”与“引擎本身不可用”
-                self._last_error = e
-                self._last_error_provider = provider_cls
+                # 上层要靠真实异常区分“引擎跑通了但图里没字”与“引擎坏了”
+                observed['error'] = e
                 raise
 
-        self._last_error = None
-        self._last_error_provider = None
         result = self._run_provider(factory, call, lambda err: None,
                                     deadline=deadline,
                                     cancel_event=cancel_event)
         if isinstance(result, list):
             return result, None, provider_cls
-        return [], self._last_error, self._last_error_provider
+        return [], observed['error'], provider_cls
 
     def _recognize_via(self, provider_cls, image, retry_handler=None,
                        deadline=None, cancel_event=None):
@@ -365,6 +370,8 @@ class OCRManager(ProviderChainManager):
             tuple[str, Exception 或 None, provider 类 或 None]:
                 (识别文本或失败文本, 本次实际异常, 实际抛异常的 provider 类)
         """
+        observed = {'error': None}
+
         def factory():
             return self._get_provider(provider_cls)
 
@@ -375,10 +382,9 @@ class OCRManager(ProviderChainManager):
             try:
                 return provider.recognize(image)
             except Exception as e:
-                # 在这里记真实异常：重试器降级时只把 None 交给 failure_text，
-                # 异常类型拿不到，而上层要靠它区分“引擎坏了”与“图里没字”
-                self._last_error = e
-                self._last_error_provider = provider_cls
+                # 重试器降级时只把 None 交给 failure_text，异常类型拿不到；
+                # 这里按本次请求局部记下，供上层区分“引擎坏了”与“图里没字”
+                observed['error'] = e
                 raise
 
         def failure_text(err):
@@ -386,11 +392,10 @@ class OCRManager(ProviderChainManager):
                 return f"{_OCR_FAIL_PREFIX}: {describe_error(err)}]"
             return f"{_OCR_FAIL_PREFIX}: {provider_cls.display_name}]"
 
-        self._last_error = None
         result = self._run_provider(factory, call, failure_text, retry_handler,
                                     deadline=deadline, cancel_event=cancel_event)
         if self._is_failure(result):
-            return result, self._last_error, self._last_error_provider
+            return result, observed['error'], provider_cls
         return result, None, provider_cls
 
     def get_available_languages(self):

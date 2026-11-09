@@ -52,7 +52,7 @@ def extract_text(image, ocr_manager=None):
         except Exception:
             pass
     text = (text or '').strip()
-    if not text or is_ocr_notice(text) or text.startswith('[OCR识别失败'):
+    if not text or is_ocr_notice(text):
         return ''
     return text
 
