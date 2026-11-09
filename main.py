@@ -124,6 +124,27 @@ def _app_qicon():
     return qicon
 
 
+def _hotkey_identity(value):
+    """
+    快捷键的唯一标识（供设置页查重）
+
+    按解析结果归一化，而不是比字面串：ctrl/control、win/windows 别名，以及
+    修饰键顺序不同（ctrl+alt+z / alt+ctrl+z）都是同一个组合。无法解析的
+    组合退化为字面条目，至少能挡住完全相同的输入。
+
+    Args:
+        value (str): 用户输入的快捷键组合
+
+    Returns:
+        tuple 或 str 或 None: 可哈希的标识；空输入返回 None
+    """
+    raw = (value or '').replace(' ', '').lower()
+    if not raw:
+        return None
+    parsed = parse_hotkey(raw)
+    return parsed if parsed is not None else raw
+
+
 class MainApp:
     """
     主应用类
@@ -392,10 +413,17 @@ class MainApp:
             qt_dispatcher.dispatch_to_main_thread(
                 self._apply_update_result, info, error, interactive)
         except Exception:
-            # 回投失败时 _apply_update_result 不会跑，标志得自己复位，
-            # 否则之后每次更新检查都被当成「还在检查」而跳过
             logger.exception("更新检查结果回投失败")
-            self._update_checking = False
+            try:
+                # 优先让主线程走正常的复位路径（含 _interactive_update_pending）
+                qt_dispatcher.dispatch_to_main_thread(
+                    self._apply_update_result, info, error, interactive)
+            except Exception:
+                logger.exception("更新检查结果重投失败")
+                # 两次都投不出去才由本线程兜底复位，否则之后每次检查
+                # 都会被当成「还在检查」而跳过
+                self._update_checking = False
+                self._interactive_update_pending = False
 
     def _apply_update_result(self, info, error, interactive):
         """主线程：按检查结果推送通知或给出交互提示"""
@@ -768,6 +796,8 @@ class ConfigWindow(QDialog):
         super().__init__()
         self.main_app = main_app
         self.config_manager = main_app.config_manager
+        # 测试翻译结果没回投时的兜底复位（子 QTimer，随窗口一起销毁）
+        self._test_watchdog = None
 
         self.setWindowTitle("截图翻译工具 - 设置")
         # 去掉标题栏右上角的“？”（QDialog 默认带上下文帮助按钮）
@@ -1191,11 +1221,16 @@ class ConfigWindow(QDialog):
                 value = (draft[field_name] if field_name in draft
                          else self._load_field_value(field_name))
                 edit.setText(value)
-                # 环境变量提供的密钥不回填进明文 config.ini：界面标出来源，
+                # 环境变量提供的值不回填进明文 config.ini：界面标出来源，
                 # 用户没动它就跳过写入（显式重打过的值仍按普通字段保存）
                 if value and self.config_manager.is_env_secret(field_name):
                     self._env_secret_values[field_name] = value
                     edit.setPlaceholderText('值来自环境变量，保持不变则不写入配置文件')
+                elif field_name == 'bing_region' and value \
+                        and os.environ.get('BING_REGION'):
+                    self._env_secret_values[field_name] = value
+                    edit.setPlaceholderText(
+                        '值来自环境变量 BING_REGION，保持不变则不写入配置文件')
                 self._api_field_edits[field_name] = edit
                 self.api_fields_layout.addRow(f"{label}:", edit)
         except Exception as e:
@@ -1208,6 +1243,11 @@ class ConfigWindow(QDialog):
         try:
             getters = {
                 'libretranslate_url': self.config_manager.get_libretranslate_url,
+                # 非密钥，但 provider 侧 `_get_secret` 也是环境变量优先：
+                # 界面必须显示实际生效的值，否则设了 BING_REGION 却看到空
+                'bing_region': lambda: (
+                    os.environ.get('BING_REGION')
+                    or self.config_manager.get_translation_option('bing_region')),
                 'bing_api_key': self.config_manager.get_bing_api_key,
                 'baidu_app_id': lambda: self.config_manager.get_baidu_api_info()[0],
                 'baidu_api_key': lambda: self.config_manager.get_baidu_api_info()[1],
@@ -1275,16 +1315,28 @@ class ConfigWindow(QDialog):
 
             self.test_button.setEnabled(False)
             self.test_result_label.setText("测试中…")
+            self._start_test_watchdog()
             if thread_pool_manager.submit(
                     self._run_test_translation, api_type, target_lang) is None:
                 # 线程池已关闭或拒收：没有任何线程会回填结果，按钮必须当场复原
-                self.test_button.setEnabled(True)
-                self.test_result_label.setText("❌ 后台任务无法启动，请稍后重试")
+                self._finish_test_translation("❌ 后台任务无法启动，请稍后重试")
         except Exception as e:
             logger.error(f"测试翻译失败: {e}")
             # 按钮在提交前已禁用，异常路径同样要复原，否则测试页从此点不动
-            self.test_button.setEnabled(True)
-            self.test_result_label.setText(f"❌ {str(e)[:60]}")
+            self._finish_test_translation(f"❌ {str(e)[:60]}")
+
+    def _start_test_watchdog(self):
+        """结果迟迟不回投（线程池卡死/调度失败）时兜底复原测试按钮"""
+        if self._test_watchdog is None:
+            self._test_watchdog = QTimer(self)
+            self._test_watchdog.setSingleShot(True)
+            self._test_watchdog.timeout.connect(self._on_test_timeout)
+        # 翻译链最长 25s + 抖动，45s 足够；正常回投会主动停表
+        self._test_watchdog.start(45000)
+
+    def _on_test_timeout(self):
+        self.test_button.setEnabled(True)
+        self.test_result_label.setText("❌ 测试超时，请重试")
 
     def _run_test_translation(self, api_type, target_lang):
         """在池线程真实调用一次翻译，结果回主线程展示"""
@@ -1309,11 +1361,20 @@ class ConfigWindow(QDialog):
                 self._finish_test_translation, text)
         except Exception:
             logger.exception("测试翻译结果回投失败")
+            try:
+                qt_dispatcher.dispatch_to_main_thread(
+                    self._finish_test_translation, "❌ 结果回投失败，请重试")
+            except Exception:
+                # 两次都投不出去（事件循环已退出），按钮由 _test_watchdog
+                # 在 45s 后兜底复原
+                logger.exception("测试翻译结果重投失败")
 
     def _finish_test_translation(self, text):
         """主线程回填测试结果并恢复按钮"""
         self.test_button.setEnabled(True)
         self.test_result_label.setText(text)
+        if self._test_watchdog is not None:
+            self._test_watchdog.stop()
 
     def _save_form_fields(self, persist=True):
         """
@@ -1429,17 +1490,13 @@ class ConfigWindow(QDialog):
                  self.repeat_hotkey_edit,
                  self.config_manager.get_repeat_hotkey),
             )
-            # 按解析结果归一化，而不是比字面串：ctrl/control、win/windows 别名，
-            # 以及修饰键顺序不同（ctrl+alt+z / alt+ctrl+z）都是同一个组合，
+            # 按解析结果归一化查重：别名字体/修饰键顺序不同都是同一个组合，
             # 只比字面会漏判，键盘钩子后端会一次按键触发多个动作。
-            normalized = []
-            for _label, value, _edit, _getter in entries:
-                if not value.strip():
-                    continue
-                raw = value.replace(' ', '').lower()
-                parsed = parse_hotkey(raw)
-                normalized.append(parsed if parsed is not None else raw)
-            if len(set(normalized)) != len(normalized):
+            identities = [identity for identity in
+                          (_hotkey_identity(value)
+                           for _label, value, _edit, _getter in entries)
+                          if identity is not None]
+            if len(set(identities)) != len(identities):
                 QMessageBox.warning(
                     self, "快捷键重复",
                     "六条快捷键不能有任意两条相同，"

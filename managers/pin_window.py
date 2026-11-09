@@ -203,3 +203,8 @@ class PinWindow(QWidget):
         self.setWindowFlags(flags)
         if was_visible:
             self.show()
+            # setWindowFlags 会重建原生窗口并丢掉焦点：不重新抢回来的话
+            # ESC / Ctrl+C / Ctrl+S 又收不到按键，直到用户点一下窗口
+            self.raise_()
+            self.activateWindow()
+            self.setFocus()

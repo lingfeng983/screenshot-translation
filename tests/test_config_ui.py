@@ -1132,3 +1132,31 @@ def test_test_translation_does_not_write_overlay(win):
     assert cm.get_overlay_option('snap_threshold') == '40', "真正保存时应当写入"
     assert cm.get_overlay_option('dim_opacity') == '150'
 
+
+def test_test_button_watchdog_recovers(win, qapp):
+    """测试翻译结果没回投时 watchdog 要复原按钮，不能永久禁用"""
+    win.test_button.setEnabled(False)
+    win._start_test_watchdog()
+    assert win._test_watchdog is not None and win._test_watchdog.isActive()
+
+    win._on_test_timeout()
+    assert win.test_button.isEnabled(), "超时后按钮仍是禁用状态"
+    assert '超时' in win.test_result_label.text()
+
+    win._finish_test_translation('✅ ok')
+    assert not win._test_watchdog.isActive(), "结果回投后 watchdog 没有停表"
+    assert win.test_result_label.text() == '✅ ok'
+
+
+def test_bing_region_env_visible_in_settings(win, qapp, monkeypatch):
+    """BING_REGION 由环境变量提供时，设置页要显示实际生效值且不回写明文"""
+    monkeypatch.setenv('BING_REGION', 'eastasia')
+    idx = win.api_type_combo.findData('bing')
+    assert idx >= 0
+    win.api_type_combo.setCurrentIndex(idx)
+    spin(qapp)
+
+    assert win._api_field_edits['bing_region'].text() == 'eastasia'
+    assert win._env_secret_values.get('bing_region') == 'eastasia', \
+        "环境变量提供的区域值不该被回写进 config.ini"
+

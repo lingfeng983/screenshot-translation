@@ -591,6 +591,11 @@ def test_pin_window_accepts_keyboard_focus(qapp):
     pin = PinWindow(pixmap)
     try:
         assert pin.focusPolicy() == Qt.StrongFocus
+        # 切换置顶会重建原生窗口：不能因此把窗口藏掉或丢掉焦点策略
+        pin.show()
+        pin._toggle_top(False)
+        assert pin.isVisible(), '切换置顶后窗口被藏起来了'
+        assert pin.focusPolicy() == Qt.StrongFocus
     finally:
         pin.close()
 
@@ -627,6 +632,12 @@ def test_magnifier_pixel_handles_grayscale_and_palette(qapp):
     palette = Image.new('P', (20, 20), 1)
     palette.putpalette([0, 0, 0, 10, 20, 30] + [0] * (256 * 3 - 6))
     assert capture_magnifier.pixel_at(palette, 5, 5, 1.0) == (10, 20, 30)
+
+    # LA 是双通道：必须还原成 3 通道，否则 color_hex/rgb[2] 会崩
+    la = Image.new('LA', (20, 20), (77, 128))
+    rgb = capture_magnifier.pixel_at(la, 5, 5, 1.0)
+    assert rgb == (77, 77, 77)
+    assert capture_magnifier.color_hex(rgb) == '#4d4d4d'
 
 
 def test_scroll_cancel_banner_sets_event(qapp):
@@ -680,4 +691,138 @@ def test_ocr_failure_keeps_error_local(qapp):
         result, error, provider_cls = manager._recognize_via(
             FailingProvider, Image.new('RGB', (4, 4)))
     assert error is not None, '本次异常要作为返回值交给调用方'
-    assert manager._last_error is None, '异常不该落到共享实例属性上'
+    assert not hasattr(manager, '_last_error'), '不该再有共享异常状态'
+
+
+def test_language_switch_during_request_never_shows_source(qapp):
+    """忙碌中换语言：回填时不能把原文当译文显示"""
+    from managers.translate_window import TranslateWindow
+
+    class FakeMain:
+        translation_manager = None
+        config_manager = None
+
+    window = TranslateWindow(FakeMain())
+    try:
+        window.source_edit.setPlainText('Hello world')
+        window._busy = True
+        window._last_request = ('Hello world', 'zh')
+        window._request_id = 1
+        window._auto_pending = True      # 换语言时置位
+        window._apply_result(1, '你好世界', '')
+        shown = window.result_edit.toPlainText()
+        assert shown != 'Hello world', '把原文当成译文显示了'
+        assert shown in ('', '你好世界')
+
+        # 没有待办时正常回填译文
+        window._auto_pending = False
+        window._apply_result(1, '你好世界', '')
+        assert window.result_edit.toPlainText() == '你好世界'
+
+        # 语言真的变了：旧语言的译文也不能回填，等补译
+        en_index = window.lang_combo.findData('en')
+        assert en_index >= 0
+        window.lang_combo.setCurrentIndex(en_index)
+        window._request_id = 2
+        window._busy = True
+        window._last_request = ('Hello world', 'zh')
+        window._auto_pending = True
+        window.result_edit.clear()
+        window._apply_result(2, '你好世界', '')
+        assert window.result_edit.toPlainText() == '', '语言已变却回填了旧译文'
+    finally:
+        window.close()
+
+
+def test_scroll_dispatch_failure_clears_token(qapp):
+    """滚动截图回投失败后必须作废令牌，否则截图热键会被永久吞掉"""
+    from unittest.mock import patch
+    from managers.screenshot import ScreenshotManager
+
+    manager = ScreenshotManager()
+
+    class Widget:
+        def current_request_id(self):
+            return 1
+
+        def set_capture_busy(self, busy):
+            pass
+
+        def show_scroll_banner(self, event):
+            pass
+
+        def on_scroll_finished(self, image):
+            pass
+
+    widget = Widget()
+    manager._screenshot_widget = widget
+    cancel_event = threading.Event()
+    manager._scroll_cancel = cancel_event
+
+    with patch('managers.screenshot.qt_dispatcher') as dispatcher, \
+            patch('managers.capture_scroll.capture_scrolling',
+                  return_value=None):
+        dispatcher.dispatch_to_main_thread.side_effect = RuntimeError('down')
+        manager._run_scroll(widget, {}, Image.new('RGB', (8, 8)), 1, {},
+                            cancel_event)
+
+    assert manager._scroll_cancel is None, '回投失败后令牌残留'
+
+
+def test_capture_hotkey_cancels_running_scroll(qapp):
+    """滚动截图期间按截图热键应取消长截图，而不是另起一个遮罩"""
+    from managers.screenshot import ScreenshotManager
+
+    manager = ScreenshotManager()
+    sentinel = object()
+    manager._screenshot_widget = sentinel
+    cancel_event = threading.Event()
+    manager._scroll_cancel = cancel_event
+
+    manager._run_screenshot(capture_only=True)
+
+    assert cancel_event.is_set(), '热键没有取消长截图'
+    assert manager._screenshot_widget is sentinel, '滚动期间又新建了遮罩'
+
+
+def test_capture_watchdog_stops_when_idle(qapp):
+    """忙碌态 watchdog 要随结果回投停表，不能一直挂着"""
+    from managers.screenshot import ScreenshotWidget
+
+    widget = ScreenshotWidget(capture_only=True)
+    try:
+        widget.set_capture_busy(True)
+        assert widget._capture_watchdog is not None
+        assert widget._capture_watchdog.isActive()
+        widget.set_capture_busy(False)
+        assert not widget._capture_watchdog.isActive()
+    finally:
+        widget.close()
+
+
+def test_hotkey_identity_normalizes_aliases(qapp):
+    """设置页查重用的标识函数：别名与顺序不同视为同一组合"""
+    from main import _hotkey_identity
+
+    assert _hotkey_identity('ctrl+alt+z') == _hotkey_identity('alt+ctrl+z')
+    assert _hotkey_identity('control+alt+z') == _hotkey_identity('ctrl+alt+z')
+    assert _hotkey_identity('win+shift+a') == _hotkey_identity('windows+shift+a')
+    assert _hotkey_identity('') is None
+    # 不同组合必须区分开
+    assert _hotkey_identity('ctrl+alt+z') != _hotkey_identity('ctrl+alt+y')
+
+
+def test_nested_no_persist_batches_allowed(tmp_path):
+    """同为不落盘的嵌套没有写盘冲突，应当允许"""
+    import os
+    from config import ConfigManager
+
+    path = str(tmp_path / 'config.ini')
+    cm = ConfigManager(path)
+    with cm.batch(persist=False):
+        cm.set_target_lang('en')
+        with cm.batch(persist=False):
+            cm.set_minimize_to_tray(False)
+    assert cm.get_target_lang() == 'en'
+    assert cm.is_minimize_to_tray() is False
+    assert not os.path.exists(path), '不落盘的批次仍然写了文件'

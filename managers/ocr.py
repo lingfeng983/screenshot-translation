@@ -94,10 +94,6 @@ class OCRManager(ProviderChainManager):
         self.ocr_type = 'rapidocr'  # 默认本地RapidOCR
         self._providers = {}
         self._provider_lock = threading.Lock()
-        # 最近一次识别失败的异常：用于区分“引擎坏了”与“图里没字”
-        self._last_error = None
-        # 抛出该异常的 provider 类：降级链里最后动手的可能不是配置的引擎
-        self._last_error_provider = None
         self._load_config()
 
         logger.info(f"OCR管理器初始化完成，当前引擎: {self.ocr_type}，"
@@ -253,7 +249,7 @@ class OCRManager(ProviderChainManager):
             return NO_TEXT_NOTICE, []
         return self.perform_ocr(image, deadline, cancel_event), []
 
-    def _empty_result_is_final(self, error=None, provider_cls=None):
+    def _empty_result_is_final(self, error, provider_cls=None):
         """
         本次空结果是否已经是最终答案
 
@@ -261,20 +257,16 @@ class OCRManager(ProviderChainManager):
         块级链路里退到本地 RapidOCR 后才报“没字”，此时答案同样确定；
         反过来只看配置引擎会把云端偶发空结果当定案。
 
-        错误与引擎由调用方按本次请求局部传递（不再从实例属性上读）：两次
-        截图并发时实例属性会被另一次请求覆盖，空结果判定就会串台。
+        错误与引擎一律由调用方按本次请求局部传递：两次截图并发时实例属性
+        会被另一次请求覆盖，空结果判定就会串台，所以这里不读任何实例状态。
 
         Args:
-            error (Exception 或 None): 本次请求实际抛出的异常；
-                None 时回退读实例属性（兼容旧调用方/测试）
-            provider_cls: 实际抛出该异常的 provider 类
+            error (Exception 或 None): 本次请求实际抛出的异常
+            provider_cls: 实际抛出该异常的 provider 类；None 时按当前配置引擎算
 
         Returns:
             bool: 最后尝试的引擎是本地确定性引擎，且刚刚报的就是“没字”
         """
-        if error is None and provider_cls is None:
-            error = self._last_error
-            provider_cls = self._last_error_provider
         if not isinstance(error, ProviderEmptyResultError):
             return False
         provider_cls = provider_cls or self._resolve_provider(self.ocr_type)

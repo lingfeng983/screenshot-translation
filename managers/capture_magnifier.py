@@ -43,9 +43,14 @@ def pixel_at(source, x, y, scale=1.0):
     if px < 0 or py < 0 or px >= source.width or py >= source.height:
         return None
     try:
-        # 直接读单像素：convert('RGB') 会把整张冻结桌面（4K 上约 25MB）复制
-        # 一遍，而放大镜每次 mouseMove 都要重绘，逐帧全图深拷贝实测约 9ms。
-        rgb = source.getpixel((px, py))
+        # 常见模式直接读单像素：convert('RGB') 会把整张冻结桌面（4K 上约
+        # 25MB）复制一遍，而放大镜每次 mouseMove 都要重绘，逐帧全图深拷贝
+        # 实测约 9ms。少见模式（CMYK/YCbCr…）没有直接的 RGB 语义，仍转换
+        # 后取值，保证下游拿到的永远是 3 通道。
+        if source.mode in ('RGB', 'RGBA', 'L', 'P', '1', 'I', 'I;16', 'F', 'LA'):
+            rgb = source.getpixel((px, py))
+        else:
+            rgb = source.convert('RGB').getpixel((px, py))
         if isinstance(rgb, int):
             if source.mode == 'P':
                 palette = source.getpalette()
@@ -53,7 +58,11 @@ def pixel_at(source, x, y, scale=1.0):
                 if palette and index + 2 < len(palette):
                     return tuple(palette[index:index + 3])
             return (rgb, rgb, rgb)
-        return tuple(rgb[:3])
+        values = tuple(rgb[:3])
+        if len(values) < 3:
+            # LA 等带 alpha 的双通道：按灰度还原，别让 color_hex/rgb[2] 崩
+            values = (values[0],) * 3 if values else (0, 0, 0)
+        return values
     except Exception:
         return None
 

@@ -256,7 +256,8 @@ def _build_mosaic_tile(local_rect, crop_scale, source):
     patch = source.crop((left, top, right, bottom))
     # 马赛克要的是硬边像素块：PIL 默认 BICUBIC 会把缩小再放大的结果插值成
     # 一片模糊，两次都必须显式用 NEAREST。
-    nearest = Image.Resampling.NEAREST
+    # Pillow < 9.1 没有 Resampling 枚举（旧别名仍可用），兼容两种写法
+    nearest = getattr(getattr(Image, 'Resampling', Image), 'NEAREST')
     pixelated = patch.resize((small_w, small_h), nearest).resize(
         (right - left, bottom - top), nearest)
     return pil_to_qpixmap(pixelated)

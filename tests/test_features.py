@@ -2362,17 +2362,17 @@ def test_ocr_empty_result_shortcut():
         assert EmptyCloudProvider.calls == ['blocks', 'text'], \
             f"云端引擎不该跳过降级链路: {EmptyCloudProvider.calls}"
 
-        # “空结果是否定案”的判定规则：看的是动手的那个引擎
+        # “空结果是否定案”的判定规则：看的是动手的那个引擎，异常按本次请求传入
+        empty = ProviderEmptyResultError('无文字')
         manager.ocr_type = 'probe_empty_local'
-        manager._last_error = ProviderEmptyResultError('无文字')
-        manager._last_error_provider = EmptyLocalProvider
-        assert manager._empty_result_is_final() is True
+        assert manager._empty_result_is_final(empty, EmptyLocalProvider) is True
         manager.ocr_type = 'probe_empty_cloud'
-        manager._last_error_provider = EmptyCloudProvider
-        assert manager._empty_result_is_final() is False
+        assert manager._empty_result_is_final(empty, EmptyCloudProvider) is False
         # 配置的是云端引擎，但降级链里最后动手的是本地确定性引擎：同样定案
-        manager._last_error_provider = EmptyLocalProvider
-        assert manager._empty_result_is_final() is True
+        assert manager._empty_result_is_final(empty, EmptyLocalProvider) is True
+        # 非“空结果”类异常不能定案
+        assert manager._empty_result_is_final(RuntimeError('boom'),
+                                              EmptyLocalProvider) is False
     finally:
         ocr_mod.ocr_provider_registry = saved_registry
     print("✅ 空识别结果不重复跑引擎测试通过\n")
@@ -3239,7 +3239,8 @@ def test_stale_attachment_delete_failure_is_fatal():
                                  io.BytesIO(b'{"message":"boom"}'))
 
             def make_api(delete_code):
-                def _api(url, token, data=None, content_type=None, method=None):
+                def _api(url, token, data=None, content_type=None, method=None,
+                         timeout=30):
                     if method == 'DELETE':
                         if delete_code:
                             raise http_error(delete_code)

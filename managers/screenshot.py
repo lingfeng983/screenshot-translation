@@ -279,10 +279,13 @@ class ScreenshotManager:
             # 这种情况下按键不能被吞掉，否则用户看到的就是"快捷键没反应"
             if self._screenshot_widget is not None:
                 if self._scroll_cancel is not None:
-                    # 滚动截图期间遮罩刻意隐藏，isVisible() 为 False：此时不能再
-                    # 把它当残留引用另起一个遮罩，否则滚轮还在注入、抓帧还在跑，
-                    # 两套流程会互相打架。让用户点取消横幅收手即可。
-                    logger.info("滚动截图进行中，忽略本次截图热键")
+                    # 滚动截图期间遮罩刻意隐藏，isVisible() 为 False：此时不能
+                    # 另起一个遮罩（滚轮还在注入、抓帧还在跑）。把这次热键
+                    # 当成「取消长截图」：置位取消事件，让后台任务按原路径
+                    # 收手并回投结果，恢复遮罩/清在途标记只走那一处。
+                    # 这样即使取消横幅因选区过大没显示，也有恒定的取消入口。
+                    logger.info("滚动截图进行中，本次热键作为取消长截图处理")
+                    self._scroll_cancel.set()
                     return
                 if self._widget_is_live(self._screenshot_widget):
                     logger.info("截图遮罩已显示，本次热键作为取消处理")
@@ -493,15 +496,26 @@ class ScreenshotManager:
             qt_dispatcher.dispatch_to_main_thread(
                 self._apply_scroll_result, widget, long_image, request_id)
         except Exception:
-            # 连回投都失败时由 widget 上的超时兜底把隐藏的遮罩恢复回来
             logger.exception("滚动截图结果回投失败")
+            # 回投不出去时 _apply_scroll_result 永远不会跑：令牌必须当场作废
+            # （只作废本轮的，别误清新一轮），否则 _run_screenshot 会把此后
+            # 所有截图热键当成「滚动中」一直吞掉。
+            if self._scroll_cancel is cancel_event:
+                self._scroll_cancel = None
+            try:
+                # 再试一次把恢复动作投回主线程；若连这次都失败（事件循环已
+                # 退出），就只能靠 widget 上的 30s 兜底复位编辑态了。
+                qt_dispatcher.dispatch_to_main_thread(
+                    self._apply_scroll_result, widget, None, request_id)
+            except Exception:
+                logger.exception("滚动截图恢复调度再次失败")
 
     def _apply_scroll_result(self, widget, long_image, request_id):
-        # 任务已收手：清掉在途标记，否则之后的截图热键会被一直当成
-        # 「滚动截图进行中」而忽略。
-        self._scroll_cancel = None
+        # 先校验归属：迟到的旧结果不能把新一轮滚动的令牌清掉
         if widget is None or widget is not self._screenshot_widget:
             return
+        # 任务已收手：清掉在途标记
+        self._scroll_cancel = None
         try:
             if request_id == widget.current_request_id():
                 widget.on_scroll_finished(long_image)

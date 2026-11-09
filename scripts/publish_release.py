@@ -251,11 +251,16 @@ def read_token():
     return ""
 
 
-def api_request(url, token, data=None, content_type=None, method=None):
+def api_request(url, token, data=None, content_type=None, method=None,
+                timeout=30):
     """GitHub REST 调用：JSON 走请求体，附件走原始二进制，返回 JSON
 
     令牌只放 Authorization 头：URL 查询串会被代理和访问日志原样落盘，
     等于把私人令牌写到别人机器上。
+
+    Args:
+        timeout (float): socket 级超时（连接与每次读），不是整个请求的总
+            时长；上传几十 MB 附件时由调用方放宽，避免慢网被误判卡死。
     """
     import json
     from urllib.request import Request, urlopen
@@ -277,8 +282,7 @@ def api_request(url, token, data=None, content_type=None, method=None):
     req.add_header("X-GitHub-Api-Version", "2022-11-28")
     if content_type:
         req.add_header("Content-Type", content_type)
-    # 上传安装包（几十 MB）或 API 卡住时不能无限等，给一个整体超时
-    with urlopen(req, timeout=90) as resp:
+    with urlopen(req, timeout=timeout) as resp:
         raw = resp.read().decode("utf-8")
         return json.loads(raw) if raw else {}
 
@@ -334,8 +338,9 @@ def upload_attachment(rid, path, token):
         payload = f.read()
     upload_url = (f"{GITHUB_UPLOAD}/repos/{GITHUB_REPO}/releases/{rid}/assets"
                   f"?name={quote(name)}")
+    # 上传是几十 MB 的二进制，慢网下单次写可能远超普通 API 的超时
     resp = api_request(upload_url, token, data=payload,
-                       content_type="application/octet-stream")
+                       content_type="application/octet-stream", timeout=120)
     print(f"  已上传 {resp['name']}（{resp.get('size', 0) / 1048576:.1f} MB）")
     print(f"  {resp['browser_download_url']}")
     undeleted = []

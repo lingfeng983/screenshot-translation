@@ -431,12 +431,16 @@ class TranslateWindow(QDialog):
             logger.debug("翻译结果已过期，丢弃")
             return
         self._set_busy(False)
-        # 请求期间用户又改过原文：现在补一次自动翻译
+        # 请求期间用户改过原文或换过语言：这次结果已经对不上当前表单了。
+        # 只排一次重译，绝不把原文或旧语言的译文贴进译文框——text 是本次
+        # 请求带回来的译文，不能拿来判断要不要重译（曾经把原文当成译文显示）。
         if self._auto_pending:
             self._auto_pending = False
-            text = self._source_text()
-            if text and (text, self.current_language()) != self._last_request:
+            pending_text = self._source_text()
+            if pending_text and (pending_text, self.current_language()) != self._last_request:
                 self._auto_timer.start()
+                self._set_status('内容已变化，正在重新翻译…')
+                return
         if error:
             self._set_status(error, error=True)
             return
