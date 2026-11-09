@@ -2,6 +2,52 @@
 
 所有显著改动记录于此。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [Unreleased]
+
+### 新增
+- **纯截图升级为完整截图工作流**：松手后不再直接出图，而是进入编辑态，
+  提供矩形/椭圆/直线/箭头/画笔/荧光笔/文字/序号/马赛克九种标注工具、
+  8 色色盘与屏幕吸管、线宽与字号调节、`Ctrl+Z` 撤销 / `Ctrl+Y` 重做 / 清空。
+  标注为烧录语义（画上即合成进像素，不提供单选对象，但可整步撤销）
+  （`managers/capture_annotation.py`、`capture_editor.py`、`capture_toolbar.py`、
+  `managers/screenshot.py`）
+- **框选辅助**：窗口自动识别（悬停高亮、单击选中整个窗口）、跟随光标的
+  放大镜与坐标/RGB/HEX 显示、方向键无关的选区平移；复用已有窗口枚举与
+  磁吸数据（`managers/capture_magnifier.py`、`managers/screenshot.py`）
+- **滚动截图（长截图）**：以选区为固定视口注入滚轮、连续抓帧，用相邻帧底部
+  条带做 `TM_SQDIFF_NORMED` 垂直模板匹配求重叠量并拼成长图，到底/无变化/
+  达到高度上限自动停止；拼接为纯函数便于离线测试，遮罩关闭时后台任务立即收手
+  （`managers/capture_scroll.py`）
+- **OCR 取字**：复用内置本地 RapidOCR 按阅读顺序提取图中文字，自动写入
+  剪贴板并弹出可编辑结果窗；本地推理不联网，保持纯截图零网络请求的定位
+  （`managers/capture_ocr.py`）
+- **三条新全局快捷键**：`Ctrl+Alt+F` 全屏截图、`Ctrl+Alt+W` 活动窗口截图、
+  `Ctrl+Alt+R` 重复上次区域；各自独立注册且 ID 互不相同，设置页扩成六行并
+  校验任意两条不重复，托盘菜单同步新增三个入口
+  （`managers/hotkey.py`、`hotkey_native.py`、`window_enum.py`、`main.py`、
+  `managers/tray.py`）
+- **截图输出增强**：PNG/JPG/WebP、JPG 质量、默认目录、strftime 文件名模板、
+  快速保存（不弹文件框）、保存后动作（复制/关闭）；贴图窗口新增右键菜单
+  （复制/保存/置顶/透明度）与 `Ctrl+S`（`managers/capture_output.py`、
+  `pin_window.py`）
+- **`[Capture]` 配置段与设置页「纯截图（不翻译）」分组**：上述参数全部可视化，
+  标注颜色/线宽/字号在工具条调整后自动记回配置
+  （`config.py`、`config.example.ini`、`main.py`）
+
+### 变更
+- `ConfigParser` 关闭 `BasicInterpolation`：文件名模板里的 `%Y%m%d` 等
+  strftime 占位符否则会被当成插值语法直接抛 `ValueError`（`config.py`）
+- 纯截图不再复用 `OverlayToolbar` 的精简分支，改由 `CaptureToolbar` 接管；
+  翻译结果工具条路径不变（`managers/overlay_toolbar.py`、`managers/screenshot.py`）
+- 打包配置显式列出新增的 `managers.capture_*` 模块，覆盖 `capture_ocr` /
+  `capture_scroll` 的函数级延迟导入（`screenshot-translator.spec`）
+
+### 测试
+- 新增 `tests/test_capture_features.py`（31 例）：图元绘制、撤销重做与平移快照、
+  高分屏合成导出、放大镜取色、输出格式与模板、滚动拼接端到端与取消、
+  OCR 提示文本过滤、新快捷键路由、配置迁移与预设选区
+- 更新 `tests/test_features.py` 的纯截图用例与遮罩 mock（新增信号、preset 参数）
+
 ## [v1.9.0] — 2026-11-09
 
 ### 新增

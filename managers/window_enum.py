@@ -163,3 +163,43 @@ def get_visible_window_rects(exclude_hwnd=0, screen_size=None):
     except Exception as e:
         logger.warning(f"枚举窗口失败，磁吸退化: {e}")
         return []
+
+
+def get_foreground_window_rect():
+    """
+    取当前前台窗口的矩形（物理像素虚拟桌面坐标），供「活动窗口截图」
+
+    优先用 DWM 的扩展边框（不含不可见阴影），取不到时退回 GetWindowRect。
+    必须在截图遮罩立起来之前调用，否则拿到的会是遮罩自己。
+
+    Returns:
+        tuple[int, int, int, int] or None: (left, top, right, bottom)
+    """
+    if not _is_windows():
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        hwnd = user32.GetForegroundWindow()
+        if not hwnd:
+            return None
+        rect = wintypes.RECT()
+        if not user32.GetWindowRect(wintypes.HWND(hwnd), ctypes.byref(rect)):
+            return None
+        try:
+            ext = wintypes.RECT()
+            ctypes.windll.dwmapi.DwmGetWindowAttribute(
+                wintypes.HWND(hwnd), wintypes.DWORD(9),  # DWMWA_EXTENDED_FRAME_BOUNDS
+                ctypes.byref(ext), ctypes.sizeof(ext))
+            rect = ext
+        except Exception:
+            pass
+        left, top, right, bottom = rect.left, rect.top, rect.right, rect.bottom
+        if right - left < 20 or bottom - top < 20:
+            return None
+        return (left, top, right, bottom)
+    except Exception as e:
+        logger.warning(f"取前台窗口矩形失败: {e}")
+        return None

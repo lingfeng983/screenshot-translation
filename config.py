@@ -31,7 +31,9 @@ class ConfigManager:
                 （源码→项目根，exe→~/.screenshot-translation）
         """
         self.config_file = config_file or app_paths.config_file()
-        self.config = configparser.ConfigParser()
+        # 关闭 BasicInterpolation：文件名模板里的 %Y%m%d 等 strftime 占位符
+        # 会被当成插值语法直接抛 ValueError，配置值应当一律按字面读写
+        self.config = configparser.ConfigParser(interpolation=None)
         # 写侧锁：池线程读、主线程写并发存在，写盘与批量改值必须串行
         self._lock = threading.RLock()
         # 批量写盘：配置窗口保存时几十个 setter 只需落盘一次
@@ -80,7 +82,7 @@ class ConfigManager:
             try:
                 self.config.read(self.config_file, encoding='utf-8')
                 logger.info(f"配置文件加载成功: {self.config_file}")
-                # 旧配置文件自动迁移：六个段逐个补齐。缺段的危害不只是读不到值
+                # 旧配置文件自动迁移：七个段逐个补齐。缺段的危害不只是读不到值
                 # （读侧有 fallback 兜着），而是 setter 里的 config.set 会直接
                 # 抛 NoSectionError——用户点一次“保存”就崩一次。
                 if self._migrate_sections() or self._migrate_values():
@@ -94,7 +96,7 @@ class ConfigManager:
                     shutil.copy2(self.config_file, self.config_file + '.bak')
                 # 半截解析会留下几个"存在但缺键"的段，而各段的默认值填充器
                 # 见段即跳，修出来的文件会整段整段缺键；先扔掉半成品
-                self.config = configparser.ConfigParser()
+                self.config = configparser.ConfigParser(interpolation=None)
                 self._set_defaults()
                 # 文件已存在但读坏了：用默认值把它修好，
                 # 否则每次启动都当成坏配置，用户此前的设置也再无机会恢复
@@ -110,6 +112,7 @@ class ConfigManager:
         ('Startup', '_set_startup_defaults'),
         ('Update', '_set_update_defaults'),
         ('Overlay', '_set_overlay_defaults'),
+        ('Capture', '_set_capture_defaults'),
         ('OCR', '_set_ocr_defaults'),
     )
 
@@ -216,6 +219,8 @@ class ConfigManager:
         self._set_update_defaults()
         # 截图遮罩默认配置
         self._set_overlay_defaults()
+        # 纯截图（编辑/输出/滚动截图）默认配置
+        self._set_capture_defaults()
         # OCR 默认配置
         self._set_ocr_defaults()
 
@@ -248,6 +253,9 @@ class ConfigManager:
         self.config.set('Hotkey', 'global_hotkey', 'alt+z')  # 默认快捷键
         self.config.set('Hotkey', 'capture_hotkey', 'ctrl+alt+z')  # 纯截图快捷键
         self.config.set('Hotkey', 'translate_hotkey', 'ctrl+alt+t')  # 文本翻译页快捷键
+        self.config.set('Hotkey', 'fullscreen_hotkey', 'ctrl+alt+f')  # 全屏截图
+        self.config.set('Hotkey', 'window_hotkey', 'ctrl+alt+w')  # 活动窗口截图
+        self.config.set('Hotkey', 'repeat_hotkey', 'ctrl+alt+r')  # 重复上次区域
 
     def _set_startup_defaults(self):
         """设置 [Startup] 段默认配置值"""
@@ -296,6 +304,27 @@ class ConfigManager:
 
         self.config.set('Overlay', 'snap_threshold', '12')  # 磁吸阈值（像素）
         self.config.set('Overlay', 'dim_opacity', '90')     # 暗角透明度 (0~180)
+
+    def _set_capture_defaults(self):
+        """设置 [Capture] 段默认配置值（纯截图的标注与输出参数）"""
+        if not self.config.has_section('Capture'):
+            self.config.add_section('Capture')
+        else:
+            return
+
+        self.config.set('Capture', 'format', 'png')             # png/jpg/webp
+        self.config.set('Capture', 'jpg_quality', '90')         # 1~100
+        self.config.set('Capture', 'save_dir', '')              # 空=系统图片目录
+        self.config.set('Capture', 'filename_template', '截图_%Y%m%d_%H%M%S')
+        self.config.set('Capture', 'quick_save', 'false')       # true 时不弹保存框
+        self.config.set('Capture', 'after_save', 'none')        # none/copy/close/copy_close
+        self.config.set('Capture', 'pen_color', '#ff3b30')
+        self.config.set('Capture', 'pen_width', '4')
+        self.config.set('Capture', 'font_size', '18')
+        self.config.set('Capture', 'magnifier', 'true')         # 框选时显示放大镜
+        self.config.set('Capture', 'scroll_delay_ms', '180')    # 滚动后等待渲染
+        self.config.set('Capture', 'scroll_step', '3')          # 每轮滚轮格数
+        self.config.set('Capture', 'scroll_max_height', '12000')  # 长图高度上限(px)
 
     def save_config(self):
         """
@@ -507,6 +536,25 @@ class ConfigManager:
         self._set('Overlay', option, value)
         self.save_config()
 
+    # 纯截图配置
+    def get_capture_option(self, option, fallback=''):
+        """
+        读取 [Capture] 段的配置项
+
+        Args:
+            option (str): 配置项名
+            fallback (str): 未设置时的默认值
+
+        Returns:
+            str: 配置值
+        """
+        return self.config.get('Capture', option, fallback=fallback)
+
+    def set_capture_option(self, option, value):
+        """写入 [Capture] 段的配置项并保存"""
+        self._set('Capture', option, value)
+        self.save_config()
+
     # 快捷键配置
     def get_global_hotkey(self):
         """
@@ -565,6 +613,36 @@ class ConfigManager:
             hotkey (str): 快捷键组合
         """
         self._set('Hotkey', 'translate_hotkey', hotkey)
+        self.save_config()
+
+    def get_fullscreen_hotkey(self):
+        """获取全屏截图的全局快捷键"""
+        return self.config.get('Hotkey', 'fullscreen_hotkey',
+                               fallback='ctrl+alt+f')
+
+    def set_fullscreen_hotkey(self, hotkey):
+        """设置全屏截图的全局快捷键"""
+        self._set('Hotkey', 'fullscreen_hotkey', hotkey)
+        self.save_config()
+
+    def get_window_hotkey(self):
+        """获取活动窗口截图的全局快捷键"""
+        return self.config.get('Hotkey', 'window_hotkey',
+                               fallback='ctrl+alt+w')
+
+    def set_window_hotkey(self, hotkey):
+        """设置活动窗口截图的全局快捷键"""
+        self._set('Hotkey', 'window_hotkey', hotkey)
+        self.save_config()
+
+    def get_repeat_hotkey(self):
+        """获取重复上次区域的全局快捷键"""
+        return self.config.get('Hotkey', 'repeat_hotkey',
+                               fallback='ctrl+alt+r')
+
+    def set_repeat_hotkey(self, hotkey):
+        """设置重复上次区域的全局快捷键"""
+        self._set('Hotkey', 'repeat_hotkey', hotkey)
         self.save_config()
 
     # 启动行为配置

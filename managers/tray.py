@@ -117,6 +117,18 @@ class SystemTrayManager:
                 self._on_start_capture
             ),
             pystray.MenuItem(
+                "全屏截图",
+                self._on_start_fullscreen
+            ),
+            pystray.MenuItem(
+                "活动窗口截图",
+                self._on_start_window
+            ),
+            pystray.MenuItem(
+                "重复上次区域",
+                self._on_start_repeat
+            ),
+            pystray.MenuItem(
                 "文本翻译",
                 self._on_open_translate
             ),
@@ -175,6 +187,31 @@ class SystemTrayManager:
                 logger.debug(traceback.format_exc())
         else:
             logger.error("截图管理器未初始化")
+
+    def _run_capture_action(self, method_name, label):
+        """统一调度截图动作：托盘回调跑在 pystray 线程，异常不能外抛"""
+        logger.info(f"托盘菜单：{label}")
+        if not self.screenshot_manager:
+            logger.error("截图管理器未初始化")
+            return
+        try:
+            getattr(self.screenshot_manager, method_name)()
+        except Exception as e:
+            logger.error(f"启动{label}失败: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+
+    def _on_start_fullscreen(self, icon=None, item=None):
+        """全屏截图菜单项回调"""
+        self._run_capture_action('start_capture_fullscreen', '全屏截图')
+
+    def _on_start_window(self, icon=None, item=None):
+        """活动窗口截图菜单项回调"""
+        self._run_capture_action('start_capture_window', '活动窗口截图')
+
+    def _on_start_repeat(self, icon=None, item=None):
+        """重复上次区域菜单项回调"""
+        self._run_capture_action('start_capture_repeat', '重复上次区域')
 
     def _on_open_translate(self, icon=None, item=None):
         """

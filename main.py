@@ -152,6 +152,9 @@ class MainApp:
         self.hotkey_manager = None
         self.capture_hotkey_manager = None
         self.text_hotkey_manager = None
+        self.fullscreen_hotkey_manager = None
+        self.window_hotkey_manager = None
+        self.repeat_hotkey_manager = None
         self.app = None
         self.config_window = None
         self.translate_window = None
@@ -243,7 +246,8 @@ class MainApp:
             self.tray_manager = SystemTrayManager(self, self.screenshot_manager)
             self.tray_manager.initialize()
 
-            # 初始化全局快捷键管理器（截图翻译 + 纯截图 + 文本翻译页各一条）
+            # 初始化全局快捷键管理器：翻译 / 区域截图 / 文本翻译页 /
+            # 全屏截图 / 活动窗口截图 / 重复上次区域，各一条且 ID 互不相同
             self.hotkey_manager = HotkeyManager(self.screenshot_manager, self.config_manager)
             self.hotkey_manager.initialize()
             self.capture_hotkey_manager = HotkeyManager(
@@ -253,6 +257,15 @@ class MainApp:
                 self.screenshot_manager, self.config_manager, action='text',
                 on_trigger=self.open_translate_window)
             self.text_hotkey_manager.initialize()
+            self.fullscreen_hotkey_manager = HotkeyManager(
+                self.screenshot_manager, self.config_manager, action='fullscreen')
+            self.fullscreen_hotkey_manager.initialize()
+            self.window_hotkey_manager = HotkeyManager(
+                self.screenshot_manager, self.config_manager, action='window')
+            self.window_hotkey_manager.initialize()
+            self.repeat_hotkey_manager = HotkeyManager(
+                self.screenshot_manager, self.config_manager, action='repeat')
+            self.repeat_hotkey_manager.initialize()
             # 原生注册被别的程序占用时只能退到键盘钩子，而钩子在提权窗口/锁屏切换后
             # 收不到按键——用户侧的感受就是“快捷键时灵时不灵”。启动时就明确提示一次，
             # 能换组合早换，而不是等他事后抱怨。
@@ -473,6 +486,9 @@ class MainApp:
         self._notify_single_hotkey_conflict(self.hotkey_manager, '截图翻译快捷键', 3.5)
         self._notify_single_hotkey_conflict(self.capture_hotkey_manager, '纯截图快捷键', 4.0)
         self._notify_single_hotkey_conflict(self.text_hotkey_manager, '文本翻译快捷键', 4.5)
+        self._notify_single_hotkey_conflict(self.fullscreen_hotkey_manager, '全屏截图快捷键', 5.0)
+        self._notify_single_hotkey_conflict(self.window_hotkey_manager, '活动窗口截图快捷键', 5.5)
+        self._notify_single_hotkey_conflict(self.repeat_hotkey_manager, '重复上次区域快捷键', 6.0)
 
     def _notify_single_hotkey_conflict(self, manager, label, delay):
         """一条快捷键的兼容模式提示（没有冲突时什么都不做）"""
@@ -646,6 +662,12 @@ class MainApp:
                 if self.text_hotkey_manager:
                     logger.debug("清理文本翻译快捷键")
                     self.text_hotkey_manager.cleanup()
+
+                for manager in (self.fullscreen_hotkey_manager,
+                                self.window_hotkey_manager,
+                                self.repeat_hotkey_manager):
+                    if manager:
+                        manager.cleanup()
 
                 if self.tray_manager:
                     logger.debug("清理系统托盘")
@@ -895,41 +917,107 @@ class ConfigWindow(QDialog):
         overlay_group.setLayout(overlay_layout)
         layout.addWidget(overlay_group)
 
-        # 快捷键配置
+        # 纯截图：输出格式/保存行为/框选辅助/滚动截图参数
+        capture_group = QGroupBox("纯截图（不翻译）")
+        capture_layout = _new_form()
+        from PyQt5.QtWidgets import QSpinBox
+
+        def _cap(option, fallback):
+            return (cm.get_capture_option(option, fallback=fallback)
+                    if cm else fallback)
+
+        def _cap_bool(option, default=False):
+            raw = str(_cap(option, 'true' if default else 'false'))
+            return raw.strip().lower() in ('true', '1', 'yes', 'on')
+
+        self.capture_format_combo = QComboBox()
+        for key, label in (('png', 'PNG'), ('jpg', 'JPG'), ('webp', 'WebP')):
+            self.capture_format_combo.addItem(label, key)
+        self.capture_format_combo.setCurrentIndex(
+            max(0, self.capture_format_combo.findData(_cap('format', 'png'))))
+        capture_layout.addRow("保存格式:", self.capture_format_combo)
+
+        self.capture_quality_spin = QSpinBox()
+        self.capture_quality_spin.setRange(1, 100)
+        self.capture_quality_spin.setValue(
+            max(1, min(100, _read_int(_cap('jpg_quality', '90'), 90))))
+        capture_layout.addRow("JPG/WebP 质量:", self.capture_quality_spin)
+
+        self.capture_dir_edit = QLineEdit(_cap('save_dir', ''))
+        self.capture_dir_edit.setPlaceholderText('留空 = 系统「图片」目录')
+        capture_layout.addRow("保存目录:", self.capture_dir_edit)
+
+        self.capture_template_edit = QLineEdit(
+            _cap('filename_template', '截图_%Y%m%d_%H%M%S'))
+        capture_layout.addRow("文件名模板:", self.capture_template_edit)
+
+        self.capture_quick_check = QCheckBox("保存时不弹文件对话框")
+        self.capture_quick_check.setChecked(_cap_bool('quick_save'))
+        capture_layout.addRow(self.capture_quick_check)
+
+        self.capture_after_combo = QComboBox()
+        for key, label in (('none', '仅保存'), ('copy', '保存并复制'),
+                           ('close', '保存并关闭'),
+                           ('copy_close', '保存、复制并关闭')):
+            self.capture_after_combo.addItem(label, key)
+        self.capture_after_combo.setCurrentIndex(
+            max(0, self.capture_after_combo.findData(_cap('after_save', 'none'))))
+        capture_layout.addRow("保存后动作:", self.capture_after_combo)
+
+        self.capture_magnifier_check = QCheckBox("框选时显示放大镜与坐标/RGB")
+        self.capture_magnifier_check.setChecked(_cap_bool('magnifier', True))
+        capture_layout.addRow(self.capture_magnifier_check)
+
+        for attr, label, option, default, lo, hi, suffix in (
+                ('capture_scroll_delay_spin', '滚动等待:',
+                 'scroll_delay_ms', 180, 30, 2000, ' ms'),
+                ('capture_scroll_step_spin', '每次滚轮格数:',
+                 'scroll_step', 3, 1, 10, ' 格'),
+                ('capture_scroll_max_spin', '长图最大高度:',
+                 'scroll_max_height', 12000, 1000, 40000, ' px')):
+            spin = QSpinBox()
+            spin.setRange(lo, hi)
+            spin.setSuffix(suffix)
+            spin.setValue(max(lo, min(hi, _read_int(
+                _cap(option, str(default)), default))))
+            setattr(self, attr, spin)
+            capture_layout.addRow(label, spin)
+
+        capture_group.setLayout(capture_layout)
+        layout.addWidget(capture_group)
+
+        # 快捷键配置：六条各自独立注册，任意两条重复都会让一次按键触发多个动作。
+        # 每条下面跟一个状态标签：被别的程序占用时只能退到键盘钩子，而钩子在
+        # 提权窗口/锁屏切换后收不到按键，只等到保存时才说就太晚了。
         hotkey_group = QGroupBox("快捷键配置")
         hotkey_layout = _new_form()
-
-        self.hotkey_edit = QLineEdit()
-        self.capture_hotkey_edit = QLineEdit()
-        self.text_hotkey_edit = QLineEdit()
-        if self.config_manager:
-            try:
-                self.hotkey_edit.setText(self.config_manager.get_global_hotkey())
-                self.capture_hotkey_edit.setText(
-                    self.config_manager.get_capture_hotkey())
-                self.text_hotkey_edit.setText(
-                    self.config_manager.get_translate_hotkey())
-            except Exception as e:
-                logger.error(f"获取全局快捷键失败: {e}")
-        hotkey_layout.addRow("截图翻译快捷键:", self.hotkey_edit)
-
-        # 快捷键的真实注册状态摆在眼前：被别的程序占用时只能退到键盘钩子，
-        # 而钩子在提权窗口/锁屏切换后收不到按键——用户只觉得"偶尔失灵"。
-        # 只在保存时才说就太晚了，打开设置就得看见。
-        self.hotkey_status_label = QLabel("")
-        # 整行宽度都要用上：占用提示是两行长句，缩在字段列里会被裁掉
-        self.hotkey_status_label.setWordWrap(True)
-        hotkey_layout.addRow(self.hotkey_status_label)
-
-        hotkey_layout.addRow("纯截图快捷键:", self.capture_hotkey_edit)
-        self.capture_hotkey_status_label = QLabel("")
-        self.capture_hotkey_status_label.setWordWrap(True)
-        hotkey_layout.addRow(self.capture_hotkey_status_label)
-
-        hotkey_layout.addRow("文本翻译快捷键:", self.text_hotkey_edit)
-        self.text_hotkey_status_label = QLabel("")
-        self.text_hotkey_status_label.setWordWrap(True)
-        hotkey_layout.addRow(self.text_hotkey_status_label)
+        hotkey_fields = (
+            ('hotkey', '截图翻译快捷键:', 'get_global_hotkey', 'hotkey_status'),
+            ('capture_hotkey', '纯截图快捷键:', 'get_capture_hotkey',
+             'capture_hotkey_status'),
+            ('text_hotkey', '文本翻译快捷键:', 'get_translate_hotkey',
+             'text_hotkey_status'),
+            ('fullscreen_hotkey', '全屏截图快捷键:', 'get_fullscreen_hotkey',
+             'fullscreen_hotkey_status'),
+            ('window_hotkey', '活动窗口截图快捷键:', 'get_window_hotkey',
+             'window_hotkey_status'),
+            ('repeat_hotkey', '重复上次区域快捷键:', 'get_repeat_hotkey',
+             'repeat_hotkey_status'),
+        )
+        for key, label_text, getter_name, status_key in hotkey_fields:
+            edit = QLineEdit()
+            if self.config_manager:
+                try:
+                    edit.setText(getattr(self.config_manager, getter_name)())
+                except Exception as e:
+                    logger.error(f"获取快捷键失败: {e}")
+            setattr(self, f'{key}_edit', edit)
+            hotkey_layout.addRow(label_text, edit)
+            status = QLabel("")
+            # 整行宽度都要用上：占用提示是两行长句，缩在字段列里会被裁掉
+            status.setWordWrap(True)
+            setattr(self, f'{status_key}_label', status)
+            hotkey_layout.addRow(status)
 
         hotkey_group.setLayout(hotkey_layout)
         layout.addWidget(hotkey_group)
@@ -996,20 +1084,23 @@ class ConfigWindow(QDialog):
 
     def _refresh_hotkey_status(self):
         """
-        把三条快捷键的注册状态写进快捷键分组
+        把六条快捷键的注册状态写进快捷键分组
 
         每次显示窗口都重算：占用是动态的——看门狗会在占用方退出后把后端升回
         系统原生注册，用户再次打开设置时应该看到恢复后的状态而不是旧文案。
         """
-        self._refresh_single_hotkey_status(
-            getattr(self, 'hotkey_status_label', None),
-            getattr(self.main_app, 'hotkey_manager', None))
-        self._refresh_single_hotkey_status(
-            getattr(self, 'capture_hotkey_status_label', None),
-            getattr(self.main_app, 'capture_hotkey_manager', None))
-        self._refresh_single_hotkey_status(
-            getattr(self, 'text_hotkey_status_label', None),
-            getattr(self.main_app, 'text_hotkey_manager', None))
+        pairs = (
+            ('hotkey_status_label', 'hotkey_manager'),
+            ('capture_hotkey_status_label', 'capture_hotkey_manager'),
+            ('text_hotkey_status_label', 'text_hotkey_manager'),
+            ('fullscreen_hotkey_status_label', 'fullscreen_hotkey_manager'),
+            ('window_hotkey_status_label', 'window_hotkey_manager'),
+            ('repeat_hotkey_status_label', 'repeat_hotkey_manager'),
+        )
+        for label_attr, manager_attr in pairs:
+            self._refresh_single_hotkey_status(
+                getattr(self, label_attr, None),
+                getattr(self.main_app, manager_attr, None))
 
     def _refresh_single_hotkey_status(self, label, manager):
         """写一条快捷键的状态文案（label/manager 缺失时安全返回）"""
@@ -1220,6 +1311,35 @@ class ConfigWindow(QDialog):
                     'snap_threshold', str(self.snap_slider.value()))
                 self.config_manager.set_overlay_option(
                     'dim_opacity', str(self.dim_slider.value()))
+                self._save_capture_fields()
+
+    def _save_capture_fields(self):
+        """把「纯截图」分组写回 [Capture] 段（只在真正保存时调用）"""
+        cm = self.config_manager
+        if cm is None:
+            return
+        cm.set_capture_option(
+            'format', self.capture_format_combo.currentData() or 'png')
+        cm.set_capture_option('jpg_quality',
+                              str(self.capture_quality_spin.value()))
+        cm.set_capture_option('save_dir', self.capture_dir_edit.text().strip())
+        cm.set_capture_option(
+            'filename_template',
+            self.capture_template_edit.text().strip() or '截图_%Y%m%d_%H%M%S')
+        cm.set_capture_option(
+            'quick_save',
+            'true' if self.capture_quick_check.isChecked() else 'false')
+        cm.set_capture_option(
+            'after_save', self.capture_after_combo.currentData() or 'none')
+        cm.set_capture_option(
+            'magnifier',
+            'true' if self.capture_magnifier_check.isChecked() else 'false')
+        cm.set_capture_option('scroll_delay_ms',
+                              str(self.capture_scroll_delay_spin.value()))
+        cm.set_capture_option('scroll_step',
+                              str(self.capture_scroll_step_spin.value()))
+        cm.set_capture_option('scroll_max_height',
+                              str(self.capture_scroll_max_spin.value()))
 
     def _apply_hotkey(self, manager, hotkey, label, save_direct):
         """
@@ -1260,6 +1380,9 @@ class ConfigWindow(QDialog):
             hotkey = self.hotkey_edit.text()
             capture_hotkey = self.capture_hotkey_edit.text()
             text_hotkey = self.text_hotkey_edit.text()
+            fullscreen_hotkey = self.fullscreen_hotkey_edit.text()
+            window_hotkey = self.window_hotkey_edit.text()
+            repeat_hotkey = self.repeat_hotkey_edit.text()
             auto_start = self.auto_start_check.isChecked()
 
             # 任意两条热键用同一个组合：键盘钩子后端会把一次按键投给多个回调，
@@ -1271,6 +1394,15 @@ class ConfigWindow(QDialog):
                  self.config_manager.get_capture_hotkey),
                 ('文本翻译快捷键', text_hotkey, self.text_hotkey_edit,
                  self.config_manager.get_translate_hotkey),
+                ('全屏截图快捷键', fullscreen_hotkey,
+                 self.fullscreen_hotkey_edit,
+                 self.config_manager.get_fullscreen_hotkey),
+                ('活动窗口截图快捷键', window_hotkey,
+                 self.window_hotkey_edit,
+                 self.config_manager.get_window_hotkey),
+                ('重复上次区域快捷键', repeat_hotkey,
+                 self.repeat_hotkey_edit,
+                 self.config_manager.get_repeat_hotkey),
             )
             normalized = [value.replace(' ', '').lower()
                           for _label, value, _edit, _getter in entries
@@ -1278,7 +1410,7 @@ class ConfigWindow(QDialog):
             if len(set(normalized)) != len(normalized):
                 QMessageBox.warning(
                     self, "快捷键重复",
-                    "三条快捷键不能有任意两条相同，"
+                    "六条快捷键不能有任意两条相同，"
                     "否则一次按键会同时触发多个动作。请换一个组合。")
                 return
 
@@ -1324,6 +1456,27 @@ class ConfigWindow(QDialog):
                          self.config_manager.set_translate_hotkey),
                      self.text_hotkey_edit,
                      self.config_manager.get_translate_hotkey),
+                    ('全屏截图快捷键',
+                     self._apply_hotkey(
+                         getattr(self.main_app, 'fullscreen_hotkey_manager', None),
+                         fullscreen_hotkey, '全屏截图快捷键',
+                         self.config_manager.set_fullscreen_hotkey),
+                     self.fullscreen_hotkey_edit,
+                     self.config_manager.get_fullscreen_hotkey),
+                    ('活动窗口截图快捷键',
+                     self._apply_hotkey(
+                         getattr(self.main_app, 'window_hotkey_manager', None),
+                         window_hotkey, '活动窗口截图快捷键',
+                         self.config_manager.set_window_hotkey),
+                     self.window_hotkey_edit,
+                     self.config_manager.get_window_hotkey),
+                    ('重复上次区域快捷键',
+                     self._apply_hotkey(
+                         getattr(self.main_app, 'repeat_hotkey_manager', None),
+                         repeat_hotkey, '重复上次区域快捷键',
+                         self.config_manager.set_repeat_hotkey),
+                     self.repeat_hotkey_edit,
+                     self.config_manager.get_repeat_hotkey),
                 )
 
             # 保存成功：草稿里的值已经写进配置，清掉避免下次切回来又盖回旧输入

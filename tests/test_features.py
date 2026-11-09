@@ -2200,13 +2200,17 @@ def test_screenshot_stale_widget():
 
     class FakeWidget:
         """只实现 _run_screenshot 会用到的接口"""
-        def __init__(self, config_manager=None, capture_only=False):
+        def __init__(self, config_manager=None, capture_only=False, preset=None):
             self.config_manager = config_manager
             self.capture_only = capture_only
+            self.preset = preset
             self.region_selected = FakeSignal()
             self.retranslate_requested = FakeSignal()
             self.retry_requested = FakeSignal()
             self.screenshot_canceled = FakeSignal()
+            self.region_committed = FakeSignal()
+            self.ocr_requested = FakeSignal()
+            self.scroll_requested = FakeSignal()
             self.visible = True
             self.shown = False
             self.fullscreen_shown = False
@@ -3516,12 +3520,14 @@ def test_tray_capture_menu_routes_to_capture_only():
 
 
 def test_pure_capture_widget_skips_ocr_and_uses_capture_toolbar():
-    """纯截图：框选后直接展示原图，不发识别请求，工具条只留图片操作"""
+    """纯截图：框选后进入编辑态，不发翻译请求，用编辑态工具条"""
     print("=== 测试纯截图遮罩流程 ===")
-    from PyQt5.QtCore import QPoint, QRect
+    from PyQt5.QtCore import QPoint, QRect, Qt, QPointF
+    from PyQt5.QtTest import QTest
     from PIL import Image
 
     from managers.screenshot import ScreenshotWidget
+    from managers.capture_toolbar import CaptureToolbar
 
     _ensure_qt_app()
     widget = ScreenshotWidget(capture_only=True)
@@ -3537,10 +3543,14 @@ def test_pure_capture_widget_skips_ocr_and_uses_capture_toolbar():
         widget.end = QPoint(110, 70)
 
         emitted = []
+        committed = []
         widget.region_selected.connect(lambda *args: emitted.append(args))
+        widget.region_committed.connect(lambda rect: committed.append(rect))
         widget._confirm_selection()
 
         assert not emitted, "纯截图仍然发起了识别翻译请求"
+        assert committed and committed[0] == QRect(10, 10, 100, 60), \
+            "没有回传已确认的选区"
         payload = widget.current_payload()
         assert payload is not None, "纯截图没有生成结果"
         assert payload['image'].size == (100, 60), "纯截图裁剪尺寸不符"
@@ -3548,18 +3558,25 @@ def test_pure_capture_widget_skips_ocr_and_uses_capture_toolbar():
         assert widget._loading is False, "纯截图不应停在加载态"
         assert widget._card_info() is None, "纯截图不该弹出空文本卡片"
 
-        toolbar = widget._toolbar
-        assert toolbar is not None and toolbar.capture_only, "没有创建纯截图工具条"
-        assert not toolbar._mode_buttons, "纯截图工具条不该有原文/双语/译文切换"
-        assert toolbar.lang_combo is None, "纯截图工具条不该有语言下拉"
-        assert toolbar.retranslate_button is None, "纯截图工具条不该有重译"
-        assert toolbar.save_original_button is not None
-        assert toolbar.copy_original_image_button is not None
+        # 松手进编辑态：不再创建翻译结果工具条，改用编辑态工具条
+        assert widget._capture_edit is True, "纯截图没有进入编辑态"
+        assert widget._toolbar is None, "纯截图不该创建翻译结果工具条"
+        assert isinstance(widget._capture_toolbar, CaptureToolbar)
+        assert widget._capture_editor is not None
 
-        # 纯截图的键盘映射：Ctrl+C/S 作用于原图，P 钉住，T/R 无效
-        from PyQt5.QtCore import Qt
-        from PyQt5.QtTest import QTest
+        # 烧录式标注：落笔 → 撤销 → 重做 → 合成导出
+        editor = widget._capture_editor
+        editor.set_tool('rect')
+        assert editor.mouse_press(QPointF(20, 20), Qt.LeftButton) is True
+        editor.mouse_move(QPointF(80, 55))
+        assert editor.mouse_release(QPointF(80, 55), Qt.LeftButton) is True
+        assert len(editor.shapes) == 1, "矩形标注没有落笔"
+        assert editor.undo() and len(editor.shapes) == 0
+        assert editor.redo() and len(editor.shapes) == 1
+        composed = editor.finish_pixmap()
+        assert composed is not None and not composed.isNull(), "标注合成失败"
 
+        # 键盘映射：Ctrl+C/S 作用于原图，P 钉住，T/R 无效；Ctrl+Z 交给编辑器
         calls = []
         widget._copy_image = lambda kind: calls.append(('copy', kind))
         widget._save_image = lambda kind: calls.append(('save', kind))
@@ -3572,6 +3589,7 @@ def test_pure_capture_widget_skips_ocr_and_uses_capture_toolbar():
         QTest.keyClick(widget, Qt.Key_R)
         assert calls == [('copy', 'original'), ('save', 'original'),
                          ('pin', None)], f"纯截图键盘映射不符: {calls}"
+        assert editor.undo() and len(editor.shapes) == 0, "Ctrl+Z 通路异常"
     finally:
         widget.close()
     print("✅ 纯截图遮罩流程测试通过\n")

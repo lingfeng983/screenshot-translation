@@ -21,7 +21,9 @@ import time
 import keyboard
 
 from .hotkey_native import (
-    HOTKEY_ID, HOTKEY_ID_CAPTURE, HOTKEY_ID_TEXT, NativeHotkeyBackend)
+    HOTKEY_ID, HOTKEY_ID_CAPTURE, HOTKEY_ID_TEXT,
+    HOTKEY_ID_FULLSCREEN, HOTKEY_ID_WINDOW, HOTKEY_ID_REPEAT,
+    NativeHotkeyBackend)
 from .qt_dispatcher import qt_dispatcher
 
 logger = logging.getLogger('screenshot-translation')
@@ -49,11 +51,13 @@ class HotkeyManager:
         Args:
             screenshot_manager: 截图管理器实例
             config_manager: 配置管理器实例
-            action (str): 'translate' 触发识别翻译，'capture' 只截图不翻译，
-                'text' 打开文本翻译页
+            action (str): 'translate' 识别翻译 / 'capture' 区域截图 /
+                'text' 文本翻译页 / 'fullscreen' 全屏截图 /
+                'window' 活动窗口截图 / 'repeat' 重复上次区域
             on_trigger: 'text' 动作的触发回调（通常是主应用的 open_translate_window）
         """
-        if action not in ('translate', 'capture', 'text'):
+        if action not in ('translate', 'capture', 'text',
+                          'fullscreen', 'window', 'repeat'):
             raise ValueError(f"未知快捷键动作: {action}")
         self.action = action
         self.screenshot_manager = screenshot_manager
@@ -76,6 +80,9 @@ class HotkeyManager:
             'translate': HOTKEY_ID,
             'capture': HOTKEY_ID_CAPTURE,
             'text': HOTKEY_ID_TEXT,
+            'fullscreen': HOTKEY_ID_FULLSCREEN,
+            'window': HOTKEY_ID_WINDOW,
+            'repeat': HOTKEY_ID_REPEAT,
         }
         self.native_backend = NativeHotkeyBackend(
             hotkey_id=hotkey_ids[self.action])
@@ -117,24 +124,42 @@ class HotkeyManager:
             logger.debug(traceback.format_exc())
             return False
 
+    _DEFAULT_HOTKEYS = {
+        'translate': 'alt+z',
+        'capture': 'ctrl+alt+z',
+        'text': 'ctrl+alt+t',
+        'fullscreen': 'ctrl+alt+f',
+        'window': 'ctrl+alt+w',
+        'repeat': 'ctrl+alt+r',
+    }
+    _CONFIG_GETTERS = {
+        'translate': 'get_global_hotkey',
+        'capture': 'get_capture_hotkey',
+        'text': 'get_translate_hotkey',
+        'fullscreen': 'get_fullscreen_hotkey',
+        'window': 'get_window_hotkey',
+        'repeat': 'get_repeat_hotkey',
+    }
+    _CONFIG_SETTERS = {
+        'translate': 'set_global_hotkey',
+        'capture': 'set_capture_hotkey',
+        'text': 'set_translate_hotkey',
+        'fullscreen': 'set_fullscreen_hotkey',
+        'window': 'set_window_hotkey',
+        'repeat': 'set_repeat_hotkey',
+    }
+
     def _default_hotkey(self):
         """本动作的默认快捷键（配置缺项/读取失败时使用）"""
-        if self.action == 'capture':
-            return 'ctrl+alt+z'
-        if self.action == 'text':
-            return 'ctrl+alt+t'
-        return 'alt+z'
+        return self._DEFAULT_HOTKEYS[self.action]
 
     def _load_hotkey_config(self):
         """加载快捷键配置"""
         if self.config_manager:
             try:
-                if self.action == 'capture':
-                    self.hotkey = self.config_manager.get_capture_hotkey()
-                elif self.action == 'text':
-                    self.hotkey = self.config_manager.get_translate_hotkey()
-                else:
-                    self.hotkey = self.config_manager.get_global_hotkey()
+                getter = getattr(self.config_manager,
+                                 self._CONFIG_GETTERS[self.action])
+                self.hotkey = getter()
                 logger.info(f"从配置加载快捷键: {self.hotkey}")
             except Exception as e:
                 logger.error(f"加载快捷键配置失败: {e}")
@@ -269,6 +294,12 @@ class HotkeyManager:
                 return
             if self.action == 'capture':
                 self.screenshot_manager.start_capture()
+            elif self.action == 'fullscreen':
+                self.screenshot_manager.start_capture_fullscreen()
+            elif self.action == 'window':
+                self.screenshot_manager.start_capture_window()
+            elif self.action == 'repeat':
+                self.screenshot_manager.start_capture_repeat()
             else:
                 self.screenshot_manager.start_screenshot()
         except Exception as e:
@@ -460,12 +491,9 @@ class HotkeyManager:
 
             # 保存到配置
             if self.config_manager:
-                if self.action == 'capture':
-                    self.config_manager.set_capture_hotkey(hotkey)
-                elif self.action == 'text':
-                    self.config_manager.set_translate_hotkey(hotkey)
-                else:
-                    self.config_manager.set_global_hotkey(hotkey)
+                setter = getattr(self.config_manager,
+                                 self._CONFIG_SETTERS[self.action])
+                setter(hotkey)
 
             logger.info(f"快捷键已设置为: {hotkey}")
             return True

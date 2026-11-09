@@ -49,6 +49,15 @@ datas += collect_data_files('rapidocr', includes=['*.yaml', 'models/*'])
 # 在导入 PyQt5 之后再导入 onnxruntime，触发本机 Qt 的访问冲突直接崩掉
 hiddenimports = [
     'pystray._win32',
+    # 纯截图编辑态：capture_ocr / capture_scroll 是函数级延迟导入，
+    # 静态扫描可能漏掉，显式列出保证 Nuitka / PyInstaller 产物里都在
+    'managers.capture_annotation',
+    'managers.capture_editor',
+    'managers.capture_magnifier',
+    'managers.capture_output',
+    'managers.capture_toolbar',
+    'managers.capture_ocr',
+    'managers.capture_scroll',
 ] + collect_submodules('managers.providers') + collect_submodules('managers.ocr_providers')
 
 

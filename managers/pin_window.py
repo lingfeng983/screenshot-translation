@@ -9,7 +9,7 @@
 
 from PyQt5.QtCore import QSize, Qt
 from PyQt5.QtGui import QKeySequence, QPainter
-from PyQt5.QtWidgets import QWidget
+from PyQt5.QtWidgets import QMenu, QWidget
 
 from . import clipboard
 
@@ -27,19 +27,23 @@ MAX_SCALE = 4.0
 class PinWindow(QWidget):
     """钉屏结果图窗口"""
 
-    def __init__(self, pixmap, top_left=None):
+    def __init__(self, pixmap, top_left=None, title='钉住的翻译结果',
+                 config_manager=None):
         """
         Args:
             pixmap (QPixmap): 要显示的结果图（原始像素尺寸）
             top_left (QPoint 或 None): 初始屏幕位置，None 时居中显示
+            title (str): 窗口标题（纯截图模式下为「钉住的截图」）
+            config_manager: 读取 [Capture] 段的保存参数，可为 None
         """
         super().__init__(None)
         self.setWindowFlags(
             Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
         self.setAttribute(Qt.WA_DeleteOnClose)
-        self.setWindowTitle('钉住的翻译结果')
+        self.setWindowTitle(title)
 
         self._source = pixmap
+        self._config_manager = config_manager
         self._scale = 1.0
         self._drag_offset = None
 
@@ -116,18 +120,82 @@ class PinWindow(QWidget):
         self.move(center - self.rect().center())
 
     def keyPressEvent(self, event):
-        """ESC 关闭，Ctrl+C 复制图片到剪贴板"""
+        """ESC 关闭，Ctrl+C 复制，Ctrl+S 保存"""
         if event.key() == Qt.Key_Escape:
             self.close()
         elif event.matches(QKeySequence.Copy):
             # 注意用 QKeySequence.Copy：QKeyEvent 上没有 Copy 属性，
             # 写 event.Copy 会在任意按键时抛 AttributeError
-            def copied(ok):
-                """确认写入生效才记日志，占用失败由 clipboard 模块记警告"""
-                if ok:
-                    logger.info("已复制钉住的图片到剪贴板")
-
-            # 非阻塞重试：同步等待会在占用期间冻住钉图窗口
-            clipboard.set_pixmap_later(self._source, on_done=copied)
+            self._copy()
+        elif event.matches(QKeySequence.Save):
+            self._save()
         else:
             super().keyPressEvent(event)
+
+    def _copy(self):
+        """复制原图到剪贴板（非阻塞，带生效校验）"""
+        def copied(ok):
+            if ok:
+                logger.info("已复制钉住的图片到剪贴板")
+        clipboard.set_pixmap_later(self._source, on_done=copied)
+
+    def _save(self):
+        """按 [Capture] 配置把钉住的图存盘"""
+        from . import capture_output
+        cfg = self._config_manager
+
+        def option(name, fallback):
+            try:
+                return cfg.get_capture_option(name, fallback=fallback) if cfg \
+                    else fallback
+            except Exception:
+                return fallback
+
+        def int_option(name, default, lo, hi):
+            try:
+                return max(lo, min(hi, int(str(option(name, default)).strip())))
+            except Exception:
+                return default
+
+        capture_output.save_pixmap(
+            self._source,
+            fmt=option('format', 'png'),
+            quality=int_option('jpg_quality', 90, 1, 100),
+            directory=option('save_dir', '') or None,
+            template=option('filename_template', ''),
+            quick=False, parent=self, title='保存钉住的截图')
+
+    def contextMenuEvent(self, event):
+        """右键菜单：复制 / 保存 / 置顶 / 透明度 / 关闭"""
+        menu = QMenu(self)
+        menu.addAction('复制图片', self._copy)
+        menu.addAction('保存到文件…', self._save)
+        menu.addSeparator()
+
+        top_action = menu.addAction('置顶')
+        top_action.setCheckable(True)
+        top_action.setChecked(
+            bool(self.windowFlags() & Qt.WindowStaysOnTopHint))
+        top_action.triggered.connect(self._toggle_top)
+
+        opacity_menu = menu.addMenu('透明度')
+        for value in (100, 85, 70, 50):
+            action = opacity_menu.addAction(f'{value}%')
+            action.triggered.connect(
+                lambda _checked=False, v=value: self.setWindowOpacity(v / 100))
+
+        menu.addSeparator()
+        menu.addAction('关闭', self.close)
+        menu.exec_(event.globalPos())
+
+    def _toggle_top(self, checked):
+        """切换置顶：改 windowFlags 会隐藏窗口，必须重新 show"""
+        was_visible = self.isVisible()
+        flags = self.windowFlags()
+        if checked:
+            flags |= Qt.WindowStaysOnTopHint
+        else:
+            flags &= ~Qt.WindowStaysOnTopHint
+        self.setWindowFlags(flags)
+        if was_visible:
+            self.show()
