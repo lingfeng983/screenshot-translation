@@ -377,7 +377,7 @@ iscc.exe /DMyAppVersion=1.7.0 scripts\setup.iss
 
 RapidOCR 的 PP-OCRv6 检测/识别/方向分类模型（约 30MB）与 ONNX Runtime 都打进
 `_internal/`，安装时不再下载任何组件、也不需要系统装 Tesseract：装完即可断网识别。
-安装器用 `lzma2/ultra64` 压缩换取更小的下载体积（248MB 目录 → 约 83MB 安装包）。
+安装器用 `lzma2/ultra64` 压缩换取更小的下载体积（约 250MB 目录 → 约 83MB 安装包）。
 
 打包时自动裁剪无用依赖：Qt 的 QML/场景图/Vulkan/ANGLE 与翻译文件、PIL 的
 `_avif/_webp/_imagingtk` 等扩展、OpenCV 的视频后端与示例数据、RapidOCR 的
