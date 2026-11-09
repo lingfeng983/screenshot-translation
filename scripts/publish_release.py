@@ -91,6 +91,24 @@ def step_tests(skip):
     run([sys.executable, "-m", "pytest", "-q"])
 
 
+def step_app_version(version):
+    """把本次发版版本号写进源码常量（随 tag 一起提交）"""
+    print("\n=== 写入应用版本号 ===")
+    path = os.path.join(PROJECT_ROOT, "managers", "app_version.py")
+    with open(path, encoding="utf-8") as f:
+        text = f.read()
+    pattern = r"(?m)^APP_VERSION = '[^']*'$"
+    if not re.search(pattern, text):
+        sys.exit("managers/app_version.py 中找不到 APP_VERSION 定义，无法写入版本号")
+    new_text = re.sub(pattern, f"APP_VERSION = '{version}'", text, count=1)
+    if new_text == text:
+        print(f"已是 {version}")
+        return
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(new_text)
+    print(f"APP_VERSION -> {version}")
+
+
 def step_build(version, no_build):
     print("\n=== 2/6 PyInstaller 构建 ===")
     if no_build:
@@ -432,6 +450,7 @@ def main():
         return 0
 
     step_tests(args.skip_tests)
+    step_app_version(args.version)
     step_build(args.version, args.no_build)
     step_assemble(args.version)
     notes = step_changelog(args.version)

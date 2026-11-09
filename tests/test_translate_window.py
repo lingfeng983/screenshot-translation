@@ -193,6 +193,69 @@ def test_ctrl_enter_triggers_translation(qapp, monkeypatch):
         window.close()
 
 
+def test_auto_translate_after_input_stops(qapp, monkeypatch):
+    """输入/粘贴停止后自动翻译；同一份文本不重复提交"""
+    pool = _FakePool()
+    _use_pool(monkeypatch, pool)
+    window = _make_window(qapp, _FakeTranslationManager())
+    try:
+        window.source_edit.setPlainText('Hello')
+        assert window._auto_timer.isActive(), '原文变化后没有安排自动翻译'
+
+        window._on_auto_translate()
+        assert len(pool.calls) == 1, '停止输入后没有自动翻译'
+        _func, args = pool.calls[0]
+        assert args == ('Hello', 'zh', 1), f'自动翻译提交参数不对: {args}'
+
+        # 文本与目标语言都没变：再次触发不应重复请求
+        window._on_auto_translate()
+        assert len(pool.calls) == 1, '同一份文本被重复自动翻译'
+    finally:
+        window.close()
+
+
+def test_auto_translate_defers_while_busy(qapp, monkeypatch):
+    """请求进行中继续输入：等结果回来再补一次，不并发提交"""
+    pool = _FakePool()
+    _use_pool(monkeypatch, pool)
+    window = _make_window(qapp, _FakeTranslationManager())
+    try:
+        window.source_edit.setPlainText('Hello')
+        window._on_auto_translate()
+        assert window._busy is True
+
+        window.source_edit.setPlainText('Hello world')
+        window._on_auto_translate()
+        assert len(pool.calls) == 1, '忙碌时仍并发提交了第二次翻译'
+        assert window._auto_pending is True, '没有记下待补发的自动翻译'
+
+        # 结果回投后应重新安排自动翻译
+        window._run_translation('Hello', 'zh', window._request_id)
+        assert window._auto_timer.isActive(), '结果返回后没有补发自动翻译'
+        window._on_auto_translate()
+        assert len(pool.calls) == 2, '新文本没有被自动翻译'
+    finally:
+        window.close()
+
+
+def test_clear_cancels_pending_auto_translate(qapp, monkeypatch):
+    """清空原文要取消待触发的自动翻译，避免把空文本或旧请求发出去"""
+    pool = _FakePool()
+    _use_pool(monkeypatch, pool)
+    window = _make_window(qapp, _FakeTranslationManager())
+    try:
+        window.source_edit.setPlainText('Hello')
+        assert window._auto_timer.isActive()
+
+        window._on_clear()
+        assert window._auto_timer.isActive() is False, '清空后自动翻译定时器仍在跑'
+        assert window._last_request is None, '清空后仍记着上一次请求'
+        window._on_auto_translate()
+        assert pool.calls == [], '清空后仍发起了翻译'
+    finally:
+        window.close()
+
+
 def test_stale_result_is_dropped(qapp):
     """窗口已关（序号推进）后迟到的译文不再回填"""
     window = _make_window(qapp, _FakeTranslationManager(reply='迟到的译文'))

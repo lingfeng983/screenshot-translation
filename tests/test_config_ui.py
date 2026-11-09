@@ -251,6 +251,86 @@ def test_capture_hotkey_saved_and_duplicate_rejected(
         "重复检查失败后不该写入任何热键"
 
 
+def test_text_hotkey_saved_and_duplicate_across_three(
+        win, qapp, main_app, no_modal_boxes):
+    """文本翻译快捷键可独立保存；与另外两条任意一条相同都要拦下"""
+    assert hasattr(win, 'text_hotkey_edit'), "缺少文本翻译快捷键输入框"
+    assert hasattr(win, 'text_hotkey_status_label'), "缺少文本翻译快捷键状态行"
+    assert win.text_hotkey_edit.text() == \
+        main_app.config_manager.get_translate_hotkey()
+
+    win.text_hotkey_edit.setText('ctrl+alt+y')
+    win._on_save()
+    assert no_modal_boxes and no_modal_boxes[-1] == "保存成功", \
+        f"文本翻译快捷键保存未成功: {no_modal_boxes}"
+    assert win.config_manager.get_translate_hotkey() == 'ctrl+alt+y'
+    assert win.config_manager.get_global_hotkey() == 'alt+z', \
+        "保存文本翻译快捷键时误改了截图翻译快捷键"
+    assert win.config_manager.get_capture_hotkey() == 'ctrl+alt+z', \
+        "保存文本翻译快捷键时误改了纯截图快捷键"
+
+    # 三条热键任意两条重复都会被键盘钩子后端一次按键投给多个回调
+    win.text_hotkey_edit.setText('alt+z')
+    win._on_save()
+    assert no_modal_boxes[-1] == "快捷键重复", \
+        f"与截图翻译重复未被拦下: {no_modal_boxes}"
+    assert win.config_manager.get_translate_hotkey() == 'ctrl+alt+y', \
+        "重复检查失败后不该写入热键"
+
+    win.text_hotkey_edit.setText('ctrl+alt+z')
+    win._on_save()
+    assert no_modal_boxes[-1] == "快捷键重复", \
+        f"与纯截图重复未被拦下: {no_modal_boxes}"
+
+
+def test_auto_start_writes_registry_and_config(
+        win, qapp, main_app, no_modal_boxes, monkeypatch):
+    """开机自启动勾选后要同时落配置与注册表"""
+    from managers import autostart
+
+    calls = []
+    monkeypatch.setattr(
+        autostart, 'apply', lambda enabled: calls.append(enabled) or True)
+    assert win.auto_start_check.isChecked() is False
+
+    win.auto_start_check.setChecked(True)
+    win._on_save()
+
+    assert calls == [True], f"没有写注册表: {calls}"
+    assert win.config_manager.is_auto_start() is True
+    assert no_modal_boxes[-1] == "保存成功"
+
+
+def test_auto_start_registry_failure_rolls_back(
+        win, qapp, main_app, no_modal_boxes, monkeypatch):
+    """注册表写失败时界面与配置回滚到真实状态，并明确告警"""
+    from managers import autostart
+
+    monkeypatch.setattr(autostart, 'apply', lambda enabled: False)
+    monkeypatch.setattr(autostart, 'is_enabled', lambda: False)
+    monkeypatch.setattr(autostart, 'last_error', '拒绝访问注册表')
+
+    win.auto_start_check.setChecked(True)
+    win._on_save()
+
+    assert no_modal_boxes[-1] == "开机自启动设置失败", \
+        f"注册表失败未点名告警: {no_modal_boxes}"
+    assert win.config_manager.is_auto_start() is False, "配置未回滚到注册表真实状态"
+    assert win.auto_start_check.isChecked() is False, "复选框未回滚"
+
+
+def test_auto_check_update_setting_persists(win, qapp, main_app, no_modal_boxes):
+    """「启动时检查更新」默认开启，取消勾选后保存到 [Update]"""
+    assert hasattr(win, 'auto_check_update_check'), "缺少检查更新复选框"
+    assert win.auto_check_update_check.isChecked() is True
+
+    win.auto_check_update_check.setChecked(False)
+    win._on_save()
+
+    assert no_modal_boxes[-1] == "保存成功"
+    assert win.config_manager.is_auto_check_update() is False
+
+
 def test_fixed_light_theme_without_theme_controls(win, qapp):
     """界面固定浅色：设置页不再有主题切换，也不再带标题栏“？”按钮"""
     from PyQt5.QtCore import Qt

@@ -32,6 +32,10 @@ _SPINNER_INTERVAL = 33      # 帧间隔（毫秒）
 _SPINNER_STEP = 18          # 每帧转过的角度
 _SPINNER_ARC = 280          # 弧长（度）：留一段缺口才看得出在转
 
+# 自动翻译防抖：停止输入/粘贴后这么久没有新改动才开始翻译。
+# 太短会把键盘连打拆成多次请求，太长则粘贴完要等；600ms 接近"说完一句话"的间隔。
+_AUTO_TRANSLATE_DELAY = 600
+
 # 页面专属样式（在全局浅色 QSS 之上叠加）
 _PAGE_STYLE = """
 QLabel#pageTitle { font-size: 16px; font-weight: 600; color: #1e2430; }
@@ -129,6 +133,10 @@ class TranslateWindow(QDialog):
         self._request_id = 0
         # 当前在飞的请求是否还在等结果（决定关闭时是否要作废）
         self._busy = False
+        # 最近一次已提交的 (原文, 目标语言)：同一份文本不重复自动翻译
+        self._last_request = None
+        # 请求期间原文又变了：等结果回来再补一次自动翻译
+        self._auto_pending = False
 
         self.setWindowTitle("文本翻译")
         # 去掉标题栏右上角的“？”（QDialog 默认带上下文帮助按钮）
@@ -178,18 +186,25 @@ class TranslateWindow(QDialog):
         header.addWidget(self.lang_combo)
         layout.addLayout(header)
 
+        # 自动翻译防抖定时器：输入/粘贴停止后触发
+        self._auto_timer = QTimer(self)
+        self._auto_timer.setSingleShot(True)
+        self._auto_timer.setInterval(_AUTO_TRANSLATE_DELAY)
+        self._auto_timer.timeout.connect(self._on_auto_translate)
+
         # 原文输入
         self.source_edit = QPlainTextEdit()
         self.source_edit.setObjectName("sourceEdit")
         self.source_edit.setPlaceholderText(
-            "在这里输入或粘贴要翻译的文本…\n（Ctrl + Enter 直接翻译）")
+            "在这里输入或粘贴要翻译的文本…\n（停止输入后自动翻译，Ctrl + Enter 立即翻译）")
         self.source_edit.installEventFilter(self)
+        self.source_edit.textChanged.connect(self._on_source_changed)
         layout.addWidget(self.source_edit, 3)
 
         # 操作行：提示 + 清空 + 翻译
         action_row = QHBoxLayout()
         action_row.setSpacing(8)
-        self.hint_label = QLabel("Ctrl + Enter 翻译")
+        self.hint_label = QLabel("自动翻译 · Ctrl + Enter 立即翻译")
         self.hint_label.setObjectName("sectionLabel")
         action_row.addWidget(self.hint_label)
         action_row.addStretch()
@@ -278,15 +293,39 @@ class TranslateWindow(QDialog):
                 return True
         return super().eventFilter(obj, event)
 
+    def _on_source_changed(self):
+        """原文变化（键入或粘贴）：停止输入后再自动翻译"""
+        if not self._source_text():
+            self._auto_timer.stop()
+            return
+        self._auto_timer.start()
+
+    def _on_auto_translate(self):
+        """防抖结束：文本或语言没变就不重复请求，忙碌则等结果回来再补"""
+        text = self._source_text()
+        if not text:
+            return
+        if (text, self.current_language()) == self._last_request:
+            return
+        if self._busy:
+            # 已有请求在飞：立刻再发一次只会被 _on_translate 挡掉，
+            # 记下待办，等结果回来由 _apply_result 补发
+            self._auto_pending = True
+            return
+        self._on_translate()
+
     def _on_language_changed(self, _index):
-        """换语言：已有译文时按新语言重译一次，免得用户再点一次"""
+        """换语言：有原文就按新语言翻译，免得用户再点一次"""
         if self._busy:
             return
-        if self.result_edit.toPlainText().strip() and self._source_text():
+        if self._source_text():
             self._on_translate()
 
     def _on_clear(self):
         """清空原文与译文"""
+        self._auto_timer.stop()
+        self._auto_pending = False
+        self._last_request = None
         self.source_edit.clear()
         self.result_edit.clear()
         self._set_status('')
@@ -329,15 +368,20 @@ class TranslateWindow(QDialog):
 
         self._request_id += 1
         request_id = self._request_id
+        target_lang = self.current_language()
         self._set_busy(True)
         self._set_status('')
 
         submitted = thread_pool_manager.submit(
-            self._run_translation, text, self.current_language(), request_id)
+            self._run_translation, text, target_lang, request_id)
         if submitted is None:
             # 线程池关闭或拒收：不会有任何线程回投结果，必须当场复原
             self._set_busy(False)
+            self._auto_pending = False
             self._set_status('后台任务无法启动，请稍后重试', error=True)
+            return
+        # 记下这份文本已提交：自动翻译据此避免同一内容重复请求
+        self._last_request = (text, target_lang)
 
     def _source_text(self):
         """原文（去掉首尾空白）"""
@@ -376,6 +420,12 @@ class TranslateWindow(QDialog):
             logger.debug("翻译结果已过期，丢弃")
             return
         self._set_busy(False)
+        # 请求期间用户又改过原文：现在补一次自动翻译
+        if self._auto_pending:
+            self._auto_pending = False
+            text = self._source_text()
+            if text and (text, self.current_language()) != self._last_request:
+                self._auto_timer.start()
         if error:
             self._set_status(error, error=True)
             return
@@ -417,6 +467,8 @@ class TranslateWindow(QDialog):
 
     def closeEvent(self, event):
         """关闭时作废在飞请求：迟到的译文不再回填已关闭的窗口"""
+        self._auto_timer.stop()
+        self._auto_pending = False
         self._request_id += 1
         self._set_busy(False)
         super().closeEvent(event)

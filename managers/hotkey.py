@@ -21,7 +21,7 @@ import time
 import keyboard
 
 from .hotkey_native import (
-    HOTKEY_ID, HOTKEY_ID_CAPTURE, NativeHotkeyBackend)
+    HOTKEY_ID, HOTKEY_ID_CAPTURE, HOTKEY_ID_TEXT, NativeHotkeyBackend)
 from .qt_dispatcher import qt_dispatcher
 
 logger = logging.getLogger('screenshot-translation')
@@ -42,20 +42,23 @@ class HotkeyManager:
     _WATCHDOG_INTERVAL = 15.0
 
     def __init__(self, screenshot_manager=None, config_manager=None,
-                 action='translate'):
+                 action='translate', on_trigger=None):
         """
         初始化全局快捷键管理器
 
         Args:
             screenshot_manager: 截图管理器实例
             config_manager: 配置管理器实例
-            action (str): 'translate' 触发识别翻译，'capture' 只截图不翻译
+            action (str): 'translate' 触发识别翻译，'capture' 只截图不翻译，
+                'text' 打开文本翻译页
+            on_trigger: 'text' 动作的触发回调（通常是主应用的 open_translate_window）
         """
-        if action not in ('translate', 'capture'):
+        if action not in ('translate', 'capture', 'text'):
             raise ValueError(f"未知快捷键动作: {action}")
         self.action = action
         self.screenshot_manager = screenshot_manager
         self.config_manager = config_manager
+        self.on_trigger = on_trigger
         self.hotkey = None
         self.is_running = False
         # keyboard 后端的注销句柄，用于精确注销
@@ -67,10 +70,15 @@ class HotkeyManager:
         self._watchdog = None
         # 最近一次注册失败的原因文案，供设置页给出针对性提示
         self.last_error = ''
-        # 原生后端实例（非 Windows 上会自动不可用）；两条热键必须用不同 ID，
+        # 原生后端实例（非 Windows 上会自动不可用）；三条热键必须用不同 ID，
         # 否则 RegisterHotKey 后注册的会把先注册的顶掉
+        hotkey_ids = {
+            'translate': HOTKEY_ID,
+            'capture': HOTKEY_ID_CAPTURE,
+            'text': HOTKEY_ID_TEXT,
+        }
         self.native_backend = NativeHotkeyBackend(
-            hotkey_id=HOTKEY_ID if action == 'translate' else HOTKEY_ID_CAPTURE)
+            hotkey_id=hotkey_ids[self.action])
 
         logger.debug("全局快捷键管理器初始化")
 
@@ -111,7 +119,11 @@ class HotkeyManager:
 
     def _default_hotkey(self):
         """本动作的默认快捷键（配置缺项/读取失败时使用）"""
-        return 'ctrl+alt+z' if self.action == 'capture' else 'alt+z'
+        if self.action == 'capture':
+            return 'ctrl+alt+z'
+        if self.action == 'text':
+            return 'ctrl+alt+t'
+        return 'alt+z'
 
     def _load_hotkey_config(self):
         """加载快捷键配置"""
@@ -119,6 +131,8 @@ class HotkeyManager:
             try:
                 if self.action == 'capture':
                     self.hotkey = self.config_manager.get_capture_hotkey()
+                elif self.action == 'text':
+                    self.hotkey = self.config_manager.get_translate_hotkey()
                 else:
                     self.hotkey = self.config_manager.get_global_hotkey()
                 logger.info(f"从配置加载快捷键: {self.hotkey}")
@@ -235,7 +249,7 @@ class HotkeyManager:
             pass
 
     def _fire(self):
-        """主线程侧：防抖后触发一次截图"""
+        """主线程侧：防抖后触发一次动作"""
         now = time.monotonic()
         if now - self._last_fire_ts < self._DEBOUNCE_SECONDS:
             logger.debug("快捷键在防抖窗口内重复触发，已忽略")
@@ -243,16 +257,22 @@ class HotkeyManager:
         self._last_fire_ts = now
 
         logger.info(f"快捷键 {self.hotkey} 被按下")
-        if not self.screenshot_manager:
-            logger.error("截图管理器未初始化")
-            return
         try:
+            if self.action == 'text':
+                if self.on_trigger is None:
+                    logger.error("文本翻译快捷键未绑定触发回调")
+                    return
+                self.on_trigger()
+                return
+            if not self.screenshot_manager:
+                logger.error("截图管理器未初始化")
+                return
             if self.action == 'capture':
                 self.screenshot_manager.start_capture()
             else:
                 self.screenshot_manager.start_screenshot()
         except Exception as e:
-            logger.error(f"启动截图失败: {e}")
+            logger.error(f"快捷键动作执行失败: {e}")
             import traceback
             logger.debug(traceback.format_exc())
 
@@ -442,6 +462,8 @@ class HotkeyManager:
             if self.config_manager:
                 if self.action == 'capture':
                     self.config_manager.set_capture_hotkey(hotkey)
+                elif self.action == 'text':
+                    self.config_manager.set_translate_hotkey(hotkey)
                 else:
                     self.config_manager.set_global_hotkey(hotkey)
 
@@ -481,7 +503,7 @@ class HotkeyManager:
             return ''
         return (f"快捷键 {self.hotkey} 已被其他程序占用，已改用兼容方式"
                 "（键盘钩子）注册：在提权窗口或锁屏切换后可能收不到按键。\n"
-                "建议换一个组合（例如 ctrl+alt+z）以获得更稳定的响应。")
+                "建议换一个组合以获得更稳定的响应。")
 
     def status_hint(self):
         """

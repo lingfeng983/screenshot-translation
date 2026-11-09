@@ -36,9 +36,10 @@ MOD_NOREPEAT = 0x4000
 WM_HOTKEY = 0x0312
 
 # 本进程的热键ID：WM_HOTKEY 的 wParam 用它区分，取值本身无含义。
-# 翻译与纯截图各用一个：RegisterHotKey 的 ID 在同一线程内必须唯一。
+# 截图翻译、纯截图、文本翻译各用一个：RegisterHotKey 的 ID 在同一线程内必须唯一。
 HOTKEY_ID = 0x4A5A
 HOTKEY_ID_CAPTURE = 0x4A5B
+HOTKEY_ID_TEXT = 0x4A5C
 
 # RegisterHotKey 失败的常见 GetLastError 码
 ERROR_HOTKEY_ALREADY_REGISTERED = 1400   # 已被其它进程注册

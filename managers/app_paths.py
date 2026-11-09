@@ -32,6 +32,11 @@ def _is_frozen() -> bool:
         or _is_nuitka()
 
 
+def is_frozen() -> bool:
+    """是否运行在打包环境中（供自启动命令拼装等外部模块使用）"""
+    return _is_frozen()
+
+
 def app_root() -> str:
     """
     应用根目录：

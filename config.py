@@ -108,6 +108,7 @@ class ConfigManager:
         ('Translation', '_set_translation_defaults'),
         ('Hotkey', '_set_hotkey_defaults'),
         ('Startup', '_set_startup_defaults'),
+        ('Update', '_set_update_defaults'),
         ('Overlay', '_set_overlay_defaults'),
         ('OCR', '_set_ocr_defaults'),
     )
@@ -211,6 +212,8 @@ class ConfigManager:
         self._set_hotkey_defaults()
         # 启动行为配置
         self._set_startup_defaults()
+        # 更新检查配置
+        self._set_update_defaults()
         # 截图遮罩默认配置
         self._set_overlay_defaults()
         # OCR 默认配置
@@ -244,6 +247,7 @@ class ConfigManager:
 
         self.config.set('Hotkey', 'global_hotkey', 'alt+z')  # 默认快捷键
         self.config.set('Hotkey', 'capture_hotkey', 'ctrl+alt+z')  # 纯截图快捷键
+        self.config.set('Hotkey', 'translate_hotkey', 'ctrl+alt+t')  # 文本翻译页快捷键
 
     def _set_startup_defaults(self):
         """设置 [Startup] 段默认配置值"""
@@ -253,6 +257,18 @@ class ConfigManager:
             return
 
         self.config.set('Startup', 'minimize_to_tray', 'true')  # 默认最小化到托盘
+        self.config.set('Startup', 'auto_start', 'false')       # 默认不开机自启动
+
+    def _set_update_defaults(self):
+        """设置 [Update] 段默认配置值"""
+        if not self.config.has_section('Update'):
+            self.config.add_section('Update')
+        else:
+            return
+
+        self.config.set('Update', 'auto_check', 'true')       # 启动时检查更新
+        # 已提醒过的版本：同一个版本只弹一次托盘通知，避免每次启动都打扰
+        self.config.set('Update', 'last_notified_version', '')
 
     def _set_ocr_defaults(self):
         """
@@ -531,6 +547,26 @@ class ConfigManager:
         self._set('Hotkey', 'capture_hotkey', hotkey)
         self.save_config()
 
+    def get_translate_hotkey(self):
+        """
+        获取打开文本翻译页的全局快捷键
+
+        Returns:
+            str: 快捷键组合
+        """
+        return self.config.get('Hotkey', 'translate_hotkey',
+                               fallback='ctrl+alt+t')
+
+    def set_translate_hotkey(self, hotkey):
+        """
+        设置打开文本翻译页的全局快捷键
+
+        Args:
+            hotkey (str): 快捷键组合
+        """
+        self._set('Hotkey', 'translate_hotkey', hotkey)
+        self.save_config()
+
     # 启动行为配置
     def is_minimize_to_tray(self):
         """
@@ -556,6 +592,73 @@ class ConfigManager:
             minimize (bool): 是否最小化到托盘
         """
         self._set('Startup', 'minimize_to_tray', str(minimize).lower())
+        self.save_config()
+
+    def is_auto_start(self):
+        """
+        获取是否开机自启动
+
+        Returns:
+            bool: 是否开机自启动；值不是合法布尔字面量时按默认 false
+        """
+        try:
+            return self.config.getboolean('Startup', 'auto_start',
+                                          fallback=False)
+        except ValueError:
+            logger.warning("Startup.auto_start 不是合法布尔值，按默认 false 处理")
+            return False
+
+    def set_auto_start(self, enabled):
+        """
+        设置是否开机自启动
+
+        Args:
+            enabled (bool): 是否开机自启动
+        """
+        self._set('Startup', 'auto_start', str(enabled).lower())
+        self.save_config()
+
+    # 更新检查配置
+    def is_auto_check_update(self):
+        """
+        获取是否在启动时检查更新
+
+        Returns:
+            bool: 是否自动检查；值不是合法布尔字面量时按默认 true
+        """
+        try:
+            return self.config.getboolean('Update', 'auto_check', fallback=True)
+        except ValueError:
+            logger.warning("Update.auto_check 不是合法布尔值，按默认 true 处理")
+            return True
+
+    def set_auto_check_update(self, enabled):
+        """
+        设置是否在启动时检查更新
+
+        Args:
+            enabled (bool): 是否自动检查
+        """
+        self._set('Update', 'auto_check', str(enabled).lower())
+        self.save_config()
+
+    def get_last_notified_version(self):
+        """
+        获取最近一次已推送过更新的版本号
+
+        Returns:
+            str: 版本号；从未推送过时为空字符串
+        """
+        return self.config.get('Update', 'last_notified_version', fallback='')
+
+    def set_last_notified_version(self, version):
+        """
+        记录最近一次已推送过更新的版本号（同一版本不再重复通知）
+
+        Args:
+            version (str): 版本号
+        """
+        self._set('Update', 'last_notified_version', version)
         self.save_config()
 
     # 其他API配置方法

@@ -9,6 +9,7 @@ import logging
 import os
 import sys
 import threading
+import webbrowser
 
 # ONNX Runtime 必须先于 PyQt5 导入：在本机组合（Python 3.14 + PyQt5 5.15.10 +
 # onnxruntime 1.31）上，先加载 QtCore 再导入 onnxruntime 会在模块初始化阶段
@@ -30,7 +31,7 @@ from PyQt5.QtWidgets import (
 
 # 配置日志（全局唯一入口，其他模块只使用 logging.getLogger）
 # 日志路径按运行形态定位：源码→项目根，exe→~/.screenshot-translation（可写）
-from managers import app_paths, result_render, single_instance, styles
+from managers import app_paths, autostart, result_render, single_instance, styles, update_checker
 from managers.provider_common import redact_url_query
 
 
@@ -150,6 +151,7 @@ class MainApp:
         self.tray_manager = None
         self.hotkey_manager = None
         self.capture_hotkey_manager = None
+        self.text_hotkey_manager = None
         self.app = None
         self.config_window = None
         self.translate_window = None
@@ -161,6 +163,11 @@ class MainApp:
 
         # 资源锁
         self._resource_lock = threading.Lock()
+
+        # 更新检查状态（同一时间只跑一个请求，手动检查在自动检查进行中排队）
+        self._update_checking = False
+        self._interactive_update_pending = False
+        self._update_timer = None
 
 
 
@@ -217,6 +224,10 @@ class MainApp:
             styles.apply_app(self.app)
             self._apply_app_icon()
 
+            # 配置里开着自启动时，顺手把注册表命令校正到当前 exe 路径
+            # （整目录覆盖升级后 exe 可能换了位置）
+            self._sync_autostart()
+
             # 初始化OCR管理器（必须传入配置，否则 [OCR] 段的引擎与语言配置不生效）
             self.ocr_manager = OCRManager(self.config_manager)
 
@@ -232,12 +243,16 @@ class MainApp:
             self.tray_manager = SystemTrayManager(self, self.screenshot_manager)
             self.tray_manager.initialize()
 
-            # 初始化全局快捷键管理器（翻译 + 纯截图各一条）
+            # 初始化全局快捷键管理器（截图翻译 + 纯截图 + 文本翻译页各一条）
             self.hotkey_manager = HotkeyManager(self.screenshot_manager, self.config_manager)
             self.hotkey_manager.initialize()
             self.capture_hotkey_manager = HotkeyManager(
                 self.screenshot_manager, self.config_manager, action='capture')
             self.capture_hotkey_manager.initialize()
+            self.text_hotkey_manager = HotkeyManager(
+                self.screenshot_manager, self.config_manager, action='text',
+                on_trigger=self.open_translate_window)
+            self.text_hotkey_manager.initialize()
             # 原生注册被别的程序占用时只能退到键盘钩子，而钩子在提权窗口/锁屏切换后
             # 收不到按键——用户侧的感受就是“快捷键时灵时不灵”。启动时就明确提示一次，
             # 能换组合早换，而不是等他事后抱怨。
@@ -261,6 +276,14 @@ class MainApp:
 
             # 启动时处理启动行为
             self._handle_startup_behavior()
+
+            # 更新推送：启动几秒后查一次，之后每 6 小时再查一次——托盘常驻
+            # 期间也能收到新版本提醒，不用等下次重启
+            self._update_timer = QTimer(self.app)
+            self._update_timer.setInterval(6 * 60 * 60 * 1000)
+            self._update_timer.timeout.connect(self.check_updates)
+            self._update_timer.start()
+            QTimer.singleShot(6000, self.check_updates)
 
             # 运行应用事件循环
             logger.info("应用事件循环开始运行")
@@ -286,6 +309,127 @@ class MainApp:
         except Exception as e:
             logger.warning(f"设置应用图标失败: {e}")
 
+    def _sync_autostart(self):
+        """配置开了开机自启动时，确保注册表命令指向当前运行路径"""
+        try:
+            if not self.config_manager.is_auto_start():
+                return
+            if not autostart.apply(True):
+                logger.warning(f"开机自启动同步失败: {autostart.last_error}")
+        except Exception as e:
+            logger.warning(f"同步开机自启动失败: {e}")
+
+    # ---- 更新检查 ----
+
+    def check_updates(self, interactive=False):
+        """
+        检查 GitHub 上有没有新版本
+
+        网络请求丢到线程池，结果回主线程处理；启动时的自动检查只在
+        "启动时检查更新"打开时执行，托盘菜单的手动检查不受该开关限制。
+
+        Args:
+            interactive (bool): True 为用户主动点"检查更新"，会弹窗给出结果
+        """
+        try:
+            if not interactive and not self.config_manager.is_auto_check_update():
+                return
+            if self._update_checking:
+                # 自动检查还没回来时用户又点了手动检查：等这次结果出来
+                # 按交互式处理，避免用户点了却什么都没看到
+                if interactive:
+                    self._interactive_update_pending = True
+                return
+
+            self._update_checking = True
+            submitted = thread_pool_manager.submit(self._check_update_worker, interactive)
+            if submitted is None:
+                self._update_checking = False
+                if interactive:
+                    QMessageBox.warning(None, "检查更新", "后台任务无法启动，请稍后重试。")
+        except Exception as e:
+            self._update_checking = False
+            logger.warning(f"启动更新检查失败: {e}")
+            if interactive:
+                QMessageBox.warning(None, "检查更新", f"检查更新失败：{e}")
+
+    def _check_update_worker(self, interactive):
+        """池线程：查询最新版本，结果回主线程"""
+        info = None
+        error = ''
+        try:
+            info = update_checker.check_for_update()
+        except Exception as e:
+            error = str(e) or e.__class__.__name__
+            logger.warning(f"检查更新失败: {error}")
+        qt_dispatcher.dispatch_to_main_thread(
+            self._apply_update_result, info, error, interactive)
+
+    def _apply_update_result(self, info, error, interactive):
+        """主线程：按检查结果推送通知或给出交互提示"""
+        interactive = interactive or self._interactive_update_pending
+        self._interactive_update_pending = False
+        self._update_checking = False
+        current = update_checker.current_version()
+
+        if error:
+            if interactive:
+                QMessageBox.warning(
+                    None, "检查更新",
+                    f"检查更新失败：{error}\n请检查网络连接后重试。")
+            return
+
+        if info is None:
+            if interactive:
+                QMessageBox.information(
+                    None, "检查更新", f"当前已是最新版本（v{current}）。")
+            return
+
+        logger.info(f"发现新版本 v{info.version}（当前 v{current}）")
+        if interactive:
+            if self._prompt_open_release_page(info):
+                self._open_release_page(info.url)
+            return
+
+        # 自动检查：同一个版本只推一次，避免每次开机都弹同一条通知；
+        # 想再次查看可随时从托盘菜单手动检查
+        if self.config_manager.get_last_notified_version() == info.version:
+            logger.debug(f"新版本 v{info.version} 已提醒过，本次不重复推送")
+            return
+        if self.tray_manager:
+            self.tray_manager.show_notification(
+                f"发现新版本 v{info.version}",
+                f"当前 v{current}，右键托盘图标选择「检查更新」查看")
+        self.config_manager.set_last_notified_version(info.version)
+
+    def _prompt_open_release_page(self, info):
+        """
+        询问是否打开发布页
+
+        Args:
+            info (update_checker.ReleaseInfo): 新版本信息
+
+        Returns:
+            bool: 用户选择打开发布页时为 True
+        """
+        box = QMessageBox()
+        box.setWindowTitle("检查更新")
+        box.setIcon(QMessageBox.Information)
+        box.setText(f"发现新版本 v{info.version}（当前 v{update_checker.current_version()}）。")
+        box.setInformativeText("是否打开发布页面下载？")
+        open_button = box.addButton("打开发布页", QMessageBox.AcceptRole)
+        box.addButton("稍后", QMessageBox.RejectRole)
+        box.exec_()
+        return box.clickedButton() is open_button
+
+    @staticmethod
+    def _open_release_page(url):
+        """用系统浏览器打开发布页（失败只记日志，不影响程序）"""
+        try:
+            webbrowser.open(url or update_checker.RELEASE_PAGE)
+        except Exception as e:
+            logger.warning(f"打开发布页失败: {e}")
+
     def _handle_startup_behavior(self):
         """根据配置决定启动后是否直接打开配置窗口"""
         if self.config_manager:
@@ -307,7 +451,7 @@ class MainApp:
                             if self.tray_manager:
                                 self.tray_manager.show_notification(
                                     "截图翻译已就绪",
-                                    "Alt+Z 翻译 / Ctrl+Alt+Z 仅截图")
+                                    "Alt+Z 截图翻译 / Ctrl+Alt+T 文本翻译")
                         except Exception as e:
                             logger.warning(f"启动通知失败: {e}")
 
@@ -326,8 +470,9 @@ class MainApp:
         提示要延迟发出：pystray 的 Icon.run 未就绪时 notify 会被丢掉，
         而 QTimer 在 exec_ 之前创建不触发（Qt 对象尚未关联事件循环）。
         """
-        self._notify_single_hotkey_conflict(self.hotkey_manager, '翻译快捷键', 3.5)
-        self._notify_single_hotkey_conflict(self.capture_hotkey_manager, '截图快捷键', 4.0)
+        self._notify_single_hotkey_conflict(self.hotkey_manager, '截图翻译快捷键', 3.5)
+        self._notify_single_hotkey_conflict(self.capture_hotkey_manager, '纯截图快捷键', 4.0)
+        self._notify_single_hotkey_conflict(self.text_hotkey_manager, '文本翻译快捷键', 4.5)
 
     def _notify_single_hotkey_conflict(self, manager, label, delay):
         """一条快捷键的兼容模式提示（没有冲突时什么都不做）"""
@@ -373,7 +518,7 @@ class MainApp:
         """
         在主线程显示配置窗口，同一时间只保留一个
 
-        托盘左键双击、菜单「设置」与启动行为都会走这里：每次都新建窗口会让
+        托盘菜单「设置」与启动行为都会走这里：每次都新建窗口会让
         设置页叠成一堆（关掉最上面那个，下面的还在），所以已存在时只置前。
         """
         try:
@@ -484,6 +629,11 @@ class MainApp:
                 return
             self._cleaned_up = True
             try:
+                # 先停周期任务，避免退出过程中又发起网络请求
+                if self._update_timer is not None:
+                    self._update_timer.stop()
+                    self._update_timer = None
+
                 # 按顺序清理各组件
                 if self.hotkey_manager:
                     logger.debug("清理全局快捷键")
@@ -492,6 +642,10 @@ class MainApp:
                 if self.capture_hotkey_manager:
                     logger.debug("清理纯截图快捷键")
                     self.capture_hotkey_manager.cleanup()
+
+                if self.text_hotkey_manager:
+                    logger.debug("清理文本翻译快捷键")
+                    self.text_hotkey_manager.cleanup()
 
                 if self.tray_manager:
                     logger.debug("清理系统托盘")
@@ -747,14 +901,17 @@ class ConfigWindow(QDialog):
 
         self.hotkey_edit = QLineEdit()
         self.capture_hotkey_edit = QLineEdit()
+        self.text_hotkey_edit = QLineEdit()
         if self.config_manager:
             try:
                 self.hotkey_edit.setText(self.config_manager.get_global_hotkey())
                 self.capture_hotkey_edit.setText(
                     self.config_manager.get_capture_hotkey())
+                self.text_hotkey_edit.setText(
+                    self.config_manager.get_translate_hotkey())
             except Exception as e:
                 logger.error(f"获取全局快捷键失败: {e}")
-        hotkey_layout.addRow("翻译快捷键:", self.hotkey_edit)
+        hotkey_layout.addRow("截图翻译快捷键:", self.hotkey_edit)
 
         # 快捷键的真实注册状态摆在眼前：被别的程序占用时只能退到键盘钩子，
         # 而钩子在提权窗口/锁屏切换后收不到按键——用户只觉得"偶尔失灵"。
@@ -764,10 +921,15 @@ class ConfigWindow(QDialog):
         self.hotkey_status_label.setWordWrap(True)
         hotkey_layout.addRow(self.hotkey_status_label)
 
-        hotkey_layout.addRow("截图快捷键:", self.capture_hotkey_edit)
+        hotkey_layout.addRow("纯截图快捷键:", self.capture_hotkey_edit)
         self.capture_hotkey_status_label = QLabel("")
         self.capture_hotkey_status_label.setWordWrap(True)
         hotkey_layout.addRow(self.capture_hotkey_status_label)
+
+        hotkey_layout.addRow("文本翻译快捷键:", self.text_hotkey_edit)
+        self.text_hotkey_status_label = QLabel("")
+        self.text_hotkey_status_label.setWordWrap(True)
+        hotkey_layout.addRow(self.text_hotkey_status_label)
 
         hotkey_group.setLayout(hotkey_layout)
         layout.addWidget(hotkey_group)
@@ -777,12 +939,19 @@ class ConfigWindow(QDialog):
         startup_layout = _new_form()
 
         self.minimize_to_tray_check = QCheckBox()
+        self.auto_start_check = QCheckBox()
+        self.auto_check_update_check = QCheckBox()
         if self.config_manager:
             try:
                 self.minimize_to_tray_check.setChecked(self.config_manager.is_minimize_to_tray())
+                self.auto_start_check.setChecked(self.config_manager.is_auto_start())
+                self.auto_check_update_check.setChecked(
+                    self.config_manager.is_auto_check_update())
             except Exception as e:
                 logger.error(f"获取启动行为配置失败: {e}")
         startup_layout.addRow("启动后最小化到托盘:", self.minimize_to_tray_check)
+        startup_layout.addRow("开机自启动:", self.auto_start_check)
+        startup_layout.addRow("启动时检查更新:", self.auto_check_update_check)
 
         startup_group.setLayout(startup_layout)
         layout.addWidget(startup_group)
@@ -827,7 +996,7 @@ class ConfigWindow(QDialog):
 
     def _refresh_hotkey_status(self):
         """
-        把两条快捷键的注册状态写进快捷键分组
+        把三条快捷键的注册状态写进快捷键分组
 
         每次显示窗口都重算：占用是动态的——看门狗会在占用方退出后把后端升回
         系统原生注册，用户再次打开设置时应该看到恢复后的状态而不是旧文案。
@@ -838,6 +1007,9 @@ class ConfigWindow(QDialog):
         self._refresh_single_hotkey_status(
             getattr(self, 'capture_hotkey_status_label', None),
             getattr(self.main_app, 'capture_hotkey_manager', None))
+        self._refresh_single_hotkey_status(
+            getattr(self, 'text_hotkey_status_label', None),
+            getattr(self.main_app, 'text_hotkey_manager', None))
 
     def _refresh_single_hotkey_status(self, label, manager):
         """写一条快捷键的状态文案（label/manager 缺失时安全返回）"""
@@ -1049,6 +1221,33 @@ class ConfigWindow(QDialog):
                 self.config_manager.set_overlay_option(
                     'dim_opacity', str(self.dim_slider.value()))
 
+    def _apply_hotkey(self, manager, hotkey, label, save_direct):
+        """
+        注册一条全局快捷键（成功后由管理器自己写配置）
+
+        Args:
+            manager: HotkeyManager 或 None（管理器不可用时直接写配置）
+            hotkey (str): 快捷键组合
+            label (str): 出错文案里的动作名
+            save_direct: 管理器不可用时直接写配置的回调
+
+        Returns:
+            tuple[bool, str]: (是否成功, 失败原因)
+        """
+        if manager is None:
+            # 快捷键管理器不可用（启动降级场景），无法校验注册结果，仅记录
+            logger.warning(f"{label}管理器不可用，未校验直接保存: {hotkey}")
+            save_direct(hotkey)
+            return True, ''
+        try:
+            if manager.set_hotkey(hotkey):
+                return True, ''
+        except Exception as e:
+            logger.error(f"{label} {hotkey} 注册异常: {e}")
+            return False, f"{label} {hotkey} 注册异常：{e}"
+        return False, (getattr(manager, 'last_error', '')
+                       or f"{label} {hotkey} 注册失败，已保留原快捷键。")
+
     def _on_save(self):
         """保存表单配置并同步到翻译与快捷键管理器"""
         try:
@@ -1059,19 +1258,28 @@ class ConfigWindow(QDialog):
             api_type = self.api_type_combo.currentData()
             target_lang = self.target_lang_combo.currentData() or 'zh'
             hotkey = self.hotkey_edit.text()
-            hotkey_ok = True
-            hotkey_error = ''
             capture_hotkey = self.capture_hotkey_edit.text()
-            capture_ok = True
-            capture_error = ''
+            text_hotkey = self.text_hotkey_edit.text()
+            auto_start = self.auto_start_check.isChecked()
 
-            # 两条热键用同一个组合时，键盘钩子后端会把一次按键投给两个回调，
-            # 结果是一次按键同时弹出两个遮罩。原生后端则第二条注册直接失败。
-            if hotkey.replace(' ', '').lower() == capture_hotkey.replace(' ', '').lower():
+            # 任意两条热键用同一个组合：键盘钩子后端会把一次按键投给多个回调，
+            # 结果是一次按键同时触发多个动作。原生后端则后注册的会失败。
+            entries = (
+                ('截图翻译快捷键', hotkey, self.hotkey_edit,
+                 self.config_manager.get_global_hotkey),
+                ('纯截图快捷键', capture_hotkey, self.capture_hotkey_edit,
+                 self.config_manager.get_capture_hotkey),
+                ('文本翻译快捷键', text_hotkey, self.text_hotkey_edit,
+                 self.config_manager.get_translate_hotkey),
+            )
+            normalized = [value.replace(' ', '').lower()
+                          for _label, value, _edit, _getter in entries
+                          if value.strip()]
+            if len(set(normalized)) != len(normalized):
                 QMessageBox.warning(
                     self, "快捷键重复",
-                    "翻译快捷键与截图快捷键不能相同，"
-                    "否则一次按键会同时触发两个动作。请换一个组合。")
+                    "三条快捷键不能有任意两条相同，"
+                    "否则一次按键会同时触发多个动作。请换一个组合。")
                 return
 
             # 所有配置写入放进批量上下文：十几次 setter 只落盘一次
@@ -1087,34 +1295,36 @@ class ConfigWindow(QDialog):
                 # 启动行为
                 self.config_manager.set_minimize_to_tray(
                     self.minimize_to_tray_check.isChecked())
+                self.config_manager.set_auto_start(auto_start)
+                self.config_manager.set_auto_check_update(
+                    self.auto_check_update_check.isChecked())
                 # 全局快捷键：注册成功后由 set_hotkey 负责写配置，失败则不落盘。
                 # 这里必须自己接住异常：让异常穿出 with 块会跳过"快捷键无效"的
                 # 提示路径，用户看到的是笼统的"保存配置失败"，而其他配置其实
                 # 已经随批量上下文落盘了——提示与实际状态对不上。
-                if self.main_app.hotkey_manager:
-                    try:
-                        hotkey_ok = self.main_app.hotkey_manager.set_hotkey(hotkey)
-                    except Exception as e:
-                        hotkey_ok = False
-                        hotkey_error = f"快捷键 {hotkey} 注册异常：{e}"
-                        logger.error(hotkey_error)
-                else:
-                    # 快捷键管理器不可用（启动降级场景），无法校验注册结果，仅记录
-                    logger.warning(f"快捷键管理器不可用，未校验直接保存快捷键: {hotkey}")
-                    self.config_manager.set_global_hotkey(hotkey)
-
-                if self.main_app.capture_hotkey_manager:
-                    try:
-                        capture_ok = self.main_app.capture_hotkey_manager.set_hotkey(
-                            capture_hotkey)
-                    except Exception as e:
-                        capture_ok = False
-                        capture_error = f"截图快捷键 {capture_hotkey} 注册异常：{e}"
-                        logger.error(capture_error)
-                else:
-                    logger.warning(
-                        f"截图快捷键管理器不可用，未校验直接保存: {capture_hotkey}")
-                    self.config_manager.set_capture_hotkey(capture_hotkey)
+                hotkey_results = (
+                    ('截图翻译快捷键',
+                     self._apply_hotkey(
+                         getattr(self.main_app, 'hotkey_manager', None),
+                         hotkey, '截图翻译快捷键',
+                         self.config_manager.set_global_hotkey),
+                     self.hotkey_edit,
+                     self.config_manager.get_global_hotkey),
+                    ('纯截图快捷键',
+                     self._apply_hotkey(
+                         getattr(self.main_app, 'capture_hotkey_manager', None),
+                         capture_hotkey, '纯截图快捷键',
+                         self.config_manager.set_capture_hotkey),
+                     self.capture_hotkey_edit,
+                     self.config_manager.get_capture_hotkey),
+                    ('文本翻译快捷键',
+                     self._apply_hotkey(
+                         getattr(self.main_app, 'text_hotkey_manager', None),
+                         text_hotkey, '文本翻译快捷键',
+                         self.config_manager.set_translate_hotkey),
+                     self.text_hotkey_edit,
+                     self.config_manager.get_translate_hotkey),
+                )
 
             # 保存成功：草稿里的值已经写进配置，清掉避免下次切回来又盖回旧输入
             self._api_drafts.clear()
@@ -1125,27 +1335,28 @@ class ConfigWindow(QDialog):
                 self.main_app.translation_manager.set_target_lang(target_lang)
                 self.main_app.translation_manager.reload_config()
 
-            if not hotkey_ok or not capture_ok:
+            # 自启动落在注册表而不是 config.ini：写盘成功但注册表失败时，
+            # 配置要回滚成注册表的真实状态，否则界面与开机行为对不上
+            if not autostart.apply(auto_start):
+                actual = autostart.is_enabled()
+                self.config_manager.set_auto_start(actual)
+                self.auto_start_check.setChecked(actual)
+                QMessageBox.warning(
+                    self, "开机自启动设置失败",
+                    f"{autostart.last_error}。其他配置已保存。")
+                return
+
+            failures = [(label, result, edit, getter)
+                        for label, result, edit, getter in hotkey_results
+                        if not result[0]]
+            if failures:
                 # 配置已全部落盘、管理器已同步，只有失败的那条热键保持原值
                 problems = []
-                if not hotkey_ok:
-                    problems.append(
-                        hotkey_error
-                        or getattr(self.main_app.hotkey_manager,
-                                   'last_error', '')
-                        or f"快捷键 {hotkey} 注册失败，已保留原快捷键。")
+                for label, (_ok, error), edit, getter in failures:
+                    problems.append(error)
                     # 输入框要跟着回滚：留着刚输入的组合就等于告诉用户"改成了"，
                     # 而实际生效的还是配置里那个
-                    self.hotkey_edit.setText(
-                        self.config_manager.get_global_hotkey())
-                if not capture_ok:
-                    problems.append(
-                        capture_error
-                        or getattr(self.main_app.capture_hotkey_manager,
-                                   'last_error', '')
-                        or f"截图快捷键 {capture_hotkey} 注册失败，已保留原快捷键。")
-                    self.capture_hotkey_edit.setText(
-                        self.config_manager.get_capture_hotkey())
+                    edit.setText(getter())
                 # 回滚之后窗口还开着，状态行必须跟上，不然显示的仍是刚输入的值
                 self._refresh_hotkey_status()
                 QMessageBox.warning(
@@ -1168,7 +1379,8 @@ class ConfigWindow(QDialog):
             # 被其他程序占用时只能退到键盘钩子：提前告知比事后抱怨"快捷键失效"好
             hints = []
             for manager in (self.main_app.hotkey_manager,
-                            self.main_app.capture_hotkey_manager):
+                            self.main_app.capture_hotkey_manager,
+                            getattr(self.main_app, 'text_hotkey_manager', None)):
                 if manager:
                     hints.append(manager.native_conflict_hint())
             conflict_hint = '\n'.join(hint for hint in hints if hint)

@@ -1543,10 +1543,9 @@ def test_clipboard_write_verified():
     print("✅ 剪贴板写入校验与重试测试通过\n")
 
 
-def test_tray_debounce():
-    """托盘单击/双击防抖：双击只开设置，第二击迟到也不误触发截图"""
-    print("=== 测试托盘防抖 ===")
-    import time as _time
+def test_tray_activation_opens_translate_page():
+    """托盘左键单击/双击都打开文本翻译页，不再触发截图或设置"""
+    print("=== 测试托盘左键行为 ===")
     from managers.tray import SystemTrayManager
 
     class FakeShot:
@@ -1556,39 +1555,56 @@ def test_tray_debounce():
         def start_screenshot(self):
             self.started += 1
 
+        def start_capture(self):
+            self.started += 1
+
     class FakeApp:
         def __init__(self):
+            self.translate_opened = 0
             self.config_opened = 0
+
+        def open_translate_window(self):
+            self.translate_opened += 1
 
         def open_config_window(self):
             self.config_opened += 1
 
     tray = SystemTrayManager(main_app=FakeApp(), screenshot_manager=FakeShot())
-    tray._click_window = 0.12
 
-    # 双击：两次快速激活
+    # 单击
+    tray._on_tray_activate()
+    assert tray.main_app.translate_opened == 1, "单击应打开文本翻译页"
+    assert tray.screenshot_manager.started == 0, "单击不该再触发截图"
+    assert tray.main_app.config_opened == 0, "单击不该打开设置"
+
+    # 双击：两次激活各调一次，窗口复用只置前，不会叠出新窗口
     tray._on_tray_activate()
     tray._on_tray_activate()
-    _time.sleep(0.3)
-    assert tray.main_app.config_opened == 1, "双击应打开设置一次"
-    assert tray.screenshot_manager.started == 0, "双击不应触发截图"
+    assert tray.main_app.translate_opened == 3, "双击也应打开文本翻译页"
+    assert tray.screenshot_manager.started == 0, "双击不该再触发截图"
+    assert tray.main_app.config_opened == 0, "双击不该再打开设置"
+    print("✅ 托盘左键行为测试通过\n")
 
-    # 单击：一次激活后等待
-    tray._on_tray_activate()
-    _time.sleep(0.3)
-    assert tray.screenshot_manager.started == 1, "单击应触发截图"
-    assert tray.main_app.config_opened == 1
 
-    # 边界竞态：第二击先到（更新了 _last_activate_ts），定时器随后触发。
-    # _fire_single_click 应发现“武装之后又有激活”而改开设置，
-    # 而不是把第二击误判为新一轮单击导致“截图开了又关”
-    tray._on_tray_activate()              # 第一击：武装定时器
-    _time.sleep(0.06)
-    tray._on_tray_activate()              # 第二击落在防抖窗口内：开设置
-    _time.sleep(0.3)
-    assert tray.screenshot_manager.started == 1
-    assert tray.main_app.config_opened == 2
-    print("✅ 托盘防抖测试通过\n")
+def test_autostart_command_and_support():
+    """自启动命令必须带引号，源码态用 pythonw 拉起 main.py"""
+    print("=== 测试开机自启动命令 ===")
+    import sys as _sys
+    from managers import app_paths, autostart
+
+    assert autostart.is_supported() == (_sys.platform == 'win32')
+
+    original = app_paths.is_frozen
+    app_paths.is_frozen = lambda: False
+    try:
+        command = autostart.startup_command()
+        assert command.startswith('"'), f"命令未加引号: {command}"
+        assert 'main.py' in command, f"源码态命令未指向 main.py: {command}"
+        if _sys.platform == 'win32':
+            assert 'python' in command.lower(), f"源码态命令未用 Python 启动: {command}"
+    finally:
+        app_paths.is_frozen = original
+    print("✅ 开机自启动命令测试通过\n")
 
 
 def test_config_defaults_in_memory():
@@ -1605,7 +1621,11 @@ def test_config_defaults_in_memory():
         # 内存里的默认值必须完整可用
         assert manager.get_api_type() == 'edge_free'
         assert manager.get_global_hotkey() == 'alt+z'
+        assert manager.get_translate_hotkey() == 'ctrl+alt+t'
         assert manager.is_minimize_to_tray() is True
+        assert manager.is_auto_start() is False
+        assert manager.is_auto_check_update() is True
+        assert manager.get_last_notified_version() == ''
         assert manager.get_ocr_option('rapidocr_score_threshold') == '0.5'
         assert manager.get_overlay_option('snap_threshold') == '12'
 
@@ -1651,7 +1671,7 @@ def test_corrupt_config_repair_fills_every_key():
             content = f.read()
         assert 'target_lang' in content, "已存在但残缺的段没被补默认值"
         assert 'baidu_api_key' in content, "半截解析让修复后的文件缺键"
-        for section in ('[Hotkey]', '[Startup]', '[Overlay]', '[OCR]'):
+        for section in ('[Hotkey]', '[Startup]', '[Update]', '[Overlay]', '[OCR]'):
             assert section in content, f"修复后的文件缺段: {section}"
     print("✅ 坏配置修复补齐全部键测试通过\n")
 
@@ -1867,6 +1887,31 @@ def test_hotkey_parse():
     for bad in ('z', 'alt+a+b', 'alt+', '', None, 123, 'alt+不存在的键'):
         assert parse_hotkey(bad) is None, f"{bad!r} 不该被解析成合法快捷键"
     print("✅ 快捷键解析测试通过\n")
+
+
+def test_text_hotkey_triggers_translate_window():
+    """文本翻译快捷键读 translate_hotkey，并调用打开页面的回调"""
+    print("=== 测试文本翻译快捷键 ===")
+    import tempfile
+    from config import ConfigManager
+    from managers.hotkey import HotkeyManager
+
+    fired = []
+    with tempfile.TemporaryDirectory() as tmp:
+        cm = ConfigManager(os.path.join(tmp, 'config.ini'))
+        assert cm.get_translate_hotkey() == 'ctrl+alt+t'
+        cm.set_translate_hotkey('ctrl+alt+t')
+        manager = HotkeyManager(
+            None, cm, action='text', on_trigger=lambda: fired.append(1))
+        try:
+            manager._load_hotkey_config()
+            assert manager.hotkey == 'ctrl+alt+t', \
+                f"文本翻译快捷键未从配置读取: {manager.hotkey}"
+            manager._fire()
+            assert fired == [1], "文本翻译快捷键没有触发打开页面"
+        finally:
+            manager.cleanup()
+    print("✅ 文本翻译快捷键测试通过\n")
 
 
 def test_hotkey_backend_fallback_and_watchdog():

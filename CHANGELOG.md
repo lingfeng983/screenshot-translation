@@ -2,6 +2,31 @@
 
 所有显著改动记录于此。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [v1.9.0] — 2026-11-09
+
+### 新增
+- **开机自启动**：设置页"启动行为"新增勾选，写入当前用户注册表 Run 项
+  （HKCU，无需管理员权限）。打包态指向 exe，源码态用 `pythonw` 拉起 `main.py`；
+  升级覆盖安装后启动时自动把命令校正到当前路径，注册表写入失败会回滚勾选与配置
+  并明确告警（`managers/autostart.py`、`config.py`、`main.py`）
+- **文本翻译页全局快捷键**：新增默认 `Ctrl+Alt+T`（配置项 `[Hotkey] translate_hotkey`），
+  按一次直接打开文本翻译页；设置页快捷键分组扩成三行，任意两条重复会被拦下
+  （`managers/hotkey.py`、`managers/hotkey_native.py`、`main.py`、`config.py`）
+- **文本翻译自动翻译**：原文输入或粘贴停止约 0.6 秒后自动发起翻译，同一份文本/
+  同一目标语言不重复提交；请求进行中继续输入会在结果回来后补译。"翻译"按钮与
+  `Ctrl+Enter` 保留（`managers/translate_window.py`）
+- **更新推送**：启动约 6 秒后在后台查询 GitHub 最新正式版（`releases/latest`），
+  发现新版本弹托盘通知（同一版本只提醒一次）；托盘菜单新增"检查更新"，
+  手动检查会弹窗并可打开发布页。设置页新增"启动时检查更新"开关
+  （`managers/update_checker.py`、`managers/app_version.py`、`main.py`、
+  `managers/tray.py`、`config.py`）。发版脚本在构建前把版本号写入
+  `managers/app_version.py`，源码态与打包态读到同一版本
+
+### 变更
+- **托盘左键行为统一**：单击与双击都打开文本翻译页（重复点击只置前已打开窗口），
+  不再区分"单击截图 / 双击设置"；截图仍可从右键菜单或全局快捷键发起
+  （`managers/tray.py`）
+
 ## [v1.8.0] — 2026-11-06
 
 ### 新增
