@@ -21,6 +21,15 @@ TOOLBAR_HEIGHT = 34
 _ICON_SIZE = 20
 _ICON_BUTTON_SIZE = QSize(28, 26)
 
+# 语言下拉定宽：收起时只占 _LANG_COMBO_CHARS 个汉字，完整语言名放进弹出列表
+_LANG_COMBO_CHARS = 2
+_COMBO_CHROME = 28
+
+
+def _fixed_combo_width(combo, chars=_LANG_COMBO_CHARS):
+    """把下拉宽度固定成 chars 个汉字的长度"""
+    return combo.fontMetrics().horizontalAdvance('简') * chars + _COMBO_CHROME
+
 _TOOLBAR_QSS = """
 QWidget#OverlayToolbar {
     background-color: rgba(35, 38, 41, 250);
@@ -119,8 +128,16 @@ class OverlayToolbar(QWidget):
                 index = self.lang_combo.findData(current_lang)
                 if index >= 0:
                     self.lang_combo.setCurrentIndex(index)
+            # 收起时宽度固定成 2 个汉字；弹出列表仍按最长语言名展开
+            self.lang_combo.setFixedWidth(_fixed_combo_width(self.lang_combo))
+            longest = max((name or code for code, name in languages),
+                          key=len, default='')
+            self.lang_combo.view().setMinimumWidth(
+                self.lang_combo.fontMetrics().horizontalAdvance(longest) + 28)
             # 连接放在初始选择之后，避免创建工具条时就触发重译
             self.lang_combo.currentIndexChanged.connect(self._on_lang_changed)
+            self.lang_combo.currentIndexChanged.connect(self._sync_lang_tooltip)
+            self._sync_lang_tooltip()
             # 下拉是独立顶层窗口，选完可能不把键盘焦点还给遮罩：那样 ESC/T/R/Ctrl+C
             # 全部失灵，只能鼠标点回去
             self.lang_combo.activated.connect(self._reactivate_host)
@@ -241,6 +258,12 @@ class OverlayToolbar(QWidget):
     def _on_lang_changed(self, _index):
         """语言下拉变化：把新的目标语言代码通知宿主"""
         self.language_changed.emit(self.lang_combo.currentData())
+
+    def _sync_lang_tooltip(self, *_args):
+        """收起时只显示两个汉字，完整语言名放进悬停提示"""
+        text = self.current_language_text()
+        if text:
+            self.lang_combo.setToolTip(f'目标语言：{text}')
 
     def _reactivate_host(self, *_args):
         """选完语言后把键盘焦点交还遮罩窗口，让快捷键继续可用"""

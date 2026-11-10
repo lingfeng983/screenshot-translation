@@ -2,6 +2,42 @@
 
 所有显著改动记录于此。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [v1.11.0] — 2026-11-10
+
+### 新增
+- **标注可回头再调**：最近一次落笔的图元保持可选中——拖着移动、拖八向手柄缩放、
+  滚轮在预设档位里调线宽（文字调字号、序号调倍率）；左键点别处取消选中，再点
+  一下标注可重新选中并接着拖；单击不拖不留空撤销
+  （`managers/capture_editor.py`、`managers/capture_annotation.py`）
+- **橡皮擦工具**：标注工具增至十种，擦头随线宽加大，只擦命中笔画/边框/填充的
+  图元，一次按下到松开只算一步撤销（`managers/capture_annotation.py`、
+  `capture_editor.py`、`capture_toolbar.py`、`managers/vector_icons.py`）
+- **角标与手柄的悬停动画**：选区四角标记、结果态八向手柄、编辑态选中框手柄在
+  鼠标靠近时放大发亮（白→蓝），移出后回落；动画由 16ms 定时器推进，到位即停表，
+  静止时零开销（`managers/screenshot.py`、`managers/capture_editor.py`）
+- **工具条下拉定宽、颜色改下拉**：线宽/字号/目标语言三个下拉固定成约 2 个汉字的
+  宽度（按字体度量算，条目更宽时不裁字），语言完整名放进弹出列表并补 tooltip；
+  8 个色块改成带色块图标的下拉，末尾「自定义…」走取色对话框，取消则退回原色
+  （`managers/capture_toolbar.py`、`managers/overlay_toolbar.py`）
+
+### 变更
+- **烧录语义的边界**：标注仍是最新一笔可直接编辑、更早的仍只受整步撤销影响；
+  `Shape.transformed()` 始终产出新对象，撤销快照不会被就地改写
+  （`managers/capture_annotation.py`、`managers/capture_editor.py`）
+
+### 修复
+- **`select` 工具下选区整体平移卡死**：残留选中的图元会把鼠标移动事件吞掉，
+  改为只在非 `select` 工具时消费（`managers/capture_editor.py`）
+- **在标注上单击一下会多出一步空撤销**：撤销快照延迟到图元真正被改动时才拍
+  （`managers/capture_editor.py`）
+- **取消选中后无法再点回已有标注**：按下时先做图元命中测试，命中即选中并可拖走
+  （`managers/capture_editor.py`）
+
+### 测试
+- `tests/test_capture_features.py` 增至 57 例：最近标注的移动/缩放/滚轮调粗细与
+  再选中、单击不拖不留空撤销、橡皮擦擦除与整步撤销、下拉定宽与颜色下拉、角标
+  悬停动画、`select` 工具下选区平移不被打断
+
 ## [v1.10.0] — 2026-11-10
 
 ### 新增

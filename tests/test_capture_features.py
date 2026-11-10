@@ -40,7 +40,7 @@ def test_all_shape_kinds_draw(qapp):
         Shape('step', [QPointF(50, 50)], number=7),
         Shape('mosaic', [QPointF(20, 20), QPointF(90, 80)]),
     ]
-    assert len(shapes) == len(TOOLS) - 1
+    assert len(shapes) == len(TOOLS) - 2, '橡皮擦是即时工具，不产生图元'
     pixmap = QPixmap(300, 200)
     pixmap.fill()
     painter = QPainter(pixmap)
@@ -127,11 +127,118 @@ def test_editor_tiny_drag_is_ignored(qapp):
     assert editor.shapes == [], '小于 3px 的误触不该落笔'
 
 
+def test_editor_last_shape_can_move_and_scale(qapp):
+    """最近一次落笔的图元可以拖动移动、拖手柄缩放，点别处取消选中"""
+    editor = CaptureEditor(_Host())
+    _draw_rect(editor, (20, 20), (80, 60))      # 局部 (10,10)-(70,50)
+    assert editor._selected == 0, '落笔后应自动选中'
+    start = editor.shapes[0].points[0]
+
+    # 从图元上边拖动（避开手柄）→ 整体平移
+    editor.mouse_press(QPointF(35, 20), Qt.LeftButton)
+    editor.mouse_move(QPointF(45, 30))
+    editor.mouse_release(QPointF(45, 30), Qt.LeftButton)
+    assert editor.shapes[0].points[0].x() == start.x() + 10
+    assert editor.shapes[0].points[0].y() == start.y() + 10
+
+    # 拖右下角手柄 → 放大（bounds 是选区局部坐标，测试的对话框原点在 (10,10)）
+    box = editor.shapes[0].bounds()
+    handle = QPointF(box.right() + 10, box.bottom() + 10)
+    editor.mouse_press(handle, Qt.LeftButton)
+    editor.mouse_move(QPointF(handle.x() + 20, handle.y() + 20))
+    editor.mouse_release(QPointF(handle.x() + 20, handle.y() + 20),
+                         Qt.LeftButton)
+    assert editor.shapes[0].bounds().width() > box.width()
+    assert len(editor.shapes) == 1, '拖手柄不应多出一个图元'
+
+    # 左键点到别处 → 取消选中（单击不落笔）
+    editor.mouse_press(QPointF(150, 100), Qt.LeftButton)
+    editor.mouse_release(QPointF(150, 100), Qt.LeftButton)
+    assert editor._selected is None
+    assert len(editor.shapes) == 1, '单击空白不应误落笔'
+
+
+def test_editor_click_shape_reselects_and_drags(qapp):
+    """取消选中后，点一下已有标注又能选中并拖走"""
+    host = _Host()
+    editor = CaptureEditor(host)
+    _draw_rect(editor, (20, 20), (80, 60))
+    ox, oy = host._result_rect.left(), host._result_rect.top()
+
+    editor.mouse_press(QPointF(150, 100), Qt.LeftButton)
+    editor.mouse_release(QPointF(150, 100), Qt.LeftButton)
+    assert editor._selected is None
+
+    # bounds 是选区局部坐标，按下要换回屏幕坐标
+    box = editor.shapes[0].bounds()
+    grab = QPointF(box.left() + box.width() * 0.3 + ox, box.top() + oy)
+    assert editor.mouse_press(grab, Qt.LeftButton) is True
+    assert editor._selected == 0, '点已有标注应重新选中'
+    editor.mouse_move(QPointF(grab.x() + 8, grab.y() + 6))
+    editor.mouse_release(QPointF(grab.x() + 8, grab.y() + 6), Qt.LeftButton)
+    assert editor.shapes[0].bounds().top() > box.top(), '选中后应能拖走'
+    assert len(editor.shapes) == 1, '点标注不该再多画一个'
+
+
+def test_editor_click_without_drag_adds_no_undo(qapp):
+    """在标注上单击（没拖）不该留一步空撤销"""
+    host = _Host()
+    editor = CaptureEditor(host)
+    _draw_rect(editor)
+    depth = len(editor.undo_stack)
+    box = editor.shapes[0].bounds()
+    grab = QPointF(box.left() + box.width() * 0.3 + host._result_rect.left(),
+                   box.top() + host._result_rect.top())
+    editor.mouse_press(grab, Qt.LeftButton)
+    editor.mouse_release(grab, Qt.LeftButton)
+    assert len(editor.undo_stack) == depth, '单击留下了空的撤销步'
+
+
+def test_editor_select_tool_keeps_region_drag_alive(qapp):
+    """select 工具下即使还有选中图元，也不能吞掉宿主的选区拖动"""
+    editor = CaptureEditor(_Host())
+    _draw_rect(editor)
+    editor.set_tool('select')
+    editor._selected = 0        # 模拟残留选中
+    assert editor.mouse_press(QPointF(150, 100), Qt.LeftButton) is False
+    assert editor._selected is None, '点空白应取消选中'
+    assert editor.mouse_move(QPointF(160, 110)) is False, \
+        'select 工具下编辑器不能接管移动事件'
+
+
+def test_editor_eraser_removes_shape(qapp):
+    """橡皮擦擦掉自己画的标注，且整次擦除可一步撤销"""
+    editor = CaptureEditor(_Host())
+    _draw_rect(editor, (20, 20), (80, 60))
+    assert len(editor.shapes) == 1
+    editor.set_tool('eraser')
+    editor.mouse_press(QPointF(20, 20), Qt.LeftButton)
+    editor.mouse_release(QPointF(20, 20), Qt.LeftButton)
+    assert editor.shapes == [], '橡皮擦没有擦掉标注'
+    assert editor.undo() and len(editor.shapes) == 1
+
+
+def test_editor_wheel_adjusts_width_and_font(qapp):
+    """滚轮调选中图元的线宽，文字图元则调字号"""
+    editor = CaptureEditor(_Host())
+    _draw_rect(editor)
+    before = editor.shapes[0].width
+    editor.wheel(-1)
+    assert editor.shapes[0].width < before, '滚轮没有调细线宽'
+    assert editor.width == editor.shapes[0].width, '默认线宽没有跟着同步'
+
+    editor.shapes = [Shape('text', [QPointF(5, 5)], text='x', font_size=18)]
+    editor._selected = 0
+    editor.wheel(1)
+    assert editor.shapes[0].font_size > 18, '滚轮没有放大字号'
+
+
 def test_editor_translation_moves_undo_snapshots(qapp):
     """平移后撤销不能让标注跳回原位"""
     editor = CaptureEditor(_Host())
     _draw_rect(editor)
-    _draw_rect(editor)
+    # 第二笔要错开：点到已有标注的边框会被选中（方便回头再调），不会另起一笔
+    _draw_rect(editor, (100, 100), (150, 130))
     before = editor.shapes[0].points[0].x()
     editor.apply_translation(9, 4)
     assert editor.shapes[0].points[0].x() == before + 9
@@ -400,6 +507,37 @@ def test_capture_toolbar_signals_and_fit(qapp):
     toolbar._tool_buttons['arrow'].click()
     assert tools == ['arrow']
     assert toolbar._tool_buttons['arrow'].isChecked()
+
+
+def test_toolbar_combos_fixed_width_and_color_dropdown(qapp):
+    """线宽/字号下拉定宽：两个同宽、约 2 个汉字且不裁字；颜色是带色块的下拉"""
+    toolbar = CaptureToolbar(None)
+    han = toolbar.width_combo.fontMetrics().horizontalAdvance('简') * 2
+    for combo in (toolbar.width_combo, toolbar.font_combo):
+        assert combo.width() == toolbar.width_combo.width(), '两个下拉宽度不一致'
+        assert combo.width() >= han, '下拉没有 2 个汉字宽'
+        assert combo.width() <= han + 40, '下拉过宽，不再紧凑'
+        assert combo.sizeHint().width() <= combo.width(), '下拉文本被裁切'
+
+    combo = toolbar.color_combo
+    texts = [combo.itemText(i) for i in range(combo.count())]
+    assert texts[-1].startswith('自定义'), '缺少自定义颜色项'
+    assert not combo.itemIcon(0).isNull(), '预设色缺少色块图标'
+    # 自定义色作为新条目插入并选中
+    toolbar.set_color('#123456')
+    assert combo.currentData() == '#123456'
+    assert combo.currentIndex() < combo.count() - 1, '自定义颜色插到了末尾'
+
+
+def test_overlay_toolbar_language_combo_fixed_width(qapp):
+    from managers.overlay_toolbar import OverlayToolbar
+    toolbar = OverlayToolbar(None, [('zh', '简体中文'), ('en', '英语')])
+    combo = toolbar.lang_combo
+    expect = combo.fontMetrics().horizontalAdvance('简') * 2 + 28
+    assert combo.width() == expect
+    # 收起宽度固定，但弹出列表要放得下完整语言名
+    assert combo.view().minimumWidth() >= expect
+    assert combo.toolTip(), '定宽后需要 tooltip 补偿显示'
 
 
 def test_window_hover_picks_smallest_rect(qapp):

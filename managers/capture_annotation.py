@@ -3,8 +3,9 @@
 """
 截图标注图元（烧录语义）
 
-标注一旦落笔就合成进像素，不提供选中/移动/删除单个对象的能力；内部保留
-轻量图元列表只为一件事：支撑 Ctrl+Z 撤销「整步」操作。
+标注一旦落笔就合成进像素，不提供逐个选中/编辑历史图元的能力；内部保留
+轻量图元列表支撑 Ctrl+Z 撤销「整步」操作，以及「最近一次落笔」的移动、缩放
+与橡皮擦擦除（旧图元仍只能整步撤销）。
 
 坐标约定：points 全部是「选区局部逻辑坐标」（选区左上角为原点），与
 ScreenshotWidget 的 _result_rect / _blocks 同一套基准。绘制时给出
@@ -12,10 +13,10 @@ draw_scale（编辑态 1.0，导出为「逻辑 → 物理像素」倍率）；�
 crop_scale 才能从原始 PIL 抓拍图里取到正确的像素块。
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
-from PyQt5.QtCore import QPointF, QRectF, Qt
-from PyQt5.QtGui import QColor, QFont, QPen, QPolygonF
+from PyQt5.QtCore import QPointF, QRectF, QSizeF, Qt
+from PyQt5.QtGui import QColor, QFont, QFontMetricsF, QPen, QPolygonF
 
 # 工具键与展示名（顺序即工具条顺序）
 TOOL_SELECT = 'select'
@@ -28,9 +29,11 @@ TOOL_HIGHLIGHT = 'highlight'
 TOOL_TEXT = 'text'
 TOOL_STEP = 'step'
 TOOL_MOSAIC = 'mosaic'
+TOOL_ERASER = 'eraser'
 
 TOOLS = (TOOL_SELECT, TOOL_RECT, TOOL_ELLIPSE, TOOL_LINE, TOOL_ARROW,
-         TOOL_PEN, TOOL_HIGHLIGHT, TOOL_TEXT, TOOL_STEP, TOOL_MOSAIC)
+         TOOL_PEN, TOOL_HIGHLIGHT, TOOL_TEXT, TOOL_STEP, TOOL_MOSAIC,
+         TOOL_ERASER)
 TOOL_LABELS = {
     TOOL_SELECT: '选择/移动选区',
     TOOL_RECT: '矩形',
@@ -42,6 +45,7 @@ TOOL_LABELS = {
     TOOL_TEXT: '文字',
     TOOL_STEP: '序号',
     TOOL_MOSAIC: '马赛克',
+    TOOL_ERASER: '橡皮擦',
 }
 
 PRESET_COLORS = ('#ff3b30', '#ff9500', '#ffcc00', '#34c759',
@@ -54,9 +58,41 @@ _HIGHLIGHT_ALPHA = 95       # 荧光笔透明度
 _MAX_SHAPES = 400           # 防误操作把内存吃光
 
 
+def _step_radius(scale):
+    """序号圆点半径（局部逻辑像素）"""
+    return max(6.0, 13.0 * max(0.2, scale))
+
+
+def _point_segment_distance(point, start, end):
+    """点到线段的距离（线性图元的命中判断用）"""
+    dx = end.x() - start.x()
+    dy = end.y() - start.y()
+    if dx == 0 and dy == 0:
+        return ((point.x() - start.x()) ** 2
+                + (point.y() - start.y()) ** 2) ** 0.5
+    t = ((point.x() - start.x()) * dx
+         + (point.y() - start.y()) * dy) / (dx * dx + dy * dy)
+    t = max(0.0, min(1.0, t))
+    px = start.x() + t * dx
+    py = start.y() + t * dy
+    return ((point.x() - px) ** 2 + (point.y() - py) ** 2) ** 0.5
+
+
+def _shape_text_box(points, text, font_size):
+    """文字图元的排版外框（与 _draw_text 的留白保持一致）"""
+    font = QFont('Microsoft YaHei UI')
+    font.setPixelSize(max(8, int(font_size)))
+    metrics = QFontMetricsF(font)
+    lines = text.split('\n') or ['']
+    line_h = metrics.height()
+    box_w = max([metrics.horizontalAdvance(line) for line in lines] + [0.0]) + 12
+    box_h = line_h * len(lines) + 12
+    return QRectF(points[0], QSizeF(box_w, box_h))
+
+
 @dataclass
 class Shape:
-    """一个已落笔的标注。约定：commit 之后不再修改字段。"""
+    """一个已落笔的标注。约定：commit 之后整体替换，不就地改字段。"""
     kind: str
     points: list = field(default_factory=list)   # list[QPointF]，选区局部逻辑坐标
     color: str = PRESET_COLORS[0]
@@ -64,6 +100,7 @@ class Shape:
     font_size: int = FONT_CHOICES[1]
     text: str = ''
     number: int = 0
+    scale: float = 1.0          # 序号圆点等固定尺寸图元的整体倍率
     # 马赛克结果缓存：首次绘制时按当前底图生成，之后直接复用
     _mosaic_cache: object = field(default=None, repr=False, compare=False)
 
@@ -73,7 +110,108 @@ class Shape:
             kind=self.kind,
             points=[QPointF(p.x() + dx, p.y() + dy) for p in self.points],
             color=self.color, width=self.width, font_size=self.font_size,
-            text=self.text, number=self.number)
+            text=self.text, number=self.number, scale=self.scale)
+
+    def bounds(self):
+        """
+        图元外框（选区局部逻辑坐标）
+
+        用于选中虚线框、手柄位置、橡皮擦与拖动的命中测试。
+
+        Returns:
+            QRectF: 图元外框
+        """
+        if not self.points:
+            return QRectF()
+        if self.kind == TOOL_TEXT:
+            return _shape_text_box(self.points, self.text, self.font_size)
+        if self.kind == TOOL_STEP:
+            radius = _step_radius(self.scale)
+            center = self.points[0]
+            return QRectF(center.x() - radius, center.y() - radius,
+                          radius * 2, radius * 2)
+        # 用 min/max 自己算包围盒：QRectF.united 遇到零宽/零高的矩形会当成
+        # 空矩形丢掉，直线、水平画笔这类图元的框会算错
+        xs = [point.x() for point in self.points]
+        ys = [point.y() for point in self.points]
+        rect = QRectF(min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys))
+        pad = max(1.0, self.width * 0.5)
+        if self.kind == TOOL_HIGHLIGHT:
+            pad = max(3.0, self.width * 1.6)
+        return rect.adjusted(-pad, -pad, pad, pad)
+
+    def hit(self, point, tol=0.0):
+        """
+        命中测试（橡皮擦与拖动共用）
+
+        Args:
+            point (QPointF): 选区局部逻辑坐标
+            tol (float): 命中容差（橡皮擦半径 / 拖动的宽容度）
+
+        Returns:
+            bool: 是否命中
+        """
+        if not self.points:
+            return False
+        box = self.bounds()
+        if not box.adjusted(-tol, -tol, tol, tol).contains(point):
+            return False
+        if self.kind in (TOOL_TEXT, TOOL_STEP, TOOL_MOSAIC):
+            return True
+        radius = tol + max(1.0, self.width * 0.5)
+        if self.kind == TOOL_RECT:
+            # 矩形只认边框：否则框内的空白处也拖不动新图元
+            inner = box.adjusted(radius, radius, -radius, -radius)
+            return inner.isEmpty() or not inner.contains(point)
+        if self.kind == TOOL_ELLIPSE:
+            cx, cy = box.center().x(), box.center().y()
+            rx = max(1e-6, box.width() / 2.0)
+            ry = max(1e-6, box.height() / 2.0)
+            distance = (((point.x() - cx) / rx) ** 2
+                        + ((point.y() - cy) / ry) ** 2) ** 0.5
+            band = max(radius / min(rx, ry), 0.08)
+            return abs(distance - 1.0) <= band
+        if len(self.points) == 1:
+            return True
+        for start, end in zip(self.points, self.points[1:]):
+            if _point_segment_distance(point, start, end) <= radius:
+                return True
+        return False
+
+    def transformed(self, target):
+        """
+        映射到新的外框（选中后拖动移动 / 拖手柄缩放）
+
+        始终返回新图元、不改自身：撤销栈里存的是旧对象，快照因此不会跟着变。
+
+        Args:
+            target (QRectF): 目标外框（选区局部逻辑坐标）
+
+        Returns:
+            Shape: 变换后的新图元
+        """
+        box = self.bounds()
+        if (box.width() <= 0 and box.height() <= 0) \
+                or (target.width() <= 0 and target.height() <= 0):
+            return self
+        scale_x = target.width() / box.width() if box.width() else 1.0
+        scale_y = target.height() / box.height() if box.height() else 1.0
+
+        def _map(point):
+            return QPointF(target.left() + (point.x() - box.left()) * scale_x,
+                           target.top() + (point.y() - box.top()) * scale_y)
+
+        if self.kind == TOOL_STEP:
+            factor = max(0.2, min(6.0, self.scale * min(scale_x, scale_y)))
+            return replace(self, points=[target.center()], scale=factor,
+                           _mosaic_cache=None)
+        if self.kind == TOOL_TEXT:
+            size = max(8, int(round(self.font_size * scale_y)))
+            return replace(self, points=[_map(self.points[0])], font_size=size,
+                           _mosaic_cache=None)
+        width = max(1, int(round(self.width * min(scale_x, scale_y))))
+        return replace(self, points=[_map(point) for point in self.points],
+                       width=width, _mosaic_cache=None)
 
     @staticmethod
     def _scaled(points, scale):
@@ -192,7 +330,7 @@ class Shape:
                 line)
 
     def _draw_step(self, painter, pts, color, draw_scale):
-        radius = max(10.0, 13.0 * draw_scale)
+        radius = max(6.0, _step_radius(self.scale) * draw_scale)
         center = pts[0]
         painter.setPen(Qt.NoPen)
         painter.setBrush(color)

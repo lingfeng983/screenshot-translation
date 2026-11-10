@@ -12,7 +12,8 @@ import threading
 import time
 
 from PIL import ImageGrab
-from PyQt5.QtCore import Qt, QRect, QRectF, QPoint, QSize, QTimer, pyqtSignal
+from PyQt5.QtCore import (Qt, QRect, QRectF, QPoint, QPointF, QSize, QTimer,
+                          pyqtSignal)
 from PyQt5.QtGui import QPainter, QPen, QColor, QCursor, QPixmap
 from PyQt5.QtWidgets import QApplication, QHBoxLayout, QLabel, QWidget
 
@@ -846,6 +847,12 @@ class ScreenshotWidget(QWidget):
         # 轻量状态提示（OCR/滚动截图结果）
         self._capture_toast = ''
         self._toast_timer = None
+        # 角标（选区四角标记 / 结果态手柄）的悬停放大动画
+        self._hover_mark = None
+        self._hover_mark_progress = 0.0
+        self._hover_timer = None
+        # 滚轮连调线宽/字号时攒一下再落盘
+        self._pref_timer = None
 
         # 设置窗口属性
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
@@ -1108,6 +1115,10 @@ class ScreenshotWidget(QWidget):
     _MIN_SELECT_EDGE = 10
     # 结果态拖动时边/角的命中范围（像素）
     _HANDLE_HIT = 10
+    # 角标悬停动画：命中半径、帧间隔、每帧进度（约 100 ms 走完）
+    _MARK_HOVER_HIT = 16
+    _MARK_FRAME_MS = 16
+    _MARK_STEP = 0.16
 
     def paintEvent(self, event):
         """
@@ -1272,40 +1283,113 @@ class ScreenshotWidget(QWidget):
         return QRect(0, 0, self.screen_width, self.screen_height)
 
     def _draw_corner_marks(self, painter, rect):
-        """选区四角的白色L形标记"""
-        pen = QPen(QColor(255, 255, 255, 220), 2)
-        painter.setPen(pen)
+        """选区四角的白色 L 形标记；鼠标靠近的角放大并转蓝（悬停动画）"""
         length = 14
-        x1, y1, x2, y2 = rect.left(), rect.top(), rect.right(), rect.bottom()
-        # 左上
-        painter.drawLine(x1, y1, x1 + length, y1)
-        painter.drawLine(x1, y1, x1, y1 + length)
-        # 右上
-        painter.drawLine(x2 - length, y1, x2, y1)
-        painter.drawLine(x2, y1, x2, y1 + length)
-        # 左下
-        painter.drawLine(x1, y2 - length, x1, y2)
-        painter.drawLine(x1, y2, x1 + length, y2)
-        # 右下
-        painter.drawLine(x2 - length, y2, x2, y2)
-        painter.drawLine(x2, y2 - length, x2, y2)
+        corners = (
+            (rect.left(), rect.top(), 1, 1),
+            (rect.right(), rect.top(), -1, 1),
+            (rect.left(), rect.bottom(), 1, -1),
+            (rect.right(), rect.bottom(), -1, -1),
+        )
+        for index, (x, y, dx, dy) in enumerate(corners):
+            grow = (self._hover_mark_progress
+                    if index == self._hover_mark else 0.0)
+            if grow:
+                color = QColor(96, 165, 250)
+                color.setAlpha(min(255, int(170 + 85 * grow)))
+            else:
+                color = QColor(255, 255, 255, 220)
+            painter.setPen(QPen(color, 2 + 1.2 * grow))
+            arm = length * (1 + 0.5 * grow)
+            painter.drawLine(x, y, int(x + dx * arm), y)
+            painter.drawLine(x, y, x, int(y + dy * arm))
 
     def _draw_handles(self, painter, rect):
-        """结果态的可拖拽把手：四角与四边中点各一个小方块"""
-        size = 7
-        half = size // 2
-        points = [
-            rect.topLeft(), rect.topRight(), rect.bottomLeft(), rect.bottomRight(),
-            QPoint(rect.center().x(), rect.top()),
-            QPoint(rect.center().x(), rect.bottom()),
-            QPoint(rect.left(), rect.center().y()),
-            QPoint(rect.right(), rect.center().y()),
-        ]
-        painter.setPen(QPen(QColor(255, 255, 255, 230), 1))
-        painter.setBrush(QColor(self._ACCENT))
-        for point in points:
-            painter.drawRect(QRect(point.x() - half, point.y() - half, size, size))
+        """结果态的可拖拽手柄：鼠标靠近的那个放大发亮（悬停动画）"""
+        size = 7.0
+        for index, point in enumerate(self._mark_points(rect, 'handle')):
+            grow = (self._hover_mark_progress
+                    if index == self._hover_mark else 0.0)
+            side = size + 4.0 * grow
+            half = side / 2.0
+            painter.setPen(
+                QPen(QColor(255, 255, 255, min(255, int(230 + 25 * grow))),
+                     1 + grow))
+            fill = QColor(self._ACCENT)
+            if grow:
+                fill = fill.lighter(int(100 + 30 * grow))
+            painter.setBrush(fill)
+            painter.drawRect(
+                QRectF(point.x() - half, point.y() - half, side, side))
         painter.setBrush(Qt.NoBrush)
+
+    # ---- 角标悬停动画 ----
+
+    def _mark_target(self):
+        """
+        当前该渲染哪种角标
+
+        Returns:
+            tuple[QRect 或 None, str 或 None]: (选区矩形, 'corner'/'handle')
+        """
+        if self.is_selecting:
+            rect, _guides = self._snap_rect(self._get_rect())
+            return rect, 'corner'
+        if self.capture_only and self._capture_edit:
+            # 编辑态用编辑控制器自己的选中框手柄
+            return None, None
+        if self._result is not None or self._error:
+            return self._result_rect, 'handle'
+        return None, None
+
+    @staticmethod
+    def _mark_points(rect, kind):
+        """角标位置：选区四角（corner）或八向手柄（handle）"""
+        if kind == 'corner':
+            return [rect.topLeft(), rect.topRight(),
+                    rect.bottomLeft(), rect.bottomRight()]
+        cx = rect.center().x()
+        cy = rect.center().y()
+        return [rect.topLeft(), rect.topRight(),
+                rect.bottomLeft(), rect.bottomRight(),
+                QPoint(cx, rect.top()), QPoint(cx, rect.bottom()),
+                QPoint(rect.left(), cy), QPoint(rect.right(), cy)]
+
+    def _update_mark_hover(self, pos):
+        """鼠标靠近角标 → 启动放大动画；离开 → 复原"""
+        rect, kind = self._mark_target()
+        index = None
+        if rect is not None and not rect.isEmpty():
+            for i, point in enumerate(self._mark_points(rect, kind)):
+                if abs(point.x() - pos.x()) <= self._MARK_HOVER_HIT \
+                        and abs(point.y() - pos.y()) <= self._MARK_HOVER_HIT:
+                    index = i
+                    break
+        if index == self._hover_mark:
+            return
+        self._hover_mark = index
+        self._start_mark_anim()
+
+    def _start_mark_anim(self):
+        """每帧推进一点悬停进度，走完即停表（静止时零开销）"""
+        if self._hover_timer is None:
+            self._hover_timer = QTimer(self)
+            self._hover_timer.setInterval(self._MARK_FRAME_MS)
+            self._hover_timer.timeout.connect(self._tick_mark_anim)
+        if not self._hover_timer.isActive():
+            self._hover_timer.start()
+
+    def _tick_mark_anim(self):
+        target = 1.0 if self._hover_mark is not None else 0.0
+        delta = target - self._hover_mark_progress
+        if abs(delta) <= self._MARK_STEP:
+            self._hover_mark_progress = target
+            if self._hover_timer is not None:
+                self._hover_timer.stop()
+        else:
+            self._hover_mark_progress += (
+                self._MARK_STEP if delta > 0 else -self._MARK_STEP)
+        self.update()
 
     def _draw_snap_guides(self, painter, rect):
         """吸附激活时绘制蓝色虚线参考线，提示当前吸附目标"""
@@ -1836,6 +1920,8 @@ class ScreenshotWidget(QWidget):
             editor.set_font_size(self.capture_option_int(
                 'font_size', FONT_CHOICES[1], 8, 96))
             editor.on_state_changed = self._on_capture_state_changed
+            # 滚轮/选中图元改了线宽字号时同步工具条下拉
+            editor.on_style_changed = self._on_capture_style_changed
             self._capture_editor = editor
         else:
             # 重新框选：旧标注属于旧画面，全部丢弃
@@ -1876,6 +1962,24 @@ class ScreenshotWidget(QWidget):
     def _on_capture_state_changed(self, can_undo, can_redo):
         if self._capture_toolbar is not None:
             self._capture_toolbar.set_undo_state(can_undo, can_redo)
+
+    def _on_capture_style_changed(self, kind, value):
+        """线宽/字号变化：同步工具条下拉的选中项，并安排一次偏好落盘"""
+        toolbar = self._capture_toolbar
+        if toolbar is not None:
+            if kind == 'width':
+                toolbar.set_width(value)
+            else:
+                toolbar.set_font_size(value)
+        self._schedule_persist_pref()
+
+    def _schedule_persist_pref(self):
+        """滚轮连调时攒一下再写 ini，避免每拨一格都落一次盘"""
+        if self._pref_timer is None:
+            self._pref_timer = QTimer(self)
+            self._pref_timer.setSingleShot(True)
+            self._pref_timer.timeout.connect(self._persist_capture_pref)
+        self._pref_timer.start(500)
 
     def _persist_capture_pref(self):
         """把当前颜色/线宽/字号写回 [Capture]，下次截图保持一致"""
@@ -2520,6 +2624,7 @@ class ScreenshotWidget(QWidget):
         鼠标移动事件：编辑态画笔/草图优先，其次拖拽选区、结果态调整与悬停
         """
         self._cursor_pos = QPoint(event.pos())
+        self._update_mark_hover(event.pos())
         if self.capture_only and self._capture_edit \
                 and self._capture_editor is not None \
                 and self._capture_editor.mouse_move(event.pos()):
@@ -2541,6 +2646,22 @@ class ScreenshotWidget(QWidget):
                     self._hover_paragraph = index
                     self.update()
             self._update_result_cursor(event.pos())
+
+    def wheelEvent(self, event):
+        """
+        滚轮：截图编辑态调整线宽 / 字号
+
+        有选中图元时改该图元，没选中时改当前工具的默认值；其它状态滚轮无关，
+        交回默认处理。
+        """
+        if self.capture_only and self._capture_edit \
+                and self._capture_editor is not None:
+            delta = event.angleDelta().y()
+            if delta:
+                self._capture_editor.wheel(1 if delta > 0 else -1)
+            event.accept()
+            return
+        event.ignore()
 
     def mouseReleaseEvent(self, event):
         """
@@ -2868,6 +2989,8 @@ class ScreenshotWidget(QWidget):
         self._crop_pixmap = None
         self.full_screen = None
         self._stop_loading_spinner()
+        if self._capture_editor is not None:
+            self._capture_editor._stop_hover_anim()
         self._capture_editor = None
         self._capture_toolbar = None
         self.hide_scroll_banner()
@@ -2876,6 +2999,12 @@ class ScreenshotWidget(QWidget):
         if self._toast_timer is not None:
             self._toast_timer.stop()
             self._toast_timer = None
+        if self._hover_timer is not None:
+            self._hover_timer.stop()
+            self._hover_timer = None
+        if self._pref_timer is not None:
+            self._pref_timer.stop()
+            self._pref_timer = None
         super().closeEvent(event)
 
     def _finish_after_copy(self):

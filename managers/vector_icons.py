@@ -256,6 +256,18 @@ def _draw_pin(painter, color):
         QPointF(12.0, 14.2), QPointF(5.0, 9.4), QPointF(6.6, 4.0)]))
 
 
+def _draw_eraser(painter, color):
+    """橡皮擦图标：斜置的胶块 + 底边擦拭线"""
+    _stroke(painter, color)
+    painter.save()
+    painter.translate(12.0, 11.0)
+    painter.rotate(-35.0)
+    painter.drawRoundedRect(QRectF(-7.2, -4.4, 14.4, 8.8), 1.6, 1.6)
+    painter.drawLine(QPointF(-7.2, 0.6), QPointF(7.2, 0.6))
+    painter.restore()
+    painter.drawLine(QPointF(3.6, 20.4), QPointF(20.4, 20.4))
+
+
 _DRAWERS = {
     'text': _draw_text,
     'copy': _draw_copy,
@@ -278,4 +290,5 @@ _DRAWERS = {
     'ocr': _draw_ocr,
     'scroll': _draw_scroll,
     'pin': _draw_pin,
+    'eraser': _draw_eraser,
 }

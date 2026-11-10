@@ -10,8 +10,10 @@
 只发信号，不直接碰截图流程。
 """
 
-from PyQt5.QtCore import QSize, Qt, pyqtSignal
-from PyQt5.QtWidgets import (QComboBox, QHBoxLayout, QPushButton, QWidget)
+from PyQt5.QtCore import QRectF, QSize, Qt, pyqtSignal
+from PyQt5.QtGui import QColor, QIcon, QPainter, QPixmap
+from PyQt5.QtWidgets import (QColorDialog, QComboBox, QHBoxLayout, QPushButton,
+                             QWidget)
 
 from . import vector_icons
 from .capture_annotation import (
@@ -25,7 +27,45 @@ _TOOL_ICONS = {
 TOOLBAR_HEIGHT = 36
 _ICON_SIZE = 20
 _ICON_BUTTON_SIZE = QSize(28, 27)
-_COLOR_BUTTON_SIZE = QSize(19, 19)
+
+# 下拉定宽：固定成 _COMBO_CHARS 个汉字，_COMBO_CHROME 是内边距 + 边框 + 箭头
+_COMBO_CHARS = 2
+# 28 是实测的边框+内边距+箭头；多留 2px，样式生效后字体度量会略涨
+_COMBO_CHROME = 30
+_COLOR_COMBO_WIDTH = 46
+_CUSTOM_COLOR_LABEL = '自定义…'
+_SWATCH_CACHE = {}
+
+
+def _fixed_combo_width(combo, chars=_COMBO_CHARS):
+    """
+    把下拉宽度固定成 chars 个汉字的长度
+
+    标签本身（如「18 px」）比两个汉字还宽时以不裁切为准，否则文本会被截掉。
+    这里按字体度量自己算最宽的条目，不用 sizeHint：样式还没生效时它给的值偏小。
+    """
+    metrics = combo.fontMetrics()
+    widest = max((metrics.horizontalAdvance(combo.itemText(i))
+                  for i in range(combo.count())), default=0)
+    return max(metrics.horizontalAdvance('简') * chars, widest) + _COMBO_CHROME
+
+
+def _swatch_icon(hex_color):
+    """颜色下拉里的小色块（带浅色描边，深色背景上才看得出边界）"""
+    cached = _SWATCH_CACHE.get(hex_color)
+    if cached is not None:
+        return cached
+    pixmap = QPixmap(14, 14)
+    pixmap.fill(Qt.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.Antialiasing, True)
+    painter.setPen(QColor(255, 255, 255, 90))
+    painter.setBrush(QColor(hex_color))
+    painter.drawRoundedRect(QRectF(1.0, 1.0, 12.0, 12.0), 3.0, 3.0)
+    painter.end()
+    icon = QIcon(pixmap)
+    _SWATCH_CACHE[hex_color] = icon
+    return icon
 
 _QSS = """
 QWidget#CaptureToolbar {
@@ -45,12 +85,6 @@ QPushButton[iconAction="true"] { padding: 2px 4px; }
 QPushButton:hover { background-color: #2d2f33; }
 QPushButton:pressed { background-color: #3c3f44; }
 QPushButton:checked { background-color: #3b82f6; color: #ffffff; }
-QPushButton[colorSwatch="true"] {
-    border: 2px solid transparent;
-    border-radius: 4px;
-    padding: 0px;
-}
-QPushButton[colorSwatch="true"]:checked { border-color: #ffffff; }
 QComboBox {
     background-color: #262d3b;
     border: 1px solid #3a3d42;
@@ -97,8 +131,8 @@ class CaptureToolbar(QWidget):
         self.setFocusPolicy(Qt.NoFocus)
 
         self._tool_buttons = {}
-        self._color_buttons = {}
         self._trimmable = []
+        self._current_color = color
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(6, 3, 6, 3)
@@ -114,37 +148,29 @@ class CaptureToolbar(QWidget):
             layout.addWidget(button)
         layout.addSpacing(5)
 
-        # 2) 属性组：色块 + 吸管
+        # 2) 属性组：颜色下拉 + 吸管
         self.eyedropper_button = self._icon_button(
             'eyedropper', '吸取屏幕颜色', checkable=True)
         self.eyedropper_button.clicked.connect(
             lambda _checked=False: self.eyedropper_clicked.emit())
         layout.addWidget(self.eyedropper_button)
-        for hex_color in PRESET_COLORS:
-            swatch = QPushButton(self)
-            swatch.setFixedSize(_COLOR_BUTTON_SIZE)
-            swatch.setCheckable(True)
-            swatch.setFocusPolicy(Qt.NoFocus)
-            swatch.setCursor(Qt.PointingHandCursor)
-            swatch.setToolTip(hex_color)
-            swatch.setAccessibleName(f'颜色 {hex_color}')
-            swatch.setProperty('colorSwatch', True)
-            swatch.setStyleSheet(
-                f'QPushButton {{ background-color: {hex_color}; }}')
-            swatch.clicked.connect(
-                lambda _checked=False, c=hex_color: self.color_changed.emit(c))
-            self._color_buttons[hex_color] = swatch
-            layout.addWidget(swatch)
+
+        self.color_combo = self._color_combo()
+        layout.addWidget(self.color_combo)
         layout.addSpacing(5)
 
         self.width_combo = self._combo(
             [f'{w} px' for w in WIDTH_CHOICES], WIDTH_CHOICES, width,
             '线宽', self.width_changed)
-        layout.addWidget(self.width_combo)
         self.font_combo = self._combo(
             [f'{s} px' for s in FONT_CHOICES], FONT_CHOICES, font_size,
             '字号', self.font_size_changed)
-        layout.addWidget(self.font_combo)
+        # 两个下拉取同一宽度（最宽的那个决定），看上去才是齐的
+        combo_width = max(_fixed_combo_width(self.width_combo),
+                          _fixed_combo_width(self.font_combo))
+        for combo in (self.width_combo, self.font_combo):
+            combo.setFixedWidth(combo_width)
+            layout.addWidget(combo)
         layout.addSpacing(5)
 
         # 3) 编辑操作
@@ -187,8 +213,9 @@ class CaptureToolbar(QWidget):
             self.font_combo,
             self.scroll_button,
             self.ocr_button,
-            *[self._color_buttons[c] for c in PRESET_COLORS[4:]],
             self.width_combo,
+            self.color_combo,
+            self._tool_buttons['eraser'],
             self._tool_buttons['mosaic'],
             self._tool_buttons['step'],
             self._tool_buttons['text'],
@@ -233,6 +260,35 @@ class CaptureToolbar(QWidget):
             lambda _i, c=combo, s=signal: s.emit(c.currentData()))
         return combo
 
+    def _color_combo(self):
+        """颜色下拉：8 个预设色块 + 自定义颜色（QColorDialog）"""
+        combo = QComboBox(self)
+        combo.setFocusPolicy(Qt.NoFocus)
+        combo.setCursor(Qt.PointingHandCursor)
+        combo.setIconSize(QSize(14, 14))
+        combo.setFixedWidth(_COLOR_COMBO_WIDTH)
+        for hex_color in PRESET_COLORS:
+            combo.addItem(_swatch_icon(hex_color), '', hex_color)
+            combo.setItemData(combo.count() - 1, hex_color, Qt.ToolTipRole)
+        combo.addItem(_CUSTOM_COLOR_LABEL)
+        # activated 只在用户交互时发，程序里 set_color 不会弹出对话框
+        combo.activated.connect(self._on_color_activated)
+        return combo
+
+    def _on_color_activated(self, index):
+        """选中预设色直接生效；「自定义…」弹取色对话框"""
+        data = self.color_combo.itemData(index)
+        if data:
+            self.color_changed.emit(data)
+            return
+        previous = self._current_color
+        picked = QColorDialog.getColor(QColor(previous), self, '选择标注颜色')
+        if picked.isValid():
+            self.color_changed.emit(picked.name())
+        else:
+            # 取消：退回原来选中的颜色，别停在「自定义…」上
+            self.set_color(previous)
+
     # ---- 状态同步 ----
 
     def set_tool(self, key):
@@ -250,8 +306,37 @@ class CaptureToolbar(QWidget):
         self.eyedropper_button.setChecked(bool(active))
 
     def set_color(self, hex_color):
-        for value, button in self._color_buttons.items():
-            button.setChecked(value == hex_color)
+        """同步颜色下拉；自定义色会作为新条目插到「自定义…」之前"""
+        self._current_color = hex_color
+        if self.color_combo is None:
+            return
+        combo = self.color_combo
+        index = combo.findData(hex_color)
+        combo.blockSignals(True)
+        if index < 0:
+            index = max(0, combo.count() - 1)
+            combo.insertItem(index, _swatch_icon(hex_color), '', hex_color)
+            combo.setItemData(index, hex_color, Qt.ToolTipRole)
+        combo.setCurrentIndex(index)
+        combo.blockSignals(False)
+        combo.setToolTip(f'标注颜色 {hex_color}')
+
+    def set_width(self, width):
+        """外部（滚轮/选中图元）改了线宽：只同步选中项，不回头发信号"""
+        self._select_combo_value(self.width_combo, width)
+
+    def set_font_size(self, size):
+        """外部（滚轮/选中图元）改了字号：只同步选中项，不回头发信号"""
+        self._select_combo_value(self.font_combo, size)
+
+    @staticmethod
+    def _select_combo_value(combo, value):
+        index = combo.findData(value)
+        if index < 0:
+            return
+        combo.blockSignals(True)
+        combo.setCurrentIndex(index)
+        combo.blockSignals(False)
 
     def set_undo_state(self, can_undo, can_redo):
         self.undo_button.setEnabled(bool(can_undo))
