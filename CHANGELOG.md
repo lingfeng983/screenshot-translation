@@ -2,6 +2,23 @@
 
 所有显著改动记录于此。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [v1.12.0] — 2026-11-11
+
+### 变更
+- **更新改成一键完成**：检查到新版本后确认「立即更新」，程序自己下载安装包（进度框
+  显示已下载/总大小，可取消）→ 校验大小、MZ 头与 GitHub 附件的 sha256 摘要 →
+  静默启动安装程序并退出本体 → Setup 装完自动把程序重新打开。不再给发布页地址让
+  用户手动下载；发行版没挂安装包时直接提示"暂无可下载的安装包"
+  （`managers/update_installer.py`、`managers/update_checker.py`、`main.py`、
+  `scripts/setup.iss`）
+
+### 修复
+- **证书链差异下自动更新必然失败**：requests 自带 certifi 证书库，企业代理或系统
+  根证书不同时报 `CERTIFICATE_VERIFY_FAILED`（本机实测 github.com 下载直链就走不通，
+  而 api.github.com 正常）。下载改为失败后改用 urllib 走 Windows 系统信任库重试，
+  两条路都失败才报错，不做 `verify=False` 这种跳过校验的兜底
+  （`managers/update_installer.py`）
+
 ## [v1.11.1] — 2026-11-11
 
 ### 修复

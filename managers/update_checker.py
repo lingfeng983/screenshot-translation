@@ -3,8 +3,8 @@
 """
 更新检查
 
-向 GitHub Releases 取最新正式版标签，与本地版本比较；只负责"有没有新版"，
-下载、安装仍交给用户通过发布页完成。
+向 GitHub Releases 取最新正式版标签，与本地版本比较，并把发行版里的安装包
+附件（名称、大小、下载地址）一并带出来——下载与安装见 update_installer。
 """
 
 import logging
@@ -24,19 +24,51 @@ _VERSION_RE = re.compile(r'(\d+(?:\.\d+)*)')
 class ReleaseInfo:
     """一条最新发行版的精简信息"""
 
-    def __init__(self, version, url='', notes=''):
+    def __init__(self, version, url='', notes='', asset_url='',
+                 asset_name='', asset_size=0, asset_digest=''):
         """
         Args:
             version (str): 去掉 v 前缀的版本号，如 '1.9.0'
             url (str): 发布页地址
             notes (str): 发行说明（Markdown 原文）
+            asset_url (str): 安装包直链；发行版没挂 exe 时为空
+            asset_name (str): 安装包文件名
+            asset_size (int): 安装包字节数；未知为 0
+            asset_digest (str): 附件摘要，形如 'sha256:...'；未知为空
         """
         self.version = version
         self.url = url or RELEASE_PAGE
         self.notes = notes or ''
+        self.asset_url = asset_url or ''
+        self.asset_name = asset_name or ''
+        self.asset_size = int(asset_size or 0)
+        self.asset_digest = asset_digest or ''
 
     def __repr__(self):
         return f"ReleaseInfo(version={self.version!r})"
+
+
+def pick_installer_asset(assets):
+    """
+    从发行版附件里挑安装包
+
+    优先名字带 setup 的 exe（本项目产物固定是 ScreenshotTranslator-Setup.exe），
+    没有时退回第一个 exe；一个 exe 都没有则返回 None（该版本无法自动更新）。
+
+    Args:
+        assets (list): GitHub API 的 assets 数组
+
+    Returns:
+        dict 或 None: 选中的附件条目
+    """
+    exe_assets = [asset for asset in assets or []
+                  if str(asset.get('name') or '').lower().endswith('.exe')]
+    if not exe_assets:
+        return None
+    for asset in exe_assets:
+        if 'setup' in str(asset.get('name') or '').lower():
+            return asset
+    return exe_assets[0]
 
 
 def parse_version(value):
@@ -107,10 +139,15 @@ def fetch_latest_release(timeout=(3, 6)):
     version = tag[1:] if tag[:1] in ('v', 'V') else tag
     if not parse_version(version):
         raise ValueError(f"发行版标签无法解析: {tag!r}")
+    asset = pick_installer_asset(payload.get('assets')) or {}
     return ReleaseInfo(
         version=version,
         url=payload.get('html_url') or RELEASE_PAGE,
-        notes=payload.get('body') or '')
+        notes=payload.get('body') or '',
+        asset_url=asset.get('browser_download_url') or '',
+        asset_name=asset.get('name') or '',
+        asset_size=asset.get('size') or 0,
+        asset_digest=asset.get('digest') or '')
 
 
 def check_for_update(current=None):

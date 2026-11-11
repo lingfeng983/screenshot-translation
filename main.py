@@ -9,7 +9,6 @@ import logging
 import os
 import sys
 import threading
-import webbrowser
 
 # ONNX Runtime 必须先于 PyQt5 导入：在本机组合（Python 3.14 + PyQt5 5.15.10 +
 # onnxruntime 1.31）上，先加载 QtCore 再导入 onnxruntime 会在模块初始化阶段
@@ -26,12 +25,13 @@ from PyQt5.QtCore import QEvent, Qt, QTimer
 from PyQt5.QtWidgets import (
     QApplication, QDialog, QVBoxLayout, QLineEdit, QPushButton,
     QComboBox, QCheckBox, QGroupBox, QFormLayout, QMessageBox,
-    QHBoxLayout, QLabel, QScrollArea, QFrame, QWidget
+    QHBoxLayout, QLabel, QScrollArea, QFrame, QWidget, QProgressDialog
 )
 
 # 配置日志（全局唯一入口，其他模块只使用 logging.getLogger）
 # 日志路径按运行形态定位：源码→项目根，exe→~/.screenshot-translation（可写）
-from managers import app_paths, autostart, result_render, single_instance, styles, update_checker
+from managers import (app_paths, autostart, result_render, single_instance,
+                      styles, update_checker, update_installer)
 from managers.hotkey_native import parse_hotkey
 from managers.provider_common import redact_url_query
 
@@ -193,6 +193,11 @@ class MainApp:
         self._update_checking = False
         self._interactive_update_pending = False
         self._update_timer = None
+        # 更新下载状态：同一时间只下一个包，取消靠 threading.Event
+        self._update_downloading = False
+        self._update_cancel = None
+        self._update_dialog = None
+        self._update_info = None
 
 
 
@@ -447,48 +452,172 @@ class MainApp:
 
         logger.info(f"发现新版本 v{info.version}（当前 v{current}）")
         if interactive:
-            if self._prompt_open_release_page(info):
-                self._open_release_page(info.url)
+            if not info.asset_url:
+                # 先确认有没有东西可下，别让用户点了「立即更新」再被告知下不了
+                QMessageBox.information(
+                    None, "检查更新",
+                    f"发现新版本 v{info.version}，但这个版本还没有可下载的安装包，"
+                    f"请稍后再检查。")
+                return
+            if self._prompt_install_update(info):
+                self._start_update_download(info)
             return
 
         # 自动检查：同一个版本只推一次，避免每次开机都弹同一条通知；
-        # 想再次查看可随时从托盘菜单手动检查
+        # 想马上更新可从托盘菜单手动检查（确认后由程序自己下载安装）
+        if not info.asset_url:
+            logger.warning(f"v{info.version} 没有安装包附件，本次不推送更新提醒")
+            return
         if self.config_manager.get_last_notified_version() == info.version:
             logger.debug(f"新版本 v{info.version} 已提醒过，本次不重复推送")
             return
         if self.tray_manager:
             self.tray_manager.show_notification(
                 f"发现新版本 v{info.version}",
-                f"当前 v{current}，右键托盘图标选择「检查更新」查看")
+                f"当前 v{current}，右键托盘图标选择「检查更新」即可直接更新")
         self.config_manager.set_last_notified_version(info.version)
 
-    def _prompt_open_release_page(self, info):
+    def _prompt_install_update(self, info):
         """
-        询问是否打开发布页
+        询问是否现在更新
 
         Args:
             info (update_checker.ReleaseInfo): 新版本信息
 
         Returns:
-            bool: 用户选择打开发布页时为 True
+            bool: 用户选择立即更新时为 True
         """
         box = QMessageBox()
         box.setWindowTitle("检查更新")
         box.setIcon(QMessageBox.Information)
         box.setText(f"发现新版本 v{info.version}（当前 v{update_checker.current_version()}）。")
-        box.setInformativeText("是否打开发布页面下载？")
-        open_button = box.addButton("打开发布页", QMessageBox.AcceptRole)
+        box.setInformativeText("现在更新？程序会自动下载并安装，完成后自动重新打开。")
+        install_button = box.addButton("立即更新", QMessageBox.AcceptRole)
         box.addButton("稍后", QMessageBox.RejectRole)
         box.exec_()
-        return box.clickedButton() is open_button
+        return box.clickedButton() is install_button
 
-    @staticmethod
-    def _open_release_page(url):
-        """用系统浏览器打开发布页（失败只记日志，不影响程序）"""
+    # ---- 更新下载 / 安装 ----
+
+    def _start_update_download(self, info):
+        """
+        开始下载安装包（下载与安装都在程序内完成，不跳发布页）
+
+        Args:
+            info (update_checker.ReleaseInfo): 新版本信息
+        """
+        if self._update_downloading:
+            return
+        if not info.asset_url:
+            QMessageBox.warning(
+                None, "更新",
+                f"v{info.version} 没有可下载的安装包，请稍后再试。")
+            return
+
+        self._update_downloading = True
+        self._update_info = info
+        self._update_cancel = threading.Event()
+
+        dialog = QProgressDialog(f"正在下载 v{info.version}…", "取消", 0, 100)
+        dialog.setWindowTitle("更新")
+        dialog.setWindowModality(Qt.ApplicationModal)
+        dialog.setMinimumDuration(0)
+        # 标签文字随进度变长（版本号 + 已下载/总大小），给足宽度免得被裁
+        dialog.setMinimumWidth(340)
+        dialog.setAutoClose(False)
+        dialog.setAutoReset(False)
+        dialog.setValue(0)
+        dialog.canceled.connect(self._cancel_update_download)
+        self._update_dialog = dialog
+        dialog.show()
+
+        submitted = thread_pool_manager.submit(self._update_download_worker, info)
+        if submitted is None:
+            self._finish_update_download()
+            QMessageBox.warning(None, "更新", "后台任务无法启动，请稍后重试。")
+
+    def _update_download_worker(self, info):
+        """池线程：下载安装包，进度与结果都回主线程处理"""
+        path = ''
+        error = ''
         try:
-            webbrowser.open(url or update_checker.RELEASE_PAGE)
+            path = update_installer.download(
+                info,
+                progress=lambda done, total: qt_dispatcher.dispatch_to_main_thread(
+                    self._update_download_progress, done, total),
+                cancel=self._update_cancel)
+        except update_installer.UpdateCancelled:
+            logger.info("用户取消了更新下载")
         except Exception as e:
-            logger.warning(f"打开发布页失败: {e}")
+            error = str(e) or e.__class__.__name__
+            logger.warning(f"下载更新失败: {error}")
+        qt_dispatcher.dispatch_to_main_thread(self._update_download_done, path, error)
+
+    def _update_download_progress(self, done, total):
+        """主线程：把下载进度反映到进度框上"""
+        dialog = self._update_dialog
+        if dialog is None:
+            return
+        version = getattr(self._update_info, 'version', '')
+        if total:
+            dialog.setRange(0, 100)
+            dialog.setValue(min(100, int(done * 100 / total)))
+            dialog.setLabelText(
+                f"正在下载 v{version}… "
+                f"{done / 1048576:.1f}/{total / 1048576:.1f} MB")
+        else:
+            # 对方没给 Content-Length：用不确定进度条，别显示假百分比
+            dialog.setRange(0, 0)
+            dialog.setLabelText(f"正在下载 v{version}…")
+
+    def _cancel_update_download(self):
+        """用户点了取消：置位标志，worker 在下个数据块处退出"""
+        if not self._update_downloading:
+            # 进度框收起时 Qt 也会把 canceled 发一遍，别把已经装完的流程打回去
+            return
+        if self._update_cancel is not None:
+            self._update_cancel.set()
+        if self._update_dialog is not None:
+            self._update_dialog.setLabelText("正在取消…")
+
+    def _update_download_done(self, path, error):
+        """主线程：下载结束——失败提示，取消则静默，成功就装"""
+        self._finish_update_download()
+        if error:
+            QMessageBox.warning(
+                None, "更新",
+                f"下载更新失败：{error}\n请检查网络连接后重试。")
+            return
+        if not path:
+            return
+        self._install_update(path)
+
+    def _install_update(self, path):
+        """
+        启动安装程序并退出本体，让 Setup 覆盖正在运行的文件
+
+        Args:
+            path (str): 已下载的安装包路径
+        """
+        try:
+            update_installer.launch(path)
+        except Exception as e:
+            logger.error(f"启动安装程序失败: {e}")
+            QMessageBox.warning(None, "更新", f"启动安装程序失败：{e}")
+            return
+        logger.info("安装程序已启动，退出本体以便覆盖文件")
+        # 留一点时间让安装程序起来并接管文件，再把本体退掉
+        QTimer.singleShot(800, self.quit)
+
+    def _finish_update_download(self):
+        """收起进度框并复位下载状态（幂等）"""
+        self._update_downloading = False
+        self._update_cancel = None
+        self._update_info = None
+        dialog, self._update_dialog = self._update_dialog, None
+        if dialog is not None:
+            dialog.close()
+            dialog.deleteLater()
 
     def _handle_startup_behavior(self):
         """根据配置决定启动后是否直接打开配置窗口"""
