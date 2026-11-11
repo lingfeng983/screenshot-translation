@@ -510,33 +510,62 @@ def test_capture_toolbar_signals_and_fit(qapp):
 
 
 def test_toolbar_combos_fixed_width_and_color_dropdown(qapp):
-    """线宽/字号下拉定宽：两个同宽、约 2 个汉字且不裁字；颜色是带色块的下拉"""
+    """线宽/字号下拉：两个同宽且贴合内容；颜色是带色块的下拉"""
     toolbar = CaptureToolbar(None)
-    han = toolbar.width_combo.fontMetrics().horizontalAdvance('简') * 2
-    for combo in (toolbar.width_combo, toolbar.font_combo):
-        assert combo.width() == toolbar.width_combo.width(), '两个下拉宽度不一致'
-        assert combo.width() >= han, '下拉没有 2 个汉字宽'
-        assert combo.width() <= han + 40, '下拉过宽，不再紧凑'
-        assert combo.sizeHint().width() <= combo.width(), '下拉文本被裁切'
+    combos = (toolbar.width_combo, toolbar.font_combo)
+    widest = max(combo.fontMetrics().horizontalAdvance(combo.itemText(i))
+                 for combo in combos for i in range(combo.count()))
+    for combo in combos:
+        # 宽度按内容实测，布局取的是 sizeHint（不显示也有值）
+        assert combo.sizeHint().width() == combos[0].sizeHint().width(), '两个下拉宽度不一致'
+        text = max(combo.fontMetrics().horizontalAdvance(combo.itemText(i))
+                   for i in range(combo.count()))
+        assert combo.sizeHint().width() > text, '下拉放不下自己的文本'
+        assert combo.sizeHint().width() <= widest + 30, '下拉留白过多，不再紧凑'
+        # 全局浅色样式给 QComboBox 留了 120px 最小宽度，工具条里必须收紧
+        assert combo.sizeHint().width() < 90, '被全局最小宽度撑开了'
 
     combo = toolbar.color_combo
     texts = [combo.itemText(i) for i in range(combo.count())]
     assert texts[-1].startswith('自定义'), '缺少自定义颜色项'
     assert not combo.itemIcon(0).isNull(), '预设色缺少色块图标'
+    # 收起时只显示色块：宽度按色块算，不按「自定义…」的文本算
+    swatch = combo.iconSize().width()
+    assert swatch < combo.sizeHint().width() <= swatch + 30, '颜色下拉没有贴合色块'
     # 自定义色作为新条目插入并选中
     toolbar.set_color('#123456')
     assert combo.currentData() == '#123456'
     assert combo.currentIndex() < combo.count() - 1, '自定义颜色插到了末尾'
 
 
+def test_small_combo_ignores_global_min_width(qapp):
+    """全局浅色样式给 QComboBox 留了 120px 最小宽度，工具条下拉不能被它撑开"""
+    from managers import styles
+    from managers.toolbar_combo import SmallComboBox
+    previous = qapp.styleSheet()
+    qapp.setStyleSheet(styles.style_sheet())
+    try:
+        toolbar = CaptureToolbar(None)
+        assert isinstance(toolbar.width_combo, SmallComboBox)
+        assert toolbar.width_combo.sizeHint().width() < 90, '被全局最小宽度撑开了'
+        assert toolbar.color_combo.sizeHint().width() < 60, '色块下拉被全局最小宽度撑开了'
+    finally:
+        qapp.setStyleSheet(previous)
+
+
 def test_overlay_toolbar_language_combo_fixed_width(qapp):
     from managers.overlay_toolbar import OverlayToolbar
     toolbar = OverlayToolbar(None, [('zh', '简体中文'), ('en', '英语')])
     combo = toolbar.lang_combo
-    expect = combo.fontMetrics().horizontalAdvance('简') * 2 + 28
-    assert combo.width() == expect
-    # 收起宽度固定，但弹出列表要放得下完整语言名
-    assert combo.view().minimumWidth() >= expect
+    widest = max(combo.fontMetrics().horizontalAdvance(combo.itemText(i))
+                 for i in range(combo.count()))
+    hint = combo.sizeHint().width()
+    # 刚好放得下语言名：不裁字，也不多留一个汉字的空白
+    assert hint > widest, '下拉放不下语言名'
+    assert hint <= widest + 30, '下拉留白过多，不再紧凑'
+    assert hint < 90, '被全局 120px 最小宽度撑开了'
+    # 收起宽度收紧，但弹出列表要放得下完整语言名
+    assert combo.view().minimumWidth() >= combo.fontMetrics().horizontalAdvance('简体中文')
     assert combo.toolTip(), '定宽后需要 tooltip 补偿显示'
 
 

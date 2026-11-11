@@ -12,12 +12,12 @@
 
 from PyQt5.QtCore import QRectF, QSize, Qt, pyqtSignal
 from PyQt5.QtGui import QColor, QIcon, QPainter, QPixmap
-from PyQt5.QtWidgets import (QColorDialog, QComboBox, QHBoxLayout, QPushButton,
-                             QWidget)
+from PyQt5.QtWidgets import (QColorDialog, QHBoxLayout, QPushButton, QWidget)
 
 from . import vector_icons
 from .capture_annotation import (
     FONT_CHOICES, PRESET_COLORS, TOOLS, TOOL_LABELS, WIDTH_CHOICES)
+from .toolbar_combo import SmallComboBox, chrome_width, content_width
 
 # 工具键 → 图标名（文字标注用 T 图标，避免与「提取文本」的文档图标混淆）
 _TOOL_ICONS = {
@@ -28,26 +28,10 @@ TOOLBAR_HEIGHT = 36
 _ICON_SIZE = 20
 _ICON_BUTTON_SIZE = QSize(28, 27)
 
-# 下拉定宽：固定成 _COMBO_CHARS 个汉字，_COMBO_CHROME 是内边距 + 边框 + 箭头
-_COMBO_CHARS = 2
-# 28 是实测的边框+内边距+箭头；多留 2px，样式生效后字体度量会略涨
-_COMBO_CHROME = 30
-_COLOR_COMBO_WIDTH = 46
+# 下拉宽度按内容实测（见 toolbar_combo）：边框/内边距/箭头不再写死常量
+_COLOR_SWATCH_SIZE = 14
 _CUSTOM_COLOR_LABEL = '自定义…'
 _SWATCH_CACHE = {}
-
-
-def _fixed_combo_width(combo, chars=_COMBO_CHARS):
-    """
-    把下拉宽度固定成 chars 个汉字的长度
-
-    标签本身（如「18 px」）比两个汉字还宽时以不裁切为准，否则文本会被截掉。
-    这里按字体度量自己算最宽的条目，不用 sizeHint：样式还没生效时它给的值偏小。
-    """
-    metrics = combo.fontMetrics()
-    widest = max((metrics.horizontalAdvance(combo.itemText(i))
-                  for i in range(combo.count())), default=0)
-    return max(metrics.horizontalAdvance('简') * chars, widest) + _COMBO_CHROME
 
 
 def _swatch_icon(hex_color):
@@ -55,13 +39,15 @@ def _swatch_icon(hex_color):
     cached = _SWATCH_CACHE.get(hex_color)
     if cached is not None:
         return cached
-    pixmap = QPixmap(14, 14)
+    pixmap = QPixmap(_COLOR_SWATCH_SIZE, _COLOR_SWATCH_SIZE)
     pixmap.fill(Qt.transparent)
     painter = QPainter(pixmap)
     painter.setRenderHint(QPainter.Antialiasing, True)
     painter.setPen(QColor(255, 255, 255, 90))
     painter.setBrush(QColor(hex_color))
-    painter.drawRoundedRect(QRectF(1.0, 1.0, 12.0, 12.0), 3.0, 3.0)
+    painter.drawRoundedRect(
+        QRectF(1.0, 1.0, _COLOR_SWATCH_SIZE - 2.0, _COLOR_SWATCH_SIZE - 2.0),
+        3.0, 3.0)
     painter.end()
     icon = QIcon(pixmap)
     _SWATCH_CACHE[hex_color] = icon
@@ -92,7 +78,13 @@ QComboBox {
     padding: 2px 4px;
     color: #e8e8e8;
     font-size: 12px;
+    /* 全局浅色样式给 QComboBox 留了 120px 最小宽度，浮层工具条要按内容收紧 */
+    min-width: 0px;
 }
+/* 箭头区收窄：默认/全局样式的 22px 会在小下拉里白占一大块；
+   箭头本身由 SmallComboBox 自绘，QSS 这里把样式表的箭头彻底关掉 */
+QComboBox::drop-down { border: none; width: 12px; }
+QComboBox::down-arrow { image: none; border: none; width: 0px; height: 0px; }
 QComboBox QAbstractItemView {
     background-color: #1e2430;
     border: 1px solid #333d4f;
@@ -165,11 +157,12 @@ class CaptureToolbar(QWidget):
         self.font_combo = self._combo(
             [f'{s} px' for s in FONT_CHOICES], FONT_CHOICES, font_size,
             '字号', self.font_size_changed)
-        # 两个下拉取同一宽度（最宽的那个决定），看上去才是齐的
-        combo_width = max(_fixed_combo_width(self.width_combo),
-                          _fixed_combo_width(self.font_combo))
+        # 两个下拉收起后显示的都是「4 px」「18 px」，取同一宽度（最宽的那个决定）
+        # 看上去才是齐的；宽度按内容实测，刚好放得下，不多留空
+        combo_width = max(content_width(self.width_combo) + chrome_width(self.width_combo),
+                          content_width(self.font_combo) + chrome_width(self.font_combo))
         for combo in (self.width_combo, self.font_combo):
-            combo.setFixedWidth(combo_width)
+            combo.set_fit_width(combo_width)
             layout.addWidget(combo)
         layout.addSpacing(5)
 
@@ -248,7 +241,7 @@ class CaptureToolbar(QWidget):
         return button
 
     def _combo(self, labels, values, current, tooltip, signal):
-        combo = QComboBox()
+        combo = SmallComboBox(self)
         combo.setFocusPolicy(Qt.NoFocus)
         combo.setToolTip(tooltip)
         for label, value in zip(labels, values):
@@ -262,15 +255,18 @@ class CaptureToolbar(QWidget):
 
     def _color_combo(self):
         """颜色下拉：8 个预设色块 + 自定义颜色（QColorDialog）"""
-        combo = QComboBox(self)
+        combo = SmallComboBox(self)
         combo.setFocusPolicy(Qt.NoFocus)
         combo.setCursor(Qt.PointingHandCursor)
-        combo.setIconSize(QSize(14, 14))
-        combo.setFixedWidth(_COLOR_COMBO_WIDTH)
+        combo.setIconSize(QSize(_COLOR_SWATCH_SIZE, _COLOR_SWATCH_SIZE))
         for hex_color in PRESET_COLORS:
             combo.addItem(_swatch_icon(hex_color), '', hex_color)
             combo.setItemData(combo.count() - 1, hex_color, Qt.ToolTipRole)
         combo.addItem(_CUSTOM_COLOR_LABEL)
+        # 收起时只显示一个色块：宽度 = 色块 + 边框/内边距/箭头，
+        # 不按「自定义…」的文本宽度撑开；弹出列表单独放宽到放得下文字
+        combo.fit_content(_COLOR_SWATCH_SIZE)
+        combo.view().setMinimumWidth(content_width(combo) + chrome_width(combo))
         # activated 只在用户交互时发，程序里 set_color 不会弹出对话框
         combo.activated.connect(self._on_color_activated)
         return combo

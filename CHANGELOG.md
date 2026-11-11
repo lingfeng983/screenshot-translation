@@ -2,6 +2,18 @@
 
 所有显著改动记录于此。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [v1.11.1] — 2026-11-11
+
+### 修复
+- **工具条下拉被全局样式撑宽**：全局浅色样式给 `QComboBox` 留了 `min-width: 120px`
+  和 22px 的箭头区，浮层工具条里的目标语言/线宽/字号/颜色下拉跟着变成 130px 上下，
+  比文字宽出一大截。现在工具条自己声明 `min-width: 0px` 并把箭头区收到 12px，宽度
+  按字体度量实测（内容宽度 + 边框/内边距/箭头的实测占位）刚好放得下「中文」「4 px」
+  与色块；箭头改为自绘细 V 形（QSS 用 border 拼三角在 Qt 里只会画成小方块）。颜色
+  下拉按色块定宽，弹出列表单独放宽到放得下「自定义…」
+  （`managers/toolbar_combo.py`、`managers/capture_toolbar.py`、
+  `managers/overlay_toolbar.py`）
+
 ## [v1.11.0] — 2026-11-10
 
 ### 新增

@@ -11,24 +11,16 @@ vector_icons 程序化绘制，右下角"原/译"徽标区分同一动作的两�
 """
 
 from PyQt5.QtCore import QSize, Qt, pyqtSignal
-from PyQt5.QtWidgets import QComboBox, QPushButton, QWidget, QHBoxLayout
+from PyQt5.QtWidgets import QPushButton, QWidget, QHBoxLayout
 
 from . import result_render, vector_icons
+from .toolbar_combo import SmallComboBox, chrome_width, content_width
 
 # 高度固定，宽度由内容决定；越宽时按 _TRIM_ORDER 逐级精简
 TOOLBAR_HEIGHT = 34
 
 _ICON_SIZE = 20
 _ICON_BUTTON_SIZE = QSize(28, 26)
-
-# 语言下拉定宽：收起时只占 _LANG_COMBO_CHARS 个汉字，完整语言名放进弹出列表
-_LANG_COMBO_CHARS = 2
-_COMBO_CHROME = 28
-
-
-def _fixed_combo_width(combo, chars=_LANG_COMBO_CHARS):
-    """把下拉宽度固定成 chars 个汉字的长度"""
-    return combo.fontMetrics().horizontalAdvance('简') * chars + _COMBO_CHROME
 
 _TOOLBAR_QSS = """
 QWidget#OverlayToolbar {
@@ -52,10 +44,16 @@ QComboBox {
     background-color: #262d3b;
     border: 1px solid #3a3d42;
     border-radius: 6px;
-    padding: 2px 6px;
+    padding: 2px 4px;
     color: #e8e8e8;
     font-size: 12px;
+    /* 全局浅色样式给 QComboBox 留了 120px 最小宽度，浮层工具条要按内容收紧 */
+    min-width: 0px;
 }
+/* 箭头区收窄，否则小下拉里一半宽度都给了箭头；
+   箭头本身由 SmallComboBox 自绘，QSS 这里把样式表的箭头彻底关掉 */
+QComboBox::drop-down { border: none; width: 12px; }
+QComboBox::down-arrow { image: none; border: none; width: 0px; height: 0px; }
 QComboBox QAbstractItemView {
     background-color: #1e2430;
     border: 1px solid #333d4f;
@@ -120,7 +118,7 @@ class OverlayToolbar(QWidget):
 
             layout.addSpacing(6)
 
-            self.lang_combo = QComboBox()
+            self.lang_combo = SmallComboBox(self)
             self.lang_combo.setFocusPolicy(Qt.NoFocus)
             for code, name in languages:
                 self.lang_combo.addItem(name if name else code, code)
@@ -128,12 +126,18 @@ class OverlayToolbar(QWidget):
                 index = self.lang_combo.findData(current_lang)
                 if index >= 0:
                     self.lang_combo.setCurrentIndex(index)
-            # 收起时宽度固定成 2 个汉字；弹出列表仍按最长语言名展开
-            self.lang_combo.setFixedWidth(_fixed_combo_width(self.lang_combo))
+            # 收起时按语言名的实际宽度定宽（刚好放得下，不裁字）；
+            # 完整语言名仍放进弹出列表。语言表为空时退回 2 个汉字的宽度，
+            # 免得留一个极窄的空下拉
+            lang_chrome = chrome_width(self.lang_combo)
+            lang_content = content_width(self.lang_combo) or (
+                self.lang_combo.fontMetrics().horizontalAdvance('简') * 2)
+            self.lang_combo.set_fit_width(lang_content + lang_chrome)
             longest = max((name or code for code, name in languages),
                           key=len, default='')
             self.lang_combo.view().setMinimumWidth(
-                self.lang_combo.fontMetrics().horizontalAdvance(longest) + 28)
+                self.lang_combo.fontMetrics().horizontalAdvance(longest)
+                + lang_chrome)
             # 连接放在初始选择之后，避免创建工具条时就触发重译
             self.lang_combo.currentIndexChanged.connect(self._on_lang_changed)
             self.lang_combo.currentIndexChanged.connect(self._sync_lang_tooltip)
