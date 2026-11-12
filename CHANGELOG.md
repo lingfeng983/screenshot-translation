@@ -2,6 +2,42 @@
 
 所有显著改动记录于此。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [v1.13.0] — 2026-11-12
+
+### 变更
+- **长截图改为用户自己滚动**：不再注入任何滚轮消息、也不再搬动光标。点工具条
+  「长截图」后遮罩让开，你自己滚页面，后台按固定间隔（默认 120ms）只抓选区那一
+  小块（BitBlt，实测约 7ms/帧，整屏 ImageGrab 要 50ms，撑不住持续轮询；失败自动
+  退回整屏抓拍），用条带模板匹配把新增内容接上。选区外的横幅实时显示已拼接高度
+  与段数，并区分「等你滚动」「继续滚动」「正在往上滚」「滚太快出现断层」几种状态；
+  点「完成」或再按一次截图快捷键结束并复制长图，点「取消」丢弃。原来的 15 秒总
+  时限改为 10 分钟兜底，忙碌态 watchdog 同步放宽
+  （`managers/capture_scroll.py`、`managers/screenshot.py`）
+- **选区移动/缩放后重新取景**：编辑态原先禁止缩放、平移时把旧像素与标注一起搬走，
+  现在四边四角都能拖拽缩放，平移与缩放松手都按新范围从冻结的整屏图重裁；旧标注
+  属于旧画面，一并清空并给出提示。抓边框优先于标注工具，任何工具下都能缩放选区
+  （`managers/screenshot.py`、`managers/capture_editor.py`）
+- **线宽/字号档位加密**：线宽 2~8 px 逐像素一档（原 2/4/7），字号 8~32 px
+  每 2 px 一档（原 14/18/24/32），默认仍是 4 px / 18 px
+  （`managers/capture_annotation.py`、`managers/capture_toolbar.py`）
+- **「清空标注」与「取消」图标分开**：清空改成垃圾桶，取消保留红色叉号
+  （`managers/vector_icons.py`、`managers/capture_toolbar.py`）
+- **配置项调整**：`[Capture]` 去掉 `scroll_step`，`scroll_delay_ms` 改为
+  `scroll_poll_ms`（抓帧间隔，默认 120），新增 `scroll_max_height`（长图高度上限，
+  默认 12000）；老配置里的这两个死键启动时自动清掉，设置页对应项同步改为
+  「长截图抓帧间隔」「长图最大高度」
+  （`config.py`、`config.example.ini`、`main.py`）
+
+### 修复
+- **老配置缺段时值迁移被跳过**：加载时写的是 `_migrate_sections() or
+  _migrate_values()`，缺段的文件补完段就短路落盘，非法目标语言与已废弃的
+  OCR/LLM 键要等到下次启动才清掉。两步改为都执行
+  （`config.py`）
+- **字号下拉弹出列表露出浅色底**：全局浅色样式给 `QComboBox QAbstractItemView`
+  留了 4px 内边距，滚动条的 margin 又不被 QSS 背景覆盖，13 档字号滚起来时右侧会
+  露一条亮边。工具条自己声明内边距并把滚动条 margin 归零，整条弹出列表统一深色
+  （`managers/capture_toolbar.py`）
+
 ## [v1.12.0] — 2026-11-11
 
 ### 变更

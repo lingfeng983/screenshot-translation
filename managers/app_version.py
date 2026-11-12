@@ -8,7 +8,7 @@
 读到的是同一个值。
 """
 
-APP_VERSION = '1.12.0'
+APP_VERSION = '1.13.0'
 
 
 def current_version():

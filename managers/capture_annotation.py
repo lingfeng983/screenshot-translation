@@ -50,8 +50,11 @@ TOOL_LABELS = {
 
 PRESET_COLORS = ('#ff3b30', '#ff9500', '#ffcc00', '#34c759',
                  '#00c7be', '#3b82f6', '#af52de', '#ffffff')
-WIDTH_CHOICES = (2, 4, 7)
-FONT_CHOICES = (14, 18, 24, 32)
+WIDTH_CHOICES = (2, 3, 4, 5, 6, 7, 8)
+FONT_CHOICES = (8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32)
+# 默认档位单独写死：档位表首项是「最细/最小」，不是默认值
+DEFAULT_WIDTH = 4
+DEFAULT_FONT_SIZE = 18
 
 _MOSAIC_BLOCK = 12          # 马赛克块边长（逻辑像素）
 _HIGHLIGHT_ALPHA = 95       # 荧光笔透明度
@@ -96,21 +99,13 @@ class Shape:
     kind: str
     points: list = field(default_factory=list)   # list[QPointF]，选区局部逻辑坐标
     color: str = PRESET_COLORS[0]
-    width: int = WIDTH_CHOICES[1]
-    font_size: int = FONT_CHOICES[1]
+    width: int = DEFAULT_WIDTH
+    font_size: int = DEFAULT_FONT_SIZE
     text: str = ''
     number: int = 0
     scale: float = 1.0          # 序号圆点等固定尺寸图元的整体倍率
     # 马赛克结果缓存：首次绘制时按当前底图生成，之后直接复用
     _mosaic_cache: object = field(default=None, repr=False, compare=False)
-
-    def translated(self, dx, dy):
-        """整体平移（编辑态移动选区时同步搬动标注）"""
-        return Shape(
-            kind=self.kind,
-            points=[QPointF(p.x() + dx, p.y() + dy) for p in self.points],
-            color=self.color, width=self.width, font_size=self.font_size,
-            text=self.text, number=self.number, scale=self.scale)
 
     def bounds(self):
         """

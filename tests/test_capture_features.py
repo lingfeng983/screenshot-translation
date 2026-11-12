@@ -15,6 +15,7 @@ from PIL import Image, ImageDraw
 
 from PyQt5.QtCore import QPoint, QPointF, QRect, Qt
 from PyQt5.QtGui import QImage, QPainter, QPixmap
+from PyQt5.QtWidgets import QApplication, QPushButton
 
 from managers import capture_magnifier, capture_output, capture_scroll
 from managers import capture_ocr
@@ -51,20 +52,19 @@ def test_all_shape_kinds_draw(qapp):
     assert shapes[-1]._mosaic_cache is not None, '马赛克没有生成贴图缓存'
 
 
-def test_shape_translation():
-    shape = Shape('rect', [QPointF(10, 10), QPointF(50, 50)])
-    moved = shape.translated(7, -3)
-    assert moved.points[0] == QPointF(17, 7)
-    assert moved.points[1] == QPointF(57, 47)
-    assert shape.points[0] == QPointF(10, 10), '平移不该改动原图元'
-
-
 def test_all_tool_icons_render(qapp):
     for name in TOOLS:
         assert not vector_icons.icon(name).isNull(), name
-    for name in ('text_annot', 'eyedropper', 'undo', 'redo', 'clear',
+    for name in ('text_annot', 'eyedropper', 'undo', 'redo', 'trash', 'close',
                  'ocr', 'scroll', 'pin'):
         assert not vector_icons.icon(name).isNull(), name
+
+
+def test_clear_and_cancel_icons_differ(qapp):
+    """清空标注是垃圾桶、取消是叉号：两个图标不能长得一样"""
+    trash = vector_icons.icon('trash').pixmap(24, 24).toImage()
+    close = vector_icons.icon('close').pixmap(24, 24).toImage()
+    assert trash != close, '清空与取消用了同一个图标'
 
 
 # ---------------------------------------------------------------- 编辑控制器
@@ -233,20 +233,6 @@ def test_editor_wheel_adjusts_width_and_font(qapp):
     assert editor.shapes[0].font_size > 18, '滚轮没有放大字号'
 
 
-def test_editor_translation_moves_undo_snapshots(qapp):
-    """平移后撤销不能让标注跳回原位"""
-    editor = CaptureEditor(_Host())
-    _draw_rect(editor)
-    # 第二笔要错开：点到已有标注的边框会被选中（方便回头再调），不会另起一笔
-    _draw_rect(editor, (100, 100), (150, 130))
-    before = editor.shapes[0].points[0].x()
-    editor.apply_translation(9, 4)
-    assert editor.shapes[0].points[0].x() == before + 9
-    assert editor.undo() is True
-    # 撤销恢复的快照同样带平移
-    assert editor.shapes[0].points[0].x() == before + 9
-
-
 def test_editor_reset_for_new_selection(qapp):
     editor = CaptureEditor(_Host())
     _draw_rect(editor)
@@ -354,30 +340,90 @@ def test_scroll_overlap_and_stitch():
     assert stitched.size == (200, 260)
 
 
-def test_scroll_end_to_end_with_injected_grabber():
+def _scripted(frames, finish):
+    """按顺序吐帧模拟用户滚动，吐完置位完成事件（相当于点「完成」）"""
+    sequence = iter(frames)
+
+    def grab(_ctx):
+        try:
+            return next(sequence)
+        except StopIteration:
+            finish.set()
+            return frames[-1]
+    return grab
+
+
+def test_scroll_no_wheel_injection():
+    """长截图不能自己滚动：模块里不该再有滚轮注入与光标搬运"""
+    source = open(capture_scroll.__file__, encoding='utf-8').read()
+    assert not hasattr(capture_scroll, 'scroll_down')
+    assert 'mouse_event' not in source and 'SetCursorPos' not in source
+
+
+def test_scroll_stitches_user_scrolled_frames():
     page = _page()
     frames = [page.crop((0, y, 200, y + 200)) for y in (0, 60, 120, 180)]
-    # 前 3 次返回滚动后的帧，之后重复最后一帧表示到底
-    sequence = iter(frames[1:] + [frames[-1], frames[-1]])
-    context = {'crop_box': (0, 0, 200, 200), 'all_screens': False,
-               'center': (100, 100)}
+    finish = threading.Event()
+    progress = capture_scroll.ScrollProgress()
     long_image = capture_scroll.capture_scrolling(
-        context, frames[0], delay_ms=0, step=1, max_height=5000,
-        grabber=lambda _ctx: next(sequence, frames[-1]),
-        scroller=lambda: True)
+        {'crop_box': (0, 0, 200, 200), 'all_screens': False}, frames[0],
+        poll_ms=0, max_height=5000, finish_event=finish,
+        grabber=_scripted(frames[1:], finish), progress=progress)
     assert long_image is not None
-    assert long_image.height >= 380, '没有把滚动新增的内容拼上来'
+    assert long_image.height == 380, '没有把用户滚出来的内容拼上来'
+    assert progress.height == 380 and progress.segments == 4
 
 
-def test_scroll_cancel_stops_immediately():
+def test_scroll_waits_while_page_is_still():
+    """画面不动就一直等，不能把同一帧重复接上去，也不能判定结束"""
+    page = _page()
+    frames = [page.crop((0, y, 200, y + 200)) for y in (0, 60, 120)]
+    finish = threading.Event()
+    progress = capture_scroll.ScrollProgress()
+    long_image = capture_scroll.capture_scrolling(
+        {'crop_box': (0, 0, 200, 200)}, frames[0], poll_ms=0,
+        finish_event=finish, progress=progress,
+        grabber=_scripted([frames[0], frames[1], frames[1], frames[2]],
+                          finish))
+    assert long_image.height == 320 and progress.segments == 3
+
+
+def test_scroll_upwards_does_not_grow():
+    """往回滚不拼接，并给出提示（长图只向下增长）"""
+    # 每行颜色都不同：_page() 的等距横线会让条带匹配在错误位置也对上
+    page = Image.new('RGB', (200, 600))
+    draw = ImageDraw.Draw(page)
+    for y in range(600):
+        draw.line((0, y, 200, y), fill=(y % 256, (y * 7) % 256, (y * 13) % 256))
+    top = page.crop((0, 60, 200, 260))
+    below = page.crop((0, 120, 200, 320))
+    finish = threading.Event()
+    progress = capture_scroll.ScrollProgress()
+    long_image = capture_scroll.capture_scrolling(
+        {'crop_box': (0, 0, 200, 200)}, below, poll_ms=0,
+        finish_event=finish, progress=progress,
+        grabber=_scripted([top], finish))
+    assert long_image.height == 200
+    assert '往上滚' in progress.hint
+
+
+def test_scroll_cancel_discards_result():
     frame = Image.new('RGB', (100, 80), 'white')
     cancel = threading.Event()
     cancel.set()
-    context = {'crop_box': (0, 0, 100, 80), 'all_screens': False,
-               'center': (10, 10)}
     long_image = capture_scroll.capture_scrolling(
-        context, frame, delay_ms=0, cancel_event=cancel,
-        grabber=lambda _ctx: frame, scroller=lambda: True)
+        {'crop_box': (0, 0, 100, 80)}, frame, poll_ms=0,
+        cancel_event=cancel, grabber=lambda _ctx: frame)
+    assert long_image is None, '取消要丢弃已拼接内容'
+
+
+def test_scroll_finish_without_scrolling_returns_first_frame():
+    frame = Image.new('RGB', (100, 80), 'white')
+    finish = threading.Event()
+    finish.set()
+    long_image = capture_scroll.capture_scrolling(
+        {'crop_box': (0, 0, 100, 80)}, frame, poll_ms=0,
+        finish_event=finish, grabber=lambda _ctx: frame)
     assert long_image is not None and long_image.height == 80
 
 
@@ -385,11 +431,9 @@ def test_scroll_max_height_respected():
     page = _page()
     frame = page.crop((0, 0, 200, 200))
     nxt = page.crop((0, 60, 200, 260))
-    context = {'crop_box': (0, 0, 200, 200), 'all_screens': False,
-               'center': (100, 100)}
     long_image = capture_scroll.capture_scrolling(
-        context, frame, delay_ms=0, max_height=210,
-        grabber=lambda _ctx: nxt, scroller=lambda: True)
+        {'crop_box': (0, 0, 200, 200)}, frame, poll_ms=0, max_height=210,
+        grabber=lambda _ctx: nxt)
     assert long_image.height <= 300
 
 
@@ -495,6 +539,18 @@ def test_capture_section_migrates_old_config(tmp_path):
     assert ConfigManager(str(path)).get_capture_option('format') == 'webp'
 
 
+def test_scroll_injection_options_are_migrated_away(tmp_path):
+    """长截图不再注入滚轮：老配置里的步长/延时要被清掉，不留死键"""
+    from config import ConfigManager
+    path = tmp_path / 'config.ini'
+    path.write_text('[Capture]\nformat = png\nscroll_step = 3\n'
+                    'scroll_delay_ms = 350\n', encoding='utf-8')
+    config = ConfigManager(str(path))
+    assert not config.config.has_option('Capture', 'scroll_step')
+    assert not config.config.has_option('Capture', 'scroll_delay_ms')
+    assert config.get_capture_option('format') == 'png'
+
+
 # ---------------------------------------------------------------- 遮罩层
 
 def test_capture_toolbar_signals_and_fit(qapp):
@@ -507,6 +563,32 @@ def test_capture_toolbar_signals_and_fit(qapp):
     toolbar._tool_buttons['arrow'].click()
     assert tools == ['arrow']
     assert toolbar._tool_buttons['arrow'].isChecked()
+
+
+def test_toolbar_width_and_font_steps(qapp):
+    """线宽 2~8 逐像素一档、字号 8~32 每 2px 一档，默认仍是 4px / 18px"""
+    from managers.capture_annotation import (DEFAULT_FONT_SIZE, DEFAULT_WIDTH,
+                                             FONT_CHOICES, WIDTH_CHOICES)
+    assert WIDTH_CHOICES == (2, 3, 4, 5, 6, 7, 8)
+    assert FONT_CHOICES == tuple(range(8, 33, 2))
+    toolbar = CaptureToolbar(None)
+    for combo, choices, default in (
+            (toolbar.width_combo, WIDTH_CHOICES, DEFAULT_WIDTH),
+            (toolbar.font_combo, FONT_CHOICES, DEFAULT_FONT_SIZE)):
+        assert [combo.itemData(i) for i in range(combo.count())] == list(choices)
+        assert combo.currentData() == default
+
+
+def test_font_choices_survive_editor_clamp(qapp):
+    """每一档字号都要真的生效，不能被下限夹成同一个值"""
+    from managers.capture_annotation import FONT_CHOICES, WIDTH_CHOICES
+    editor = CaptureEditor(_Host())
+    for size in FONT_CHOICES:
+        editor.set_font_size(size)
+        assert editor.font_size == size
+    for width in WIDTH_CHOICES:
+        editor.set_width(width)
+        assert editor.width == width
 
 
 def test_toolbar_combos_fixed_width_and_color_dropdown(qapp):
@@ -634,8 +716,103 @@ def test_widget_mouse_events_route_to_editor(qapp):
         assert len(widget._capture_editor.shapes) == 1, \
             '遮罩没有把鼠标事件转给编辑控制器'
 
-        # 编辑态禁止缩放选区（只允许 move），避免标注与内容错位
-        assert widget._begin_result_drag(QPoint(10, 30)) is False
+        # 编辑态也能四向缩放选区：抓住左边框进入缩放，松手后重新取景
+        assert widget._begin_result_drag(QPoint(10, 30)) is True
+        assert widget._drag_mode == 'resize'
+    finally:
+        widget.close()
+
+
+def _edit_widget(page_size=(200, 120)):
+    """搭一个停在编辑态的遮罩：左半白、右半深，便于验证重新取景"""
+    from managers.screenshot import ScreenshotWidget
+    widget = ScreenshotWidget(capture_only=True)
+    page = Image.new('RGB', page_size, 'white')
+    ImageDraw.Draw(page).rectangle(
+        (page_size[0] // 2, 0, page_size[0] - 1, page_size[1] - 1),
+        fill=(20, 40, 60))
+    widget.full_screen = page
+    widget._grab_scale = 1.0
+    widget._grab_scale_y = 1.0
+    widget.screen_width, widget.screen_height = page_size
+    widget._desktop_rect = QRect(0, 0, *page_size)
+    widget._snap_threshold = 0
+    widget.begin = QPoint(10, 10)
+    widget.end = QPoint(70, 70)
+    widget._confirm_selection()
+    return widget
+
+
+def _send_mouse(widget, kind, pos, buttons=Qt.LeftButton):
+    """直接派发鼠标事件：QTest.mouseMove 在未显示的窗口上不保证送达"""
+    from PyQt5.QtCore import QEvent
+    from PyQt5.QtGui import QMouseEvent
+    button = Qt.NoButton if kind == QEvent.MouseMove else Qt.LeftButton
+    event = QMouseEvent(kind, QPointF(pos), button, buttons, Qt.NoModifier)
+    if kind == QEvent.MouseButtonPress:
+        widget.mousePressEvent(event)
+    elif kind == QEvent.MouseMove:
+        widget.mouseMoveEvent(event)
+    else:
+        widget.mouseReleaseEvent(event)
+
+
+def _drag(widget, start, end):
+    from PyQt5.QtCore import QEvent
+    _send_mouse(widget, QEvent.MouseButtonPress, start)
+    _send_mouse(widget, QEvent.MouseMove, end)
+    _send_mouse(widget, QEvent.MouseButtonRelease, end, Qt.NoButton)
+
+
+def test_capture_edit_move_recrops_and_drops_annotations(qapp):
+    """编辑态搬动选区：按新位置重新取景，旧标注属于旧画面要丢弃"""
+    widget = _edit_widget()
+    try:
+        assert widget._capture_edit is True
+        assert widget.current_payload()['image'].getpixel((5, 5)) == (255, 255, 255)
+
+        widget._capture_set_tool('rect')
+        editor = widget._capture_editor
+        editor.mouse_press(QPointF(20, 20), Qt.LeftButton)
+        editor.mouse_move(QPointF(50, 50))
+        editor.mouse_release(QPointF(50, 50), Qt.LeftButton)
+        assert len(editor.shapes) == 1
+
+        # 选择工具下拖选区内部 = 搬动选区，右移 100px 落到深色半边
+        widget._capture_set_tool('select')
+        _drag(widget, QPoint(40, 40), QPoint(140, 40))
+
+        assert widget._result_rect.left() == 110, '选区没有跟着搬'
+        assert widget.current_payload()['image'].getpixel((5, 5)) == (20, 40, 60), \
+            '搬动后还是旧内容，没有重新取景'
+        assert widget._capture_editor.shapes == [], '旧标注被搬到了新画面上'
+    finally:
+        widget.close()
+
+
+def test_capture_edit_resizes_from_every_edge(qapp):
+    """四条边都能抓住缩放，且当前是画笔工具时也不会被标注接走"""
+    from PyQt5.QtCore import QEvent
+    widget = _edit_widget()
+    try:
+        widget._capture_set_tool('pen')
+        left, top = widget._result_rect.left(), widget._result_rect.top()
+        width, height = widget._result_rect.width(), widget._result_rect.height()
+        right, bottom = left + width - 1, top + height - 1
+        cx, cy = left + width // 2, top + height // 2
+        mids = {'l': QPoint(left, cy), 'r': QPoint(right, cy),
+                't': QPoint(cx, top), 'b': QPoint(cx, bottom)}
+        for edge, pos in mids.items():
+            _send_mouse(widget, QEvent.MouseButtonPress, pos)
+            assert widget._drag_mode == 'resize', f'{edge} 边没进入缩放'
+            assert edge in widget._resize_edges
+            _send_mouse(widget, QEvent.MouseButtonRelease, pos, Qt.NoButton)
+        assert widget._capture_editor.shapes == [], '抓边框缩放不该落笔'
+
+        # 右边往右拉 40px：新内容要重新裁，宽度跟着变
+        _drag(widget, mids['r'], QPoint(right + 40, cy))
+        assert widget._result_rect.width() == width + 40
+        assert widget.current_payload()['image'].width == width + 40
     finally:
         widget.close()
 
@@ -807,23 +984,77 @@ def test_magnifier_pixel_handles_grayscale_and_palette(qapp):
     assert capture_magnifier.color_hex(rgb) == '#4d4d4d'
 
 
-def test_scroll_cancel_banner_sets_event(qapp):
-    """滚动截图期间的可点取消横幅要能置位取消事件并正常收起"""
-    import threading
-    from PyQt5.QtTest import QTest
+def test_scroll_banner_finish_and_cancel(qapp):
+    """长截图横幅：完成/取消各自置位对应事件，并显示实时进度"""
+    from managers.capture_scroll import ScrollProgress
     from managers.screenshot import ScreenshotWidget
 
     widget = ScreenshotWidget(capture_only=True)
     try:
         widget._result_rect = QRect(10, 10, 60, 40)
-        event = threading.Event()
-        widget.show_scroll_banner(event)
+        finish, cancel = threading.Event(), threading.Event()
+        progress = ScrollProgress(240)
+        progress.segments = 3
+        widget.show_scroll_banner(finish, cancel, progress)
         banner = widget._scroll_banner
-        assert banner is not None, '小选区下应有可点击的取消横幅'
-        QTest.mouseClick(banner, Qt.LeftButton)
-        assert event.is_set(), '点击横幅没有置位取消事件'
+        assert banner is not None, '小选区下应有长截图控制面板'
+        assert '240 px' in banner._status.text()
+        assert '3 段' in banner._status.text()
+
+        progress.height = 480
+        banner._refresh()
+        assert '480 px' in banner._status.text(), '进度没有跟着抓帧线程更新'
+
+        banner.findChild(QPushButton, 'ScrollFinish').click()
+        assert finish.is_set() and not cancel.is_set()
+        assert not banner._timer.isActive(), '结束后定时器要停'
+
+        finish.clear()
+        banner.findChild(QPushButton, 'ScrollAbort').click()
+        assert cancel.is_set() and not finish.is_set()
+        assert banner.isHidden()
+
         widget.hide_scroll_banner()
         assert widget._scroll_banner is None
+    finally:
+        widget.close()
+
+
+def test_scroll_banner_hidden_when_selection_fills_screen(qapp):
+    """选区占满屏幕时横幅无处可放：不显示，靠截图热键结束"""
+    from managers.capture_scroll import ScrollProgress
+    from managers.screenshot import ScreenshotWidget
+
+    widget = ScreenshotWidget(capture_only=True)
+    try:
+        screen = QApplication.primaryScreen().availableGeometry()
+        widget._desktop_rect = QRect(screen)
+        widget._result_rect = QRect(0, 0, screen.width(), screen.height())
+        widget.show_scroll_banner(threading.Event(), threading.Event(),
+                                  ScrollProgress(100))
+        assert widget._scroll_banner is None
+    finally:
+        widget.close()
+
+
+def test_scroll_watchdog_outlives_manual_session(qapp):
+    """手动长截图由用户决定时长，兜底复位不能还是 OCR 那 30s"""
+    from managers.capture_scroll import MAX_DURATION_SECONDS
+    from managers.screenshot import ScreenshotWidget
+
+    widget = ScreenshotWidget(capture_only=True)
+    try:
+        widget.set_capture_busy(True)
+        assert widget._capture_watchdog.interval() == 30000
+        widget.set_capture_busy(False)
+
+        widget._result = {'image': Image.new('RGB', (60, 40), 'white')}
+        widget._result_rect = QRect(10, 10, 60, 40)
+        widget._capture_scroll()
+        assert widget._capture_busy is True
+        assert widget._capture_watchdog.interval() > MAX_DURATION_SECONDS * 1000
+        widget.set_capture_busy(False)
+        assert not widget._capture_watchdog.isActive()
     finally:
         widget.close()
 
@@ -902,7 +1133,7 @@ def test_language_switch_during_request_never_shows_source(qapp):
 
 
 def test_scroll_dispatch_failure_clears_token(qapp):
-    """滚动截图回投失败后必须作废令牌，否则截图热键会被永久吞掉"""
+    """长截图回投失败后必须作废令牌，否则截图热键会被永久吞掉"""
     from unittest.mock import patch
     from managers.screenshot import ScreenshotManager
 
@@ -912,18 +1143,13 @@ def test_scroll_dispatch_failure_clears_token(qapp):
         def current_request_id(self):
             return 1
 
-        def set_capture_busy(self, busy):
-            pass
-
-        def show_scroll_banner(self, event):
-            pass
-
-        def on_scroll_finished(self, image):
+        def on_scroll_finished(self, image, canceled=False):
             pass
 
     widget = Widget()
     manager._screenshot_widget = widget
-    cancel_event = threading.Event()
+    finish_event, cancel_event = threading.Event(), threading.Event()
+    manager._scroll_finish = finish_event
     manager._scroll_cancel = cancel_event
 
     with patch('managers.screenshot.qt_dispatcher') as dispatcher, \
@@ -931,25 +1157,42 @@ def test_scroll_dispatch_failure_clears_token(qapp):
                   return_value=None):
         dispatcher.dispatch_to_main_thread.side_effect = RuntimeError('down')
         manager._run_scroll(widget, {}, Image.new('RGB', (8, 8)), 1, {},
-                            cancel_event)
+                            finish_event, cancel_event, None)
 
-    assert manager._scroll_cancel is None, '回投失败后令牌残留'
+    assert manager._scroll_cancel is None, '回投失败后取消令牌残留'
+    assert manager._scroll_finish is None, '回投失败后结束令牌残留'
 
 
-def test_capture_hotkey_cancels_running_scroll(qapp):
-    """滚动截图期间按截图热键应取消长截图，而不是另起一个遮罩"""
+def test_capture_hotkey_finishes_running_scroll(qapp):
+    """长截图期间按截图热键应结束并保留长图，而不是另起一个遮罩"""
     from managers.screenshot import ScreenshotManager
 
     manager = ScreenshotManager()
     sentinel = object()
     manager._screenshot_widget = sentinel
-    cancel_event = threading.Event()
+    finish_event, cancel_event = threading.Event(), threading.Event()
+    manager._scroll_finish = finish_event
     manager._scroll_cancel = cancel_event
 
     manager._run_screenshot(capture_only=True)
 
-    assert cancel_event.is_set(), '热键没有取消长截图'
-    assert manager._screenshot_widget is sentinel, '滚动期间又新建了遮罩'
+    assert finish_event.is_set(), '热键没有结束长截图'
+    assert not cancel_event.is_set(), '热键应保留长图，不是丢弃'
+    assert manager._screenshot_widget is sentinel, '长截图期间又新建了遮罩'
+
+
+def test_scroll_cancel_toast_differs_from_failure(qapp):
+    """取消是用户主动行为，提示文案不能还是「未完成」"""
+    from managers.screenshot import ScreenshotWidget
+
+    widget = ScreenshotWidget(capture_only=True)
+    try:
+        widget.on_scroll_finished(None, canceled=True)
+        assert widget._capture_toast == '已取消长截图'
+        widget.on_scroll_finished(None)
+        assert widget._capture_toast == '长截图未完成'
+    finally:
+        widget.close()
 
 
 def test_capture_watchdog_stops_when_idle(qapp):

@@ -15,14 +15,18 @@ from PIL import ImageGrab
 from PyQt5.QtCore import (Qt, QRect, QRectF, QPoint, QPointF, QSize, QTimer,
                           pyqtSignal)
 from PyQt5.QtGui import QPainter, QPen, QColor, QCursor, QPixmap
-from PyQt5.QtWidgets import QApplication, QHBoxLayout, QLabel, QWidget
+from PyQt5.QtWidgets import (QApplication, QHBoxLayout, QLabel, QPushButton,
+                             QVBoxLayout, QWidget)
 
 # 导入必要的模块
 from . import capture_magnifier
 from . import capture_output
 from . import clipboard
 from . import result_render
-from .capture_annotation import FONT_CHOICES, PRESET_COLORS, WIDTH_CHOICES
+from . import vector_icons
+from .capture_annotation import (
+    DEFAULT_FONT_SIZE, DEFAULT_WIDTH, FONT_CHOICES, PRESET_COLORS, TOOL_SELECT,
+    WIDTH_CHOICES)
 from .capture_editor import CaptureEditor
 from .capture_toolbar import CaptureToolbar
 from .error_handler import error_handler
@@ -66,32 +70,121 @@ class _RequestToken:
         return self.cancel_event.is_set()
 
 
-class _ScrollCancelBanner(QWidget):
+class _ScrollCaptureBanner(QWidget):
     """
-    滚动截图期间唯一的可见取消入口
+    手动长截图期间的控制面板：实时进度 + 完成 / 取消
 
-    遮罩为了不挡滚轮、不进抓帧必须隐藏，用户因此看不到任何可点的地方；
-    这个小横幅放在选区之外，点一下就置位取消事件，让后台抓帧立刻收手。
+    遮罩为了不挡滚动、不进抓帧必须隐藏，用户因此看不到任何可点的地方；
+    这个小横幅放在选区之外，既告诉用户已经拼了多长，也是唯一的结束入口。
+    抓帧线程只写 ScrollProgress，这里用定时器读，不跨线程碰 Qt。
     """
 
-    def __init__(self, cancel_event):
+    _REFRESH_MS = 200
+
+    def __init__(self, finish_event, cancel_event, progress):
         super().__init__()
+        self._finish = finish_event
         self._cancel = cancel_event
-        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
+        self._progress = progress
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint
+                            | Qt.Tool)
         self.setAttribute(Qt.WA_StyledBackground, True)
+        # 显示时不抢焦点：焦点留在被滚动的窗口上，滚轮/翻页键才继续生效
+        self.setAttribute(Qt.WA_ShowWithoutActivating, True)
         self.setStyleSheet(
-            'QWidget { background: rgba(35,38,41,245); border: 1px solid #3a3d42;'
-            ' border-radius: 8px; color: #e8e8e8; font-size: 12px; }')
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(12, 7, 12, 7)
-        layout.addWidget(QLabel('长截图进行中…  点击此处取消'))
+            'QWidget { background: #232629; border: 1px solid #3a3d42;'
+            ' border-radius: 8px; }'
+            'QLabel { border: none; background: transparent; color: #e8e8e8;'
+            ' font-size: 12px; }'
+            'QLabel#ScrollHint { color: #9aa4b2; font-size: 11px; }'
+            'QPushButton { border: 1px solid #3f4a5e; border-radius: 5px;'
+            ' background: #2b303a; color: #e8e8e8; font-size: 12px;'
+            ' padding: 4px 12px; }'
+            'QPushButton:hover { background: #363d4a; }'
+            'QPushButton#ScrollFinish { background: #3b82f6;'
+            ' border-color: #3b82f6; color: #ffffff; }'
+            'QPushButton#ScrollFinish:hover { background: #5a95f8; }'
+            'QPushButton#ScrollAbort { color: #ff6b6b; }'
+            'QPushButton#ScrollAbort:hover { background: #5a2a2e;'
+            ' border-color: #7a3238; }')
+
+        self._status = QLabel(self)
+        self._hint = QLabel(self)
+        self._hint.setObjectName('ScrollHint')
+        self._hint.setWordWrap(False)
+
+        finish_button = QPushButton(vector_icons.icon('check', '#ffffff'),
+                                    '完成', self)
+        finish_button.setObjectName('ScrollFinish')
+        finish_button.setToolTip('结束长截图并复制结果（也可再按一次截图快捷键）')
+        finish_button.clicked.connect(self._on_finish)
+        abort_button = QPushButton(vector_icons.icon('close', '#ff6b6b'),
+                                   '取消', self)
+        abort_button.setObjectName('ScrollAbort')
+        abort_button.setToolTip('丢弃本次长截图')
+        abort_button.clicked.connect(self._on_cancel)
+        for button in (finish_button, abort_button):
+            button.setCursor(QCursor(Qt.PointingHandCursor))
+            button.setIconSize(QSize(14, 14))
+
+        buttons = QHBoxLayout()
+        buttons.setContentsMargins(0, 0, 0, 0)
+        buttons.setSpacing(6)
+        buttons.addWidget(finish_button)
+        buttons.addWidget(abort_button)
+        top = QHBoxLayout()
+        top.setContentsMargins(0, 0, 0, 0)
+        top.setSpacing(14)
+        top.addWidget(self._status)
+        top.addStretch(1)
+        top.addLayout(buttons)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 9, 12, 9)
+        layout.setSpacing(4)
+        layout.addLayout(top)
+        layout.addWidget(self._hint)
+
+        # 文字每 200ms 变一次，宽度按最长文案顶死，免得横幅一直抖
+        self._status.setMinimumWidth(self._text_width(
+            self._status, '长截图  已拼接 40000 px · 400 段'))
+        self._hint.setMinimumWidth(self._text_width(
+            self._hint, '抓帧中断，点「完成」保留已拼接部分'))
+        self._refresh()
         self.adjustSize()
 
-    def mousePressEvent(self, event):
-        if self._cancel is not None:
-            self._cancel.set()
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._refresh)
+        self._timer.start(self._REFRESH_MS)
+
+    @staticmethod
+    def _text_width(label, text):
+        """按样式表生效后的字体量文本宽度（没 polish 时度量偏大）"""
+        label.ensurePolished()
+        return label.fontMetrics().horizontalAdvance(text)
+
+    def _refresh(self):
+        state = self._progress
+        if state is None:
+            return
+        self._status.setText(
+            f'长截图  已拼接 {state.height} px · {state.segments} 段')
+        self._hint.setText(state.hint)
+
+    def _stop(self, event):
+        self._timer.stop()
+        if event is not None:
+            event.set()
         self.hide()
-        event.accept()
+
+    def _on_finish(self):
+        self._stop(self._finish)
+
+    def _on_cancel(self):
+        self._stop(self._cancel)
+
+    def stop(self):
+        """结果已回投或被外部结束：停表，不再改文案"""
+        self._timer.stop()
 
 
 def desktop_bounds():
@@ -148,7 +241,8 @@ class ScreenshotManager:
         self._last_request = None
         # 最近一次确认的选区（遮罩局部逻辑坐标），供「重复上次区域」截图
         self._last_region = None
-        # 滚动截图的取消令牌：遮罩关闭时让后台抓取立刻收手
+        # 滚动截图的结束/取消令牌：遮罩关闭时让后台抓帧立刻收手
+        self._scroll_finish = None
         self._scroll_cancel = None
         # 在途请求的取消令牌：新请求与遮罩关闭都要让旧的立刻收手
         self._inflight = []
@@ -279,14 +373,14 @@ class ScreenshotManager:
             # 但引用也可能只是残留（此前关闭时没清掉，或是被外部销毁了），
             # 这种情况下按键不能被吞掉，否则用户看到的就是"快捷键没反应"
             if self._screenshot_widget is not None:
-                if self._scroll_cancel is not None:
-                    # 滚动截图期间遮罩刻意隐藏，isVisible() 为 False：此时不能
-                    # 另起一个遮罩（滚轮还在注入、抓帧还在跑）。把这次热键
-                    # 当成「取消长截图」：置位取消事件，让后台任务按原路径
-                    # 收手并回投结果，恢复遮罩/清在途标记只走那一处。
-                    # 这样即使取消横幅因选区过大没显示，也有恒定的取消入口。
-                    logger.info("滚动截图进行中，本次热键作为取消长截图处理")
-                    self._scroll_cancel.set()
+                if self._scroll_finish is not None:
+                    # 长截图期间遮罩刻意隐藏，isVisible() 为 False：此时不能
+                    # 另起一个遮罩（抓帧还在跑）。把这次热键当成「完成长
+                    # 截图」：置位结束事件，让后台任务按原路径收手并回投结果，
+                    # 恢复遮罩/清在途标记只走那一处。
+                    # 这样即使横幅因选区过大没显示，也有恒定的结束入口。
+                    logger.info("长截图进行中，本次热键作为完成长截图处理")
+                    self._scroll_finish.set()
                     return
                 if self._widget_is_live(self._screenshot_widget):
                     logger.info("截图遮罩已显示，本次热键作为取消处理")
@@ -354,10 +448,11 @@ class ScreenshotManager:
 
     def _release_screenshot_widget(self):
         """关闭并释放截图窗口引用（窗口已被销毁时可安全调用）"""
-        # 滚动截图是独立后台任务，遮罩一关就让它停止注入滚轮
+        # 长截图是独立后台任务，遮罩一关就没有结果去处了，直接丢弃
         if self._scroll_cancel is not None:
             self._scroll_cancel.set()
-            self._scroll_cancel = None
+        self._scroll_finish = None
+        self._scroll_cancel = None
         # 遮罩都没了，在途的识别与翻译再无去处，立刻让它们收手
         self._cancel_inflight()
         # 全屏遮罩不在了，错误提示可以正常弹窗
@@ -465,61 +560,71 @@ class ScreenshotManager:
         widget = self._screenshot_widget
         if widget is None or image is None:
             return
+        from .capture_scroll import POLL_MS, ScrollProgress
         request_id = widget.current_request_id()
         options = {
-            'delay_ms': widget.capture_option_int('scroll_delay_ms', 180, 30, 2000),
-            'step': widget.capture_option_int('scroll_step', 3, 1, 10),
+            'poll_ms': widget.capture_option_int('scroll_poll_ms', POLL_MS,
+                                                 40, 1000),
             'max_height': widget.capture_option_int(
                 'scroll_max_height', 12000, 1000, 40000),
         }
+        finish_event = threading.Event()
         cancel_event = threading.Event()
+        progress = ScrollProgress(image.height)
+        self._scroll_finish = finish_event
         self._scroll_cancel = cancel_event
         if thread_pool_manager.submit(
                 self._run_scroll, widget, context, image, request_id,
-                options, cancel_event) is None:
+                options, finish_event, cancel_event, progress) is None:
             logger.warning("滚动截图任务提交失败")
+            self._scroll_finish = None
             self._scroll_cancel = None
             widget.on_scroll_finished(None)
             return
-        widget.set_capture_busy(True)
-        widget.show_scroll_banner(cancel_event)
+        widget.show_scroll_banner(finish_event, cancel_event, progress)
 
     def _run_scroll(self, widget, context, image, request_id, options,
-                    cancel_event):
+                    finish_event, cancel_event, progress):
         try:
             from . import capture_scroll
             long_image = capture_scroll.capture_scrolling(
-                context, image, cancel_event=cancel_event, **options)
+                context, image, finish_event=finish_event,
+                cancel_event=cancel_event, progress=progress, **options)
         except Exception:
             logger.exception("滚动截图失败")
             long_image = None
         try:
             qt_dispatcher.dispatch_to_main_thread(
-                self._apply_scroll_result, widget, long_image, request_id)
+                self._apply_scroll_result, widget, long_image, request_id,
+                cancel_event)
         except Exception:
             logger.exception("滚动截图结果回投失败")
             # 回投不出去时 _apply_scroll_result 永远不会跑：令牌必须当场作废
             # （只作废本轮的，别误清新一轮），否则 _run_screenshot 会把此后
             # 所有截图热键当成「滚动中」一直吞掉。
             if self._scroll_cancel is cancel_event:
+                self._scroll_finish = None
                 self._scroll_cancel = None
             try:
                 # 再试一次把恢复动作投回主线程；若连这次都失败（事件循环已
-                # 退出），就只能靠 widget 上的 30s 兜底复位编辑态了。
+                # 退出），就只能靠 widget 上的兜底定时器复位编辑态了。
                 qt_dispatcher.dispatch_to_main_thread(
-                    self._apply_scroll_result, widget, None, request_id)
+                    self._apply_scroll_result, widget, None, request_id,
+                    cancel_event)
             except Exception:
                 logger.exception("滚动截图恢复调度再次失败")
 
-    def _apply_scroll_result(self, widget, long_image, request_id):
+    def _apply_scroll_result(self, widget, long_image, request_id, cancel_event):
         # 先校验归属：迟到的旧结果不能把新一轮滚动的令牌清掉
         if widget is None or widget is not self._screenshot_widget:
             return
         # 任务已收手：清掉在途标记
+        self._scroll_finish = None
         self._scroll_cancel = None
         try:
             if request_id == widget.current_request_id():
-                widget.on_scroll_finished(long_image)
+                widget.on_scroll_finished(long_image,
+                                          canceled=cancel_event.is_set())
         except RuntimeError:
             logger.debug("遮罩已销毁，丢弃迟到的滚动截图结果")
 
@@ -813,7 +918,7 @@ class ScreenshotWidget(QWidget):
     region_committed = pyqtSignal(object)
     # 信号：请求本地 OCR 取字（携带选区原图）
     ocr_requested = pyqtSignal(object)
-    # 信号：请求滚动截图（携带选区矩形与首帧图）
+    # 信号：请求长截图（携带抓帧上下文与首帧图）
     scroll_requested = pyqtSignal(object, object)
 
     def __init__(self, config_manager=None, capture_only=False, preset=None):
@@ -836,7 +941,7 @@ class ScreenshotWidget(QWidget):
         self._capture_editor = None
         self._capture_toolbar = None
         self._capture_busy = False
-        # 滚动截图期间遮罩隐藏，靠这条横幅给用户一个可点的取消入口
+        # 长截图期间遮罩隐藏，靠这条横幅给进度与完成/取消入口
         self._scroll_banner = None
         # 后台结果没回投时的兜底复位（子 QTimer，随窗口一起销毁）
         self._capture_watchdog = None
@@ -1335,9 +1440,6 @@ class ScreenshotWidget(QWidget):
         if self.is_selecting:
             rect, _guides = self._snap_rect(self._get_rect())
             return rect, 'corner'
-        if self.capture_only and self._capture_edit:
-            # 编辑态用编辑控制器自己的选中框手柄
-            return None, None
         if self._result is not None or self._error:
             return self._result_rect, 'handle'
         return None, None
@@ -1665,11 +1767,11 @@ class ScreenshotWidget(QWidget):
             return
         if self._drag_mode in ('move', 'resize'):
             # 拖动调整中：只预览新的选区范围（底图取自同一张冻结图），
-            # 松手后才重裁重译，避免旧译文被拉变形
+            # 松手后才按新范围重裁，避免旧内容被拉变形
             self._draw_frozen_region(painter, rect)
             self._draw_border(painter, rect)
             self._draw_handles(painter, rect)
-            hint = ('· 松开鼠标平移截图'
+            hint = ('· 松开鼠标重新取景'
                     if self.capture_only and self._capture_edit
                     else '· 松开鼠标重新识别')
             self._draw_size_bubble(painter, rect, hint=hint)
@@ -1719,9 +1821,7 @@ class ScreenshotWidget(QWidget):
             painter.restore()
 
         self._draw_border(painter, rect)
-        # 编辑态禁止缩放选区（会与标注错位），不画八向手柄
-        if not (self.capture_only and self._capture_edit):
-            self._draw_handles(painter, rect)
+        self._draw_handles(painter, rect)
 
         active = self._active_paragraph()
         if active is not None:
@@ -1916,16 +2016,21 @@ class ScreenshotWidget(QWidget):
             editor = CaptureEditor(self)
             editor.set_color(self.capture_option('pen_color', PRESET_COLORS[0]))
             editor.set_width(self.capture_option_int(
-                'pen_width', WIDTH_CHOICES[1], 1, 20))
+                'pen_width', DEFAULT_WIDTH,
+                WIDTH_CHOICES[0], WIDTH_CHOICES[-1]))
             editor.set_font_size(self.capture_option_int(
-                'font_size', FONT_CHOICES[1], 8, 96))
+                'font_size', DEFAULT_FONT_SIZE,
+                FONT_CHOICES[0], FONT_CHOICES[-1]))
             editor.on_state_changed = self._on_capture_state_changed
             # 滚轮/选中图元改了线宽字号时同步工具条下拉
             editor.on_style_changed = self._on_capture_style_changed
             self._capture_editor = editor
         else:
-            # 重新框选：旧标注属于旧画面，全部丢弃
+            # 重新取景：旧标注属于旧画面，全部丢弃
+            had_shapes = bool(self._capture_editor.shapes)
             self._capture_editor.reset_for_new_selection()
+            if had_shapes:
+                self._show_capture_toast('选区已重新取景，原标注已清空')
         self._capture_edit = True
         self._window_hover_rect = None
         self._ensure_capture_toolbar()
@@ -2045,16 +2150,16 @@ class ScreenshotWidget(QWidget):
         self.ocr_requested.emit(image)
 
     def _capture_scroll(self):
-        """工具条「滚动截图」：让开遮罩后后台连续抓帧拼接"""
+        """工具条「滚动截图」：让开遮罩，由用户自己滚动，后台定时抓帧拼接"""
         if self._capture_busy:
             return
         image = (self._result or {}).get('image')
         rect = self._result_rect
         if image is None or rect is None:
             return
+        from .capture_scroll import MAX_DURATION_SECONDS
         scale_x = self._grab_scale or 1.0
         scale_y = self._grab_scale_y or 1.0
-        origin = self._desktop_rect.topLeft()
         context = {
             # 相对整屏抓拍图的物理像素裁剪框：与 _confirm_selection 同算法
             'crop_box': (
@@ -2063,20 +2168,19 @@ class ScreenshotWidget(QWidget):
                 int((rect.left() + rect.width()) * scale_x),
                 int((rect.top() + rect.height()) * scale_y)),
             'all_screens': bool(self._cover_all_screens),
-            'center': (
-                int((rect.center().x() + origin.x()) * scale_x),
-                int((rect.center().y() + origin.y()) * scale_y)),
         }
-        self.set_capture_busy(True)
-        # 遮罩是置顶全屏窗口，不藏起来滚轮消息会被它自己吃掉，
-        # 下层窗口根本不会滚动；抓帧也正好需要干净的桌面
+        # 当次会话由用户决定何时结束，兜底时限得放到抓帧线程的上限之外
+        self.set_capture_busy(
+            True, timeout_ms=int(MAX_DURATION_SECONDS * 1000) + 15000)
+        # 遮罩是置顶全屏窗口，不藏起来就会盖住要滚动的页面，
+        # 抓帧也正好需要干净的桌面
         self.hide()
         self.scroll_requested.emit(context, image)
 
-    def show_scroll_banner(self, cancel_event):
-        """显示可点击的取消横幅；放在选区之外，避免被长图的裁剪框收进去"""
+    def show_scroll_banner(self, finish_event, cancel_event, progress):
+        """显示长截图控制面板；放在选区之外，避免被长图的裁剪框收进去"""
         self.hide_scroll_banner()
-        banner = _ScrollCancelBanner(cancel_event)
+        banner = _ScrollCaptureBanner(finish_event, cancel_event, progress)
         size = banner.sizeHint()
         width, height = size.width(), size.height()
         origin = self._desktop_rect.topLeft()
@@ -2096,15 +2200,17 @@ class ScreenshotWidget(QWidget):
                 banner.show()
                 self._scroll_banner = banner
                 return
-        # 选区几乎占满屏幕：没有不污染抓帧的位置，退化为总时限兜底
+        # 选区几乎占满屏幕：没有不污染抓帧的位置，退化为截图快捷键结束
+        banner.stop()
         banner.deleteLater()
-        logger.info("选区过大，不显示滚动截图取消横幅")
+        logger.info("选区过大，不显示长截图控制面板，请用截图快捷键结束")
 
     def hide_scroll_banner(self):
-        """收起取消横幅（结果回投、遮罩关闭时都要调）"""
+        """收起长截图控制面板（结果回投、遮罩关闭时都要调）"""
         banner = self._scroll_banner
         self._scroll_banner = None
         if banner is not None:
+            banner.stop()
             banner.hide()
             banner.deleteLater()
 
@@ -2122,8 +2228,14 @@ class ScreenshotWidget(QWidget):
         self.set_capture_busy(False)
         self._show_capture_toast('处理超时，请重试')
 
-    def set_capture_busy(self, busy):
-        """OCR / 滚动截图进行中：禁用重复发起，并显示忙碌提示"""
+    def set_capture_busy(self, busy, timeout_ms=30000):
+        """
+        OCR / 长截图进行中：禁用重复发起，并显示忙碌提示
+
+        Args:
+            busy (bool): 是否进入忙碌态
+            timeout_ms (int): 结果迟迟不回投时的兜底复位时限
+        """
         self._capture_busy = bool(busy)
         if self._capture_toolbar is not None:
             self._capture_toolbar.set_busy(busy)
@@ -2135,8 +2247,7 @@ class ScreenshotWidget(QWidget):
                 self._capture_watchdog.setSingleShot(True)
                 self._capture_watchdog.timeout.connect(
                     self._restore_if_capture_stuck)
-            # 滚动截图本身最长 15s，留足余量；正常回投会主动停表
-            self._capture_watchdog.start(30000)
+            self._capture_watchdog.start(int(timeout_ms))
         elif self._capture_watchdog is not None:
             self._capture_watchdog.stop()
         self.update()
@@ -2154,8 +2265,8 @@ class ScreenshotWidget(QWidget):
             logger.exception("展示 OCR 结果失败")
         self._show_capture_toast(f'已提取 {len(text)} 个字符')
 
-    def on_scroll_finished(self, image):
-        """滚动截图结果回投（主线程）：恢复遮罩、复制长图并按配置保存"""
+    def on_scroll_finished(self, image, canceled=False):
+        """长截图结果回投（主线程）：恢复遮罩、复制长图并按配置保存"""
         self.show()
         self.raise_()
         # 隐藏期间键盘焦点已经丢了，不重新抢回来的话 ESC / Ctrl+S 全部失灵
@@ -2163,8 +2274,11 @@ class ScreenshotWidget(QWidget):
         self.setFocus()
         self.hide_scroll_banner()
         self.set_capture_busy(False)
+        if canceled:
+            self._show_capture_toast('已取消长截图')
+            return
         if image is None or image.width <= 0 or image.height <= 0:
-            self._show_capture_toast('滚动截图未完成')
+            self._show_capture_toast('长截图未完成')
             return
         pixmap = result_render.pil_to_qpixmap(image)
         if pixmap is None:
@@ -2572,6 +2686,11 @@ class ScreenshotWidget(QWidget):
         """
         if event.button() == Qt.LeftButton:
             self._press_pos = QPoint(event.pos())
+            # 编辑态先认选区的边/角：任何工具下抓住边框都是缩放选区，
+            # 而不是在边框上落一笔标注
+            if self.capture_only and self._capture_edit \
+                    and self._begin_result_drag(event.pos(), resize_only=True):
+                return
             if self.capture_only and self._capture_edit \
                     and self._capture_editor is not None \
                     and self._capture_editor.mouse_press(event.pos(), event.button()):
@@ -2625,6 +2744,11 @@ class ScreenshotWidget(QWidget):
         """
         self._cursor_pos = QPoint(event.pos())
         self._update_mark_hover(event.pos())
+        if self._drag_mode:
+            # 选区拖动优先于标注：按住边框缩放时不能被画笔接走
+            self._apply_adjust_drag(event.pos())
+            self.update()
+            return
         if self.capture_only and self._capture_edit \
                 and self._capture_editor is not None \
                 and self._capture_editor.mouse_move(event.pos()):
@@ -2635,9 +2759,6 @@ class ScreenshotWidget(QWidget):
                 self.update()
         if self.is_selecting:
             self.end = event.pos()
-            self.update()
-        elif self._drag_mode:
-            self._apply_adjust_drag(event.pos())
             self.update()
         elif self._result is not None or self._error:
             if self._result is not None:
@@ -2665,7 +2786,7 @@ class ScreenshotWidget(QWidget):
 
     def mouseReleaseEvent(self, event):
         """
-        鼠标释放事件：框选松手立即识别；结果态拖动松手立即按新范围重新识别
+        鼠标释放事件：框选松手立即识别；拖动选区松手立即按新范围重新取景/识别
         """
         if event.button() != Qt.LeftButton:
             return
@@ -2700,18 +2821,8 @@ class ScreenshotWidget(QWidget):
         if dragged_rect.width() > self._MIN_SELECT_EDGE \
                 and dragged_rect.height() > self._MIN_SELECT_EDGE:
             if dragged_rect != start_rect:
-                if self.capture_only and self._capture_edit:
-                    # 编辑态平移：不重裁（重裁会让已烧录的标注错位），
-                    # 选区与标注一起搬，工具条跟到新位置
-                    if self._capture_editor is not None:
-                        self._capture_editor.apply_translation(
-                            dragged_rect.left() - start_rect.left(),
-                            dragged_rect.top() - start_rect.top())
-                    self._show_toolbar()
-                    self._update_result_cursor(event.pos())
-                    self.update()
-                    return
-                # 松开即识别，不再需要额外确认；工具条等新结果回来再显示
+                # 松开即按新范围重裁：截图态重新取景，翻译态重新识别，
+                # 都不把旧内容搬到新位置上去
                 self._confirm_selection()
                 return
         else:
@@ -2722,9 +2833,14 @@ class ScreenshotWidget(QWidget):
         self._update_result_cursor(event.pos())
         self.update()
 
-    def _begin_result_drag(self, pos):
+    def _begin_result_drag(self, pos, resize_only=False):
         """
         结果态按下：命中边/角或选区内部时进入拖动调整
+
+        Args:
+            pos (QPoint): 按下的位置（遮罩局部逻辑坐标）
+            resize_only (bool): 只认边/角。编辑态用它把「抓边框缩放选区」
+                从标注工具手里抢过来，选区内部仍旧交给标注/平移
 
         Returns:
             bool: 是否已进入拖动；False 表示事件应继续交给段落命中/新框选
@@ -2737,8 +2853,7 @@ class ScreenshotWidget(QWidget):
         zone = self._hit_zone(pos, rect)
         if zone is None:
             return False
-        if self.capture_only and self._capture_edit and zone[0] != 'move':
-            # 编辑态禁止缩放选区：重裁会让已烧录的标注与内容错位
+        if resize_only and zone[0] != 'resize':
             return False
         if zone[0] == 'move' and self._result is not None \
                 and self._paragraph_at(pos) is not None:
@@ -2747,6 +2862,9 @@ class ScreenshotWidget(QWidget):
         self._drag_mode, self._resize_edges = zone
         self._drag_origin = QPoint(pos)
         self._drag_start_rect = QRect(rect)
+        if self._capture_editor is not None:
+            # 选区要重取景，选中图元的手柄先收起来，免得两套手柄叠在一起
+            self._capture_editor._clear_selection(update=False)
         self._hide_toolbar()
         self._update_result_cursor(pos)
         return True
@@ -2855,13 +2973,19 @@ class ScreenshotWidget(QWidget):
         zone = self._hit_zone(pos)
         if zone is None:
             self.setCursor(QCursor(Qt.CrossCursor))
-        elif zone[0] == 'move':
-            if self._result is not None and self._paragraph_at(pos) is not None:
-                self.setCursor(QCursor(Qt.ArrowCursor))
-            else:
-                self.setCursor(QCursor(Qt.SizeAllCursor))
-        else:
+        elif zone[0] == 'resize':
             self.setCursor(QCursor(self._cursor_for_edges(zone[1])))
+        elif self.capture_only and self._capture_edit:
+            editor = self._capture_editor
+            if editor is not None and (editor.eyedropper_mode
+                                       or editor.tool != TOOL_SELECT):
+                # 选区内部是落笔/取色的地方，保持工具自己的光标
+                return
+            self.setCursor(QCursor(Qt.SizeAllCursor))
+        elif self._result is not None and self._paragraph_at(pos) is not None:
+            self.setCursor(QCursor(Qt.ArrowCursor))
+        else:
+            self.setCursor(QCursor(Qt.SizeAllCursor))
 
     def _set_selection_rect(self, rect):
         """把选区矩形写回 begin/end 两个端点（end 为开区间上界）"""

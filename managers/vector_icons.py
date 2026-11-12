@@ -219,8 +219,24 @@ def _draw_redo(painter, color):
         QPointF(20.0, 8.0), QPointF(20.0, 13.6), QPointF(14.6, 13.6)]))
 
 
-def _draw_clear(painter, color):
+def _draw_trash(painter, color):
+    """垃圾桶：清空全部标注（与「取消」的叉号区分开）"""
     _stroke(painter, color)
+    painter.drawLine(QPointF(4.0, 7.0), QPointF(20.0, 7.0))
+    painter.drawPolyline(QPolygonF([
+        QPointF(9.2, 7.0), QPointF(9.2, 4.2), QPointF(14.8, 4.2),
+        QPointF(14.8, 7.0)]))
+    painter.drawPolyline(QPolygonF([
+        QPointF(6.2, 7.0), QPointF(7.2, 20.0), QPointF(16.8, 20.0),
+        QPointF(17.8, 7.0)]))
+    _stroke(painter, color, 1.3)
+    painter.drawLine(QPointF(10.2, 10.4), QPointF(10.6, 16.8))
+    painter.drawLine(QPointF(13.8, 10.4), QPointF(13.4, 16.8))
+
+
+def _draw_close(painter, color):
+    """叉号：取消/退出"""
+    _stroke(painter, color, 1.9)
     painter.drawLine(QPointF(6.0, 6.0), QPointF(18.0, 18.0))
     painter.drawLine(QPointF(18.0, 6.0), QPointF(6.0, 18.0))
 
@@ -285,7 +301,8 @@ _DRAWERS = {
     'eyedropper': _draw_eyedropper,
     'undo': _draw_undo,
     'redo': _draw_redo,
-    'clear': _draw_clear,
+    'trash': _draw_trash,
+    'close': _draw_close,
     'check': _draw_check,
     'ocr': _draw_ocr,
     'scroll': _draw_scroll,

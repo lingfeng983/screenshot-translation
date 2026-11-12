@@ -16,7 +16,8 @@ from PyQt5.QtWidgets import (QColorDialog, QHBoxLayout, QPushButton, QWidget)
 
 from . import vector_icons
 from .capture_annotation import (
-    FONT_CHOICES, PRESET_COLORS, TOOLS, TOOL_LABELS, WIDTH_CHOICES)
+    DEFAULT_FONT_SIZE, DEFAULT_WIDTH, FONT_CHOICES, PRESET_COLORS, TOOLS,
+    TOOL_LABELS, WIDTH_CHOICES)
 from .toolbar_combo import SmallComboBox, chrome_width, content_width
 
 # 工具键 → 图标名（文字标注用 T 图标，避免与「提取文本」的文档图标混淆）
@@ -31,6 +32,8 @@ _ICON_BUTTON_SIZE = QSize(28, 27)
 # 下拉宽度按内容实测（见 toolbar_combo）：边框/内边距/箭头不再写死常量
 _COLOR_SWATCH_SIZE = 14
 _CUSTOM_COLOR_LABEL = '自定义…'
+# 取消（退出截图）用红色叉号，与「清空标注」的垃圾桶一眼分开
+_CANCEL_COLOR = '#ff6b6b'
 _SWATCH_CACHE = {}
 
 
@@ -71,6 +74,8 @@ QPushButton[iconAction="true"] { padding: 2px 4px; }
 QPushButton:hover { background-color: #2d2f33; }
 QPushButton:pressed { background-color: #3c3f44; }
 QPushButton:checked { background-color: #3b82f6; color: #ffffff; }
+QPushButton#CaptureCancel:hover { background-color: #5a2a2e; }
+QPushButton#CaptureCancel:pressed { background-color: #7a3238; }
 QComboBox {
     background-color: #262d3b;
     border: 1px solid #3a3d42;
@@ -91,6 +96,32 @@ QComboBox QAbstractItemView {
     color: #e5eaf2;
     selection-background-color: #3b82f6;
     outline: none;
+    /* 全局浅色样式留了 4px 内边距，不覆盖掉就是一圈亮色边框 */
+    padding: 2px;
+}
+/* 字号有 13 档，弹出列表要滚动：滚动条也走工具条自己的配色 */
+QComboBox QAbstractItemView QScrollBar:vertical {
+    background: #1e2430;
+    border: none;
+    width: 8px;
+    /* 不留 margin：margin 那一圈不被 QSS 背景覆盖，会露出全局浅色底 */
+    margin: 0;
+}
+QComboBox QAbstractItemView QScrollBar::handle:vertical {
+    background: #3f4a5e;
+    border-radius: 3px;
+    min-height: 22px;
+}
+QComboBox QAbstractItemView QScrollBar::handle:vertical:hover {
+    background: #3b82f6;
+}
+QComboBox QAbstractItemView QScrollBar::add-line:vertical,
+QComboBox QAbstractItemView QScrollBar::sub-line:vertical {
+    height: 0px;
+}
+QComboBox QAbstractItemView QScrollBar::add-page:vertical,
+QComboBox QAbstractItemView QScrollBar::sub-page:vertical {
+    background: none;
 }
 """
 
@@ -114,7 +145,7 @@ class CaptureToolbar(QWidget):
     cancel_clicked = pyqtSignal()
 
     def __init__(self, parent, tool='select', color=PRESET_COLORS[0],
-                 width=WIDTH_CHOICES[1], font_size=FONT_CHOICES[1]):
+                 width=DEFAULT_WIDTH, font_size=DEFAULT_FONT_SIZE):
         super().__init__(parent)
         self.setObjectName('CaptureToolbar')
         self.setAttribute(Qt.WA_StyledBackground, True)
@@ -173,7 +204,7 @@ class CaptureToolbar(QWidget):
         self.redo_button = self._icon_button('redo', '重做 (Ctrl+Y)')
         self.redo_button.clicked.connect(self.redo_clicked.emit)
         layout.addWidget(self.redo_button)
-        self.clear_button = self._icon_button('clear', '清空全部标注')
+        self.clear_button = self._icon_button('trash', '清空全部标注')
         self.clear_button.clicked.connect(self.clear_clicked.emit)
         layout.addWidget(self.clear_button)
         layout.addSpacing(5)
@@ -182,7 +213,7 @@ class CaptureToolbar(QWidget):
         self.ocr_button = self._icon_button('ocr', '提取图中文字（本地 OCR）')
         self.ocr_button.clicked.connect(self.ocr_clicked.emit)
         layout.addWidget(self.ocr_button)
-        self.scroll_button = self._icon_button('scroll', '滚动截图（长截图）')
+        self.scroll_button = self._icon_button('scroll', '长截图（自己滚动页面）')
         self.scroll_button.clicked.connect(self.scroll_clicked.emit)
         layout.addWidget(self.scroll_button)
         layout.addSpacing(5)
@@ -197,7 +228,9 @@ class CaptureToolbar(QWidget):
         self.pin_button = self._icon_button('pin', '钉到屏幕 (P)')
         self.pin_button.clicked.connect(self.pin_clicked.emit)
         layout.addWidget(self.pin_button)
-        self.cancel_button = self._icon_button('clear', '取消 (ESC)')
+        self.cancel_button = self._icon_button(
+            'close', '取消 (ESC)', color=_CANCEL_COLOR)
+        self.cancel_button.setObjectName('CaptureCancel')
         self.cancel_button.clicked.connect(self.cancel_clicked.emit)
         layout.addWidget(self.cancel_button)
 
@@ -227,9 +260,10 @@ class CaptureToolbar(QWidget):
 
     # ---- 构造辅助 ----
 
-    def _icon_button(self, icon_name, tooltip, checkable=False):
+    def _icon_button(self, icon_name, tooltip, checkable=False, color=None):
         button = QPushButton(self)
-        button.setIcon(vector_icons.icon(icon_name))
+        button.setIcon(vector_icons.icon(icon_name) if color is None
+                       else vector_icons.icon(icon_name, color))
         button.setIconSize(QSize(_ICON_SIZE, _ICON_SIZE))
         button.setFixedSize(_ICON_BUTTON_SIZE)
         button.setCheckable(checkable)

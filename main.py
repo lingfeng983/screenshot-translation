@@ -1147,10 +1147,8 @@ class ConfigWindow(QDialog):
         capture_layout.addRow(self.capture_magnifier_check)
 
         for attr, label, option, default, lo, hi, suffix in (
-                ('capture_scroll_delay_spin', '滚动等待:',
-                 'scroll_delay_ms', 180, 30, 2000, ' ms'),
-                ('capture_scroll_step_spin', '每次滚轮格数:',
-                 'scroll_step', 3, 1, 10, ' 格'),
+                ('capture_scroll_poll_spin', '长截图抓帧间隔:',
+                 'scroll_poll_ms', 120, 40, 1000, ' ms'),
                 ('capture_scroll_max_spin', '长图最大高度:',
                  'scroll_max_height', 12000, 1000, 40000, ' px')):
             spin = QSpinBox()
@@ -1549,10 +1547,8 @@ class ConfigWindow(QDialog):
         cm.set_capture_option(
             'magnifier',
             'true' if self.capture_magnifier_check.isChecked() else 'false')
-        cm.set_capture_option('scroll_delay_ms',
-                              str(self.capture_scroll_delay_spin.value()))
-        cm.set_capture_option('scroll_step',
-                              str(self.capture_scroll_step_spin.value()))
+        cm.set_capture_option('scroll_poll_ms',
+                              str(self.capture_scroll_poll_spin.value()))
         cm.set_capture_option('scroll_max_height',
                               str(self.capture_scroll_max_spin.value()))
 

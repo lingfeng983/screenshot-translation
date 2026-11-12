@@ -9,8 +9,7 @@ capture_only 模式下把鼠标与键盘事件转发进来，绘制时调用 pai
 
 标注默认仍然烧录进像素，但最近一次落笔的图元保持可编辑：可以拖着移动、拖
 手柄缩放、滚轮调线宽/字号，左键点到别处即取消选中；橡皮擦可以把自己画上去
-的图元擦掉。选区整体平移时所有图元同步平移（含撤销栈里的快照，撤销后不会
-跳回原位）。
+的图元擦掉。选区本身被移动或缩放时按新范围重新取景，旧标注随之丢弃。
 """
 
 import logging
@@ -23,9 +22,10 @@ from PyQt5.QtWidgets import QLineEdit
 from . import capture_magnifier
 from . import result_render
 from .capture_annotation import (
-    FONT_CHOICES, PRESET_COLORS, TOOLS, TOOL_ARROW, TOOL_ELLIPSE, TOOL_ERASER,
-    TOOL_HIGHLIGHT, TOOL_LINE, TOOL_PEN, TOOL_RECT, TOOL_SELECT, TOOL_STEP,
-    TOOL_TEXT, WIDTH_CHOICES, Shape, _MAX_SHAPES)
+    DEFAULT_FONT_SIZE, DEFAULT_WIDTH, FONT_CHOICES, PRESET_COLORS, TOOLS,
+    TOOL_ARROW, TOOL_ELLIPSE, TOOL_ERASER, TOOL_HIGHLIGHT, TOOL_LINE, TOOL_PEN,
+    TOOL_RECT, TOOL_SELECT, TOOL_STEP, TOOL_TEXT, WIDTH_CHOICES, Shape,
+    _MAX_SHAPES)
 
 logger = logging.getLogger('screenshot-translation')
 
@@ -92,8 +92,8 @@ class CaptureEditor:
         self.redo_stack = []
         self.tool = TOOL_SELECT
         self.color = PRESET_COLORS[0]
-        self.width = 4
-        self.font_size = FONT_CHOICES[1]
+        self.width = DEFAULT_WIDTH
+        self.font_size = DEFAULT_FONT_SIZE
         self.eyedropper_mode = False
         self._draft = None
         self._next_step = 1
@@ -391,7 +391,7 @@ class CaptureEditor:
         self.host.update()
 
     def reset_for_new_selection(self):
-        """选区被重新框选：标注属于旧画面，全部丢弃"""
+        """选区被重新取景：标注属于旧画面，全部丢弃"""
         self._cancel_draft()
         self._close_text_input(commit=False)
         self._end_transform()
@@ -401,16 +401,6 @@ class CaptureEditor:
         self.redo_stack.clear()
         self._next_step = 1
         self._notify()
-
-    def apply_translation(self, dx, dy):
-        """选区整体平移：图元与撤销栈里的快照一起搬，避免撤销后错位"""
-        if not self.shapes or (dx == 0 and dy == 0):
-            return
-        self.shapes = [s.translated(dx, dy) for s in self.shapes]
-        self.undo_stack = [
-            [s.translated(dx, dy) for s in snap] for snap in self.undo_stack]
-        self.redo_stack = [
-            [s.translated(dx, dy) for s in snap] for snap in self.redo_stack]
 
     def _notify(self):
         if self.on_state_changed:

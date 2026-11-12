@@ -98,7 +98,11 @@ class ConfigManager:
                 # 旧配置文件自动迁移：七个段逐个补齐。缺段的危害不只是读不到值
                 # （读侧有 fallback 兜着），而是 setter 里的 config.set 会直接
                 # 抛 NoSectionError——用户点一次“保存”就崩一次。
-                if self._migrate_sections() or self._migrate_values():
+                # 两步都要跑：短路成 `or` 会让缺段的老文件这一轮跳过值迁移，
+                # 死键与非法值要等到下次启动才被清掉
+                sections_changed = self._migrate_sections()
+                values_changed = self._migrate_values()
+                if sections_changed or values_changed:
                     self.save_config()
             except Exception as e:
                 logger.error(f"配置文件加载失败，回退默认配置: {e}")
@@ -150,6 +154,7 @@ class ConfigManager:
         - OCR 已固定为本地 RapidOCR：ocr_type、旧 Tesseract 语言与云端密钥
           都已无对应实现，留着只会让人以为还能配
         - 旧的 LLM 配置同样已无实现
+        - 长截图不再注入滚轮：scroll_step / scroll_delay_ms 已无实现
         - 目标语言收窄为中文/英文，旧值（如 ja）回落到中文
         - 界面固定浅色，旧配置里的主题选择不再生效
 
@@ -172,6 +177,11 @@ class ConfigManager:
         for option in ('llm_base_url', 'llm_api_key', 'llm_model'):
             if self.config.has_option('Translation', option):
                 self.config.remove_option('Translation', option)
+                migrated = True
+        # 长截图改成用户自己滚动：注入滚轮的步长与延时已无对应实现
+        for option in ('scroll_step', 'scroll_delay_ms'):
+            if self.config.has_option('Capture', option):
+                self.config.remove_option('Capture', option)
                 migrated = True
         if not self.config.has_option('OCR', 'rapidocr_score_threshold'):
             self.config.set('OCR', 'rapidocr_score_threshold', '0.5')
@@ -335,8 +345,7 @@ class ConfigManager:
         self.config.set('Capture', 'pen_width', '4')
         self.config.set('Capture', 'font_size', '18')
         self.config.set('Capture', 'magnifier', 'true')         # 框选时显示放大镜
-        self.config.set('Capture', 'scroll_delay_ms', '180')    # 滚动后等待渲染
-        self.config.set('Capture', 'scroll_step', '3')          # 每轮滚轮格数
+        self.config.set('Capture', 'scroll_poll_ms', '120')     # 长截图抓帧间隔
         self.config.set('Capture', 'scroll_max_height', '12000')  # 长图高度上限(px)
 
     def save_config(self):

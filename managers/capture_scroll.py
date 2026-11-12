@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-滚动截图（长截图）
+滚动截图（长截图）—— 用户自己滚动
 
-以框选区域为固定视口，向窗口注入滚轮消息，连续抓帧，用前一帧底部条带在
-下一帧里做垂直模板匹配求重叠量，再把每帧新增的部分拼成一张长图。
+以框选区域为固定视口，程序不注入任何滚轮消息：用户自己滚动页面，后台按固定
+间隔抓帧，用上一段底部条带在新帧里做垂直模板匹配求重叠量，把新增的部分拼成
+一张长图。用户点「完成」（或再按一次截图快捷键）结束，点「取消」丢弃。
 
 拼接部分（find_overlap / frame_diff / stitch_segments）是纯函数，不碰
-Win32 也不碰 Qt，可以离线单测；滚轮注入与抓帧隔离在平台函数里。
+Win32 也不碰 Qt，可以离线单测；抓帧隔离在平台函数里。
 """
 
+import ctypes
 import logging
 import sys
 import time
+from ctypes import wintypes
 
 from PIL import Image
 
@@ -20,22 +23,48 @@ logger = logging.getLogger('screenshot-translation')
 
 # 用于匹配的底部条带高度（像素）
 STRIP_HEIGHT = 80
-# 相邻帧平均绝对差低于此值视为「画面没动」（到底或被拦住）。
+# 相邻帧平均绝对差低于此值视为「画面没动」，不必再去匹配。
 # 不能用「变化小」当标准：白底细线的页面滚 60px 平均差也只有 1 左右，
-# 阈值给到 2 会把正常滚动误判成到底，长图只剩首帧。
+# 阈值给到 2 会把正常滚动误判成没动，长图只剩首帧。
 SIMILAR_THRESHOLD = 0.8
-# 连续几帧不动才判定结束，躲开一次偶然的静止（动画间隙）
-STILL_FRAMES = 2
 # 匹配置信度：TM_SQDIFF_NORMED 越小越像，超过此值认为没找到重叠
 MATCH_MAX_DISTANCE = 0.06
 # 新增内容少于该高度就没有拼接价值
 MIN_ADDED = 4
-MAX_FRAMES = 200
-# 遮罩在滚动期间会隐藏，用户没有中途取消的入口，兜一个总时限避免长时间无响应
-MAX_DURATION_SECONDS = 15.0
+# 抓帧间隔：用户滚多久就抓多久，间隔太大容易一次滚过头出现断层
+POLL_MS = 120
+MAX_SEGMENTS = 400
+# 兜底总时限：横幅万一没显示、快捷键也没按，线程不能永远轮询下去
+MAX_DURATION_SECONDS = 600.0
 
-_MOUSEEVENTF_WHEEL = 0x0800
-_WHEEL_DELTA = -120
+_SM_XVIRTUALSCREEN = 76
+_SM_YVIRTUALSCREEN = 77
+_SRCCOPY = 0x00CC0020
+_CAPTUREBLT = 0x40000000
+_DIB_RGB_COLORS = 0
+
+_IDLE_HINT = '自己滚动页面，新增内容会自动接上'
+_GROW_HINT = '继续滚动，或点「完成」结束'
+
+
+class ScrollProgress:
+    """抓帧线程 → 完成/取消横幅的共享状态：线程只写，主线程定时读"""
+
+    def __init__(self, height=0):
+        self.height = height
+        self.segments = 1
+        self.hint = _IDLE_HINT
+
+
+class _BITMAPINFOHEADER(ctypes.Structure):
+    _fields_ = [
+        ('biSize', wintypes.DWORD), ('biWidth', wintypes.LONG),
+        ('biHeight', wintypes.LONG), ('biPlanes', wintypes.WORD),
+        ('biBitCount', wintypes.WORD), ('biCompression', wintypes.DWORD),
+        ('biSizeImage', wintypes.DWORD), ('biXPelsPerMeter', wintypes.LONG),
+        ('biYPelsPerMeter', wintypes.LONG), ('biClrUsed', wintypes.DWORD),
+        ('biClrImportant', wintypes.DWORD),
+    ]
 
 
 def frame_diff(prev, cur):
@@ -119,6 +148,88 @@ def stitch_segments(segments):
     return out
 
 
+def _grab_region_win32(box, all_screens):
+    """
+    BitBlt 只抓选区那一小块（物理像素）
+
+    整屏 ImageGrab 一帧要 50ms 上下，手动滚动期间要一直轮询抓帧，撑不住；
+    这里只拷选区大小的位图，实测 7ms 左右。CAPTUREBLT 与 Pillow 保持一致，
+    分层窗口才抓得到。
+
+    Args:
+        box (tuple[int, int, int, int]): 相对抓拍图左上角的裁剪框
+        all_screens (bool): 抓拍图是否覆盖整块虚拟桌面（原点可能为负）
+
+    Returns:
+        PIL.Image.Image or None
+    """
+    left, top, right, bottom = (int(v) for v in box)
+    width, height = right - left, bottom - top
+    if width <= 0 or height <= 0:
+        return None
+
+    user32 = ctypes.windll.user32
+    gdi32 = ctypes.windll.gdi32
+    # 句柄是指针宽度，不声明签名会被当成 C int 截断
+    user32.GetDC.argtypes = [wintypes.HWND]
+    user32.GetDC.restype = wintypes.HDC
+    user32.ReleaseDC.argtypes = [wintypes.HWND, wintypes.HDC]
+    gdi32.CreateCompatibleDC.argtypes = [wintypes.HDC]
+    gdi32.CreateCompatibleDC.restype = wintypes.HDC
+    gdi32.CreateCompatibleBitmap.argtypes = [wintypes.HDC, ctypes.c_int,
+                                             ctypes.c_int]
+    gdi32.CreateCompatibleBitmap.restype = wintypes.HBITMAP
+    gdi32.SelectObject.argtypes = [wintypes.HDC, wintypes.HGDIOBJ]
+    gdi32.SelectObject.restype = wintypes.HGDIOBJ
+    gdi32.BitBlt.argtypes = [wintypes.HDC, ctypes.c_int, ctypes.c_int,
+                             ctypes.c_int, ctypes.c_int, wintypes.HDC,
+                             ctypes.c_int, ctypes.c_int, wintypes.DWORD]
+    gdi32.GetDIBits.argtypes = [wintypes.HDC, wintypes.HBITMAP, wintypes.UINT,
+                                wintypes.UINT, ctypes.c_void_p,
+                                ctypes.c_void_p, wintypes.UINT]
+    gdi32.DeleteObject.argtypes = [wintypes.HGDIOBJ]
+    gdi32.DeleteDC.argtypes = [wintypes.HDC]
+
+    if all_screens:
+        left += user32.GetSystemMetrics(_SM_XVIRTUALSCREEN)
+        top += user32.GetSystemMetrics(_SM_YVIRTUALSCREEN)
+
+    screen_dc = user32.GetDC(None)
+    if not screen_dc:
+        return None
+    mem_dc = gdi32.CreateCompatibleDC(screen_dc)
+    bitmap = (gdi32.CreateCompatibleBitmap(screen_dc, width, height)
+              if mem_dc else None)
+    if not bitmap:
+        if mem_dc:
+            gdi32.DeleteDC(mem_dc)
+        user32.ReleaseDC(None, screen_dc)
+        return None
+    try:
+        previous = gdi32.SelectObject(mem_dc, bitmap)
+        if not gdi32.BitBlt(mem_dc, 0, 0, width, height, screen_dc,
+                            left, top, _SRCCOPY | _CAPTUREBLT):
+            return None
+        header = _BITMAPINFOHEADER()
+        header.biSize = ctypes.sizeof(header)
+        header.biWidth = width
+        header.biHeight = -height       # 负高度 = 自上而下，省一次翻转
+        header.biPlanes = 1
+        header.biBitCount = 32
+        buffer = ctypes.create_string_buffer(width * height * 4)
+        lines = gdi32.GetDIBits(mem_dc, bitmap, 0, height, buffer,
+                                ctypes.byref(header), _DIB_RGB_COLORS)
+        gdi32.SelectObject(mem_dc, previous)
+        if lines != height:
+            return None
+        return Image.frombytes('RGB', (width, height), buffer, 'raw',
+                               'BGRX', 0, 1)
+    finally:
+        gdi32.DeleteObject(bitmap)
+        gdi32.DeleteDC(mem_dc)
+        user32.ReleaseDC(None, screen_dc)
+
+
 def grab_frame(context):
     """
     按 context 抓一帧选区图
@@ -129,165 +240,102 @@ def grab_frame(context):
     Returns:
         PIL.Image.Image or None
     """
+    box = tuple(context['crop_box'])
+    all_screens = bool(context.get('all_screens'))
+    if sys.platform == 'win32':
+        try:
+            image = _grab_region_win32(box, all_screens)
+        except Exception as e:
+            logger.warning(f"选区抓帧失败，退回整屏抓拍: {e}")
+            image = None
+        if image is not None:
+            return image
     from PIL import ImageGrab
     try:
-        full = ImageGrab.grab(all_screens=bool(context.get('all_screens')))
-        return full.crop(tuple(context['crop_box'])).copy()
+        full = ImageGrab.grab(all_screens=all_screens)
+        return full.crop(box).copy()
     except Exception as e:
         logger.warning(f"滚动截图抓帧失败: {e}")
         return None
 
 
-def scroll_down(center, step=3):
+def capture_scrolling(context, first_image, *, poll_ms=POLL_MS,
+                      max_height=12000, finish_event=None, cancel_event=None,
+                      grabber=None, progress=None):
     """
-    把光标移到视口中心并向下滚动 step 格（仅 Windows）
+    定时抓帧 + 拼接，直到用户结束；滚动由用户自己完成
 
     Args:
-        center (tuple[int, int]): 屏幕物理像素坐标
-        step (int): 滚轮格数
-
-    Returns:
-        bool: 是否成功注入
-    """
-    if sys.platform != 'win32':
-        return False
-    import ctypes
-    from ctypes import wintypes
-    try:
-        user32 = ctypes.windll.user32
-        # 显式声明签名：SetCursorPos 入参是 int，mouse_event 的 dwData 是
-        # DWORD、dwExtraInfo 是 ULONG_PTR，缺 argtypes 时全按 C int 传。
-        user32.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
-        user32.SetCursorPos.restype = wintypes.BOOL
-        user32.mouse_event.argtypes = [wintypes.DWORD, wintypes.DWORD,
-                                       wintypes.DWORD, wintypes.DWORD,
-                                       ctypes.c_void_p]
-        user32.SetCursorPos(int(center[0]), int(center[1]))
-        delta = ctypes.c_uint32(_WHEEL_DELTA).value
-        for _ in range(max(1, int(step))):
-            user32.mouse_event(_MOUSEEVENTF_WHEEL, 0, 0, delta, 0)
-        return True
-    except Exception as e:
-        logger.warning(f"滚轮注入失败: {e}")
-        return False
-
-
-def _cursor_pos():
-    """记录当前光标，滚动结束后还回去"""
-    if sys.platform != 'win32':
-        return None
-    import ctypes
-    from ctypes import wintypes
-    try:
-        user32 = ctypes.windll.user32
-        user32.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
-        user32.GetCursorPos.restype = wintypes.BOOL
-        point = wintypes.POINT()
-        if user32.GetCursorPos(ctypes.byref(point)):
-            return (point.x, point.y)
-    except Exception:
-        pass
-    return None
-
-
-def _restore_cursor(pos):
-    if not pos or sys.platform != 'win32':
-        return
-    import ctypes
-    from ctypes import wintypes
-    try:
-        user32 = ctypes.windll.user32
-        user32.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
-        user32.SetCursorPos.restype = wintypes.BOOL
-        user32.SetCursorPos(int(pos[0]), int(pos[1]))
-    except Exception:
-        pass
-
-
-def capture_scrolling(context, first_image, *, delay_ms=180, step=3,
-                      max_height=12000, cancel_event=None, grabber=None,
-                      scroller=None):
-    """
-    连续滚动 + 抓帧 + 拼接，返回长图
-
-    Args:
-        context (dict): 抓帧上下文（crop_box / all_screens / center）
+        context (dict): 抓帧上下文（crop_box / all_screens）
         first_image (PIL.Image.Image): 首帧选区图
-        delay_ms (int): 每轮滚动后等待渲染的毫秒数
-        step (int): 每轮滚轮格数
+        poll_ms (int): 抓帧间隔（毫秒）
         max_height (int): 长图总高度上限（像素）
-        cancel_event (threading.Event or None): 置位后立刻收手
+        finish_event (threading.Event or None): 置位后结束并返回长图
+        cancel_event (threading.Event or None): 置位后丢弃，返回 None
         grabber (callable or None): 注入的抓帧函数，便于测试
-        scroller (callable or None): 注入的滚动函数，便于测试
+        progress (ScrollProgress or None): 供横幅读取的实时状态
 
     Returns:
-        PIL.Image.Image or None: 拼接长图；完全无法滚动时至少返回首帧
+        PIL.Image.Image or None: 拼接长图；取消时 None，没滚动时是首帧
     """
     if first_image is None:
         return None
     grab = grabber or grab_frame
-    scroll = scroller or (lambda: scroll_down(context.get('center'), step))
-    original_cursor = _cursor_pos()
+    state = progress if progress is not None else ScrollProgress()
 
     # 第一段：首帧整张
     segments = [(first_image, first_image.height)]
     total = first_image.height
-    previous = first_image
-    still = 0
+    reference = first_image
+    state.height = total
+    state.segments = 1
+    state.hint = _IDLE_HINT
+    interval = max(0.02, poll_ms / 1000.0)
     started = time.monotonic()
 
-    try:
-        for _index in range(MAX_FRAMES):
-            if cancel_event is not None and cancel_event.is_set():
-                break
-            if time.monotonic() - started > MAX_DURATION_SECONDS:
-                logger.info("滚动截图达到总时限，停止抓取")
-                break
-            if not scroll():
-                logger.info("滚轮注入不可用，滚动截图只返回首帧")
-                break
-            time.sleep(max(0.0, delay_ms / 1000.0))
-            if cancel_event is not None and cancel_event.is_set():
-                break
+    while True:
+        if cancel_event is not None and cancel_event.is_set():
+            logger.info("用户取消长截图，丢弃已拼接内容")
+            return None
+        if finish_event is not None and finish_event.is_set():
+            break
+        if total >= max_height:
+            state.hint = f'已达高度上限 {max_height} px'
+            break
+        if len(segments) >= MAX_SEGMENTS \
+                or time.monotonic() - started > MAX_DURATION_SECONDS:
+            state.hint = '已达本次长截图上限'
+            break
 
-            frame = grab(context)
-            if frame is None or frame.size != first_image.size:
-                break
+        time.sleep(interval)
+        frame = grab(context)
+        if frame is None or frame.size != first_image.size:
+            state.hint = '抓帧中断，点「完成」保留已拼接部分'
+            break
 
-            # 到底判定：连续两帧几乎不变
-            if frame_diff(previous, frame) < SIMILAR_THRESHOLD:
-                still += 1
-                if still >= STILL_FRAMES:
-                    logger.info("画面连续静止，判定已滚动到底")
-                    break
-                previous = frame
-                continue
-            still = 0
+        # 画面没动就继续等，用户想滚多久都行
+        if frame_diff(reference, frame) < SIMILAR_THRESHOLD:
+            continue
 
-            overlap = find_overlap(previous, frame)
-            added = (frame.height - overlap) if overlap is not None else 0
-            if overlap is None or added < MIN_ADDED:
-                # 找不到重叠或几乎没有新增内容：到底、被拦住、滚动过快或
-                # 偶发匹配失败都可能，连续几次都这样才收手
-                still += 1
-                if still >= STILL_FRAMES:
-                    logger.info("连续无新增内容，停止拼接")
-                    break
-                previous = frame
-                continue
-            still = 0
+        overlap = find_overlap(reference, frame)
+        if overlap is None:
+            # 反向匹配能对上说明在往上滚；两边都对不上是一次滚过头了
+            state.hint = ('正在往上滚，长图只向下增长'
+                          if find_overlap(frame, reference) is not None
+                          else '滚动过快出现断层，请往回滚一点')
+            continue
+        added = frame.height - overlap
+        if added < MIN_ADDED:
+            continue
 
-            # 只把新增那一段接上去，避免重复内容
-            new_part = frame.crop((0, overlap, frame.width, frame.height))
-            segments.append((new_part, added))
-            total += added
-            previous = frame
-            if total >= max_height:
-                logger.info(f"长图达到高度上限 {max_height}，停止滚动")
-                break
-    finally:
-        _restore_cursor(original_cursor)
+        # 只把新增那一段接上去，避免重复内容
+        segments.append((frame.crop((0, overlap, frame.width, frame.height)),
+                         added))
+        total += added
+        reference = frame
+        state.height = total
+        state.segments = len(segments)
+        state.hint = _GROW_HINT
 
-    if len(segments) == 1:
-        logger.info("没有可拼接的新内容，返回首帧")
+    logger.info(f"长截图结束：{len(segments)} 段，{total} px")
     return stitch_segments(segments)
