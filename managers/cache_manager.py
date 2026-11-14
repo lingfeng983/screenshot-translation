@@ -24,9 +24,9 @@ class CacheManager:
     缓存条数有上限（LRU 淘汰），写盘按次数节流，进程退出时兜底落盘。
     """
 
-    def __init__(self, cache_file: str = None,
+    def __init__(self, cache_file: Optional[str] = None,
                  expire_hours: int = 24, max_entries: int = 1000,
-                 flush_every: int = 10):
+                 flush_every: int = 10, enabled: bool = True):
         """
         初始化缓存管理器
 
@@ -35,11 +35,13 @@ class CacheManager:
             expire_hours (int): 缓存过期时间（小时）
             max_entries (int): 缓存最大条数，超出按最旧条目淘汰
             flush_every (int): 每累积多少次写入才落盘一次
+            enabled (bool): 是否启用缓存；关闭后不读写明文缓存文件
         """
         if cache_file is None:
             from . import app_paths
             cache_file = app_paths.cache_file()
         self.cache_file = cache_file
+        self.enabled = bool(enabled)
         self.expire_hours = expire_hours
         self.max_entries = max_entries
         self.flush_every = max(flush_every, 1)
@@ -93,6 +95,8 @@ class CacheManager:
         Returns:
             Optional[str]: 缓存的翻译结果，如果没有则返回None
         """
+        if not self.enabled:
+            return None
         cache_key = self._get_cache_key(text, api_type)
 
         with self._lock:
@@ -120,6 +124,8 @@ class CacheManager:
             api_type (str): API类型
             translation (str): 翻译结果
         """
+        if not self.enabled:
+            return
         cache_key = self._get_cache_key(text, api_type)
 
         with self._lock:
@@ -149,10 +155,28 @@ class CacheManager:
         if self._pending_writes >= self.flush_every:
             self._save_cache()
 
+    def set_enabled(self, enabled):
+        """
+        开关缓存；关闭时清掉内存与磁盘上的明文原文/译文
+
+        Args:
+            enabled (bool): 是否启用
+        """
+        with self._lock:
+            enabled = bool(enabled)
+            if enabled == self.enabled:
+                return
+            self.enabled = enabled
+            if not enabled:
+                self._cache.clear()
+                self._pending_writes = 0
+                self._delete_cache_file()
+                logger.info("翻译缓存已关闭，已清除本地明文缓存")
+
     def flush(self):
         """立即把待落盘的缓存写入文件（进程退出时由 atexit 兜底调用）"""
         with self._lock:
-            if self._pending_writes:
+            if self.enabled and self._pending_writes:
                 self._save_cache()
 
     def _load_cache(self):
@@ -178,8 +202,18 @@ class CacheManager:
             logger.error(f"加载缓存失败: {e}")
             self._cache = {}
 
+    def _delete_cache_file(self):
+        """删除磁盘上的明文缓存文件（失败只记日志）"""
+        try:
+            if os.path.isfile(self.cache_file):
+                os.remove(self.cache_file)
+        except OSError as e:
+            logger.warning(f"删除翻译缓存文件失败: {e}")
+
     def _save_cache(self):
         """保存缓存到文件（原子写入，避免中断产生损坏文件）"""
+        if not self.enabled:
+            return
         # 临时名带进程与线程标识：多实例共用固定 ".tmp" 时，两个写者会互相
         # 顶替同一个临时文件，失败方清理时还会把对方正在写的那份删掉
         tmp_file = (f"{self.cache_file}.{os.getpid()}"
@@ -196,6 +230,14 @@ class CacheManager:
             # 先写入同目录下的临时文件，再原子替换，防止写入中断损坏原文件
             with open(tmp_file, 'w', encoding='utf-8') as f:
                 json.dump(self._cache, f, ensure_ascii=False, indent=2)
+            try:
+                # 缓存里是明文的截图原文与译文，和 config.ini 一样收紧到仅属主
+                # 可读写（POSIX 下 0o600）。收紧必须在 replace 之前：替换后再
+                # chmod，明文会有一段按默认权限对同机其它用户可读的窗口。
+                os.chmod(tmp_file, 0o600)
+            except OSError:
+                # Windows 等平台 chmod 语义有限，失败不影响主流程
+                pass
             os.replace(tmp_file, self.cache_file)
             self._pending_writes = 0
             logger.debug(f"缓存保存成功，共{len(self._cache)}条记录")
@@ -221,10 +263,11 @@ class CacheManager:
             logger.debug(f"清理了{len(expired_keys)}条过期缓存")
 
     def clear_cache(self):
-        """清空所有缓存"""
+        """清空所有缓存：内存清零并直接删掉磁盘上的明文文件"""
         with self._lock:
             self._cache.clear()
-            self._save_cache()
+            self._pending_writes = 0
+            self._delete_cache_file()
             logger.info("缓存已清空")
 
     def get_cache_stats(self) -> dict:

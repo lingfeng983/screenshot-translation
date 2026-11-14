@@ -1,10 +1,17 @@
 # 开发/发版依赖（运行程序本身不需要，装 requirements.txt 就够了）
-# 用法：pip install -r requirements.txt -r requirements-dev.txt
+# 用法：pip install -r requirements.txt -r requirements-dev.txt -c constraints.txt
 
 -r requirements.txt
 
 # 跑测试（python -m pytest tests/ -q）
-pytest
+pytest>=8,<10
+pytest-cov>=5,<8
+
+# 静态检查：ruff 只把"语法错误/未定义名"这类零误报规则设成门禁，
+# 其余风格规则可本地按需启用；mypy 按 pyproject.toml 的宽松配置检查 managers 包。
+# CI 会跑 `ruff check ...` 与 `mypy -p managers`（配置见 pyproject.toml）
+ruff>=0.6,<1
+mypy>=1.10,<3
 
 # 出包（python -m PyInstaller screenshot-translator.spec）
-PyInstaller
+PyInstaller>=6,<7

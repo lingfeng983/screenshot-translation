@@ -42,21 +42,27 @@ class GoogleFreeProvider(TranslationProvider):
         import requests
 
         def translate_chunk(chunk):
-            """翻译单个文本块"""
+            """翻译单个文本块（原文只放请求体，不进 URL 查询串）"""
             params = {
                 'client': 'gtx',       # gtx 即网页版翻译使用的公开客户端
                 'sl': source or 'auto',
                 'tl': target,
                 'dt': 't',             # 返回逐段翻译结果
                 'dj': '1',             # 结构化JSON响应，便于拼接
-                'q': chunk,
             }
+            # 原先用 GET 把 q 拼进 URL：查询串会被浏览器历史、正向代理、
+            # CDN 与服务端访问日志原样记录，截图里的原文等于被抄走一份。
+            # 该端点接受表单编码的 POST，原文放 body 就不会出现在这些日志里。
             try:
-                response = self.session.get(
+                response = self.session.post(
                     DEFAULT_ENDPOINT,
                     params=params,
+                    data={'q': chunk},
                     timeout=self._http_timeout(),
-                    headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+                    headers={
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+                        'Content-Type': 'application/x-www-form-urlencoded',
+                    }
                 )
             except requests.RequestException as e:
                 raise wrap_request_error(e, 'Google免费翻译') from e

@@ -207,23 +207,29 @@ def _grab_region_win32(box, all_screens):
         return None
     try:
         previous = gdi32.SelectObject(mem_dc, bitmap)
-        if not gdi32.BitBlt(mem_dc, 0, 0, width, height, screen_dc,
-                            left, top, _SRCCOPY | _CAPTUREBLT):
-            return None
-        header = _BITMAPINFOHEADER()
-        header.biSize = ctypes.sizeof(header)
-        header.biWidth = width
-        header.biHeight = -height       # 负高度 = 自上而下，省一次翻转
-        header.biPlanes = 1
-        header.biBitCount = 32
-        buffer = ctypes.create_string_buffer(width * height * 4)
-        lines = gdi32.GetDIBits(mem_dc, bitmap, 0, height, buffer,
-                                ctypes.byref(header), _DIB_RGB_COLORS)
-        gdi32.SelectObject(mem_dc, previous)
-        if lines != height:
-            return None
-        return Image.frombytes('RGB', (width, height), buffer, 'raw',
-                               'BGRX', 0, 1)
+        try:
+            if not gdi32.BitBlt(mem_dc, 0, 0, width, height, screen_dc,
+                                left, top, _SRCCOPY | _CAPTUREBLT):
+                return None
+            header = _BITMAPINFOHEADER()
+            header.biSize = ctypes.sizeof(header)
+            header.biWidth = width
+            header.biHeight = -height       # 负高度 = 自上而下，省一次翻转
+            header.biPlanes = 1
+            header.biBitCount = 32
+            buffer = ctypes.create_string_buffer(width * height * 4)
+            lines = gdi32.GetDIBits(mem_dc, bitmap, 0, height, buffer,
+                                    ctypes.byref(header), _DIB_RGB_COLORS)
+            if lines != height:
+                return None
+            return Image.frombytes('RGB', (width, height), buffer, 'raw',
+                                   'BGRX', 0, 1)
+        finally:
+            # 位图仍被选进 mem_dc 时 DeleteObject 会失败并留下一个 GDI 对象；
+            # 长截图是高频抓帧，BitBlt/GetDIBits 任一失败路径漏掉这一步都会
+            # 持续累积句柄。恢复旧对象必须放在所有 return 之前的内层 finally。
+            if previous:
+                gdi32.SelectObject(mem_dc, previous)
     finally:
         gdi32.DeleteObject(bitmap)
         gdi32.DeleteDC(mem_dc)

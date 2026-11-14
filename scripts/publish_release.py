@@ -4,16 +4,19 @@
 一条命令出包 + 发版到 GitHub
 
 流程：
+    0. 预检（全只读）：干净工作树、CHANGELOG、tag 与 HEAD 一致、版本号可写、
+       复用产物是否齐备、origin 是否为发布目标仓库
     1. pytest 全量测试（--skip-tests 可跳过）
-    2. PyInstaller 构建 onedir（RapidOCR 模型随 exe 分发，安装时不再下载组件）
-    3. 出包：onedir 同步到 release/onedir/ → Inno Setup 编译唯一的交付物
+    2. CHANGELOG 的 [Unreleased] 段落就地改名为 [v版本] — 日期
+    3. 写 APP_VERSION → PyInstaller 构建 onedir（模型随 exe 分发）
+    4. 出包：onedir 同步到 release/onedir/ → Inno Setup 编译唯一的交付物
        release/ScreenshotTranslator-Setup.exe
-    4. CHANGELOG 的 [Unreleased] 段落就地改名为 [v版本] — 日期
-    5. git commit + tag + push（含 tag；origin 推 GitHub，gitee 远程存在则镜像）
-    6. GitHub API 创建/更新 Release（取 [v版本] 段作为说明），并上传安装包
-       （uploads.github.com，二进制 body）：同名旧附件要等新附件传成功才删，
-       所以整条命令可以重复执行。
-       origin 与发布目标仓库不一致时在第 1 步之前就中止。
+    5. 可选代码签名（ST_SIGNTOOL_COMMAND），成功则固化发布者指纹
+    6. git commit（只提交显式清单里的文件）+ tag + push（gitee 存在则镜像）
+    7. GitHub API 创建/更新 Release（取 [v版本] 段作为说明），流式上传安装包：
+       同名旧附件要等新附件传成功才删，所以整条命令可以重复执行。
+
+任何"必然会失败"的条件都在第 0 步验完；预检之后才允许改文件。
 
 用法：
     python scripts/publish_release.py --version 1.2.0
@@ -84,7 +87,7 @@ def run(cmd, cwd=PROJECT_ROOT, check=True, env=None, capture=False):
 
 
 def step_tests(skip):
-    print("\n=== 1/6 测试 ===")
+    print("\n=== 1/7 测试 ===")
     if skip:
         print("跳过（--skip-tests）")
         return
@@ -110,7 +113,7 @@ def step_app_version(version):
 
 
 def step_build(version, no_build):
-    print("\n=== 2/6 PyInstaller 构建 ===")
+    print("\n=== 3/7 PyInstaller 构建 ===")
     if no_build:
         print("跳过（--no-build）")
         return
@@ -120,7 +123,7 @@ def step_build(version, no_build):
 
 
 def step_assemble(version):
-    print("\n=== 3/6 出包：Setup.exe ===")
+    print("\n=== 4/7 出包：Setup.exe ===")
     src = os.path.join(PROJECT_ROOT, "dist", "ScreenshotTranslator")
     dst = os.path.join(PROJECT_ROOT, "release", "onedir")
     if not os.path.isdir(src):
@@ -136,11 +139,138 @@ def step_assemble(version):
     run([iscc, f"/DMyAppVersion={version}", iss], capture=True)
 
 
+def read_changelog():
+    """CHANGELOG 全文（预检与版本化共用一个读取入口）"""
+    with open(os.path.join(PROJECT_ROOT, "CHANGELOG.md"), encoding="utf-8") as f:
+        return f.read()
+
+
+def check_changelog(version, only_release=False):
+    """
+    发版文案的只读预检
+
+    以前这项检查放在 step_changelog 里，而 step_changelog 排在测试、写版本号、
+    PyInstaller 构建、删除重建 release/onedir 与 Inno 编译之后——脚本跑到一半
+    才因为「CHANGELOG 没有 [Unreleased] 段」退出，版本源码和产物已经被改过。
+    所有这类"必然会失败"的条件都必须在任何写操作之前验完。
+    """
+    text = read_changelog()
+    header = f"## [v{version}]"
+    if only_release:
+        if header not in text:
+            sys.exit(f"CHANGELOG.md 中没有 {header} 段，--only-release 无法取到发行说明")
+        return
+    if header not in text and "## [Unreleased]" not in text:
+        sys.exit("CHANGELOG.md 中既没有 '## [Unreleased]' 段，也没有本次版本的段落，"
+                 "无法自动版本化，请手动处理")
+
+
+def preflight(version, args):
+    """
+    发版预检：全部只读，且必须排在任何写操作之前
+
+    检查：发布目标仓库、工作树是否干净、CHANGELOG 文案、tag 与 HEAD 是否一致、
+    版本常量能否写入、复用产物时文件是否齐备、签名命令是否可用。
+    """
+    print("\n=== 0/7 发版预检 ===")
+    check_origin()
+    check_changelog(version, only_release=args.only_release)
+
+    if not args.only_release:
+        status = subprocess.run(
+            ["git", "status", "--porcelain"], cwd=PROJECT_ROOT,
+            capture_output=True, text=True).stdout.strip()
+        if status:
+            sys.exit("工作区不干净，请先提交或清理以下文件再发版（未跟踪的生产模块"
+                     "尤其容易在 git add -A 时被带出去）：\n" + status[:4000])
+
+    tag = f"v{version}"
+    tagged = git_output(["git", "rev-list", "-n", "1", tag])
+    head = git_output(["git", "rev-parse", "HEAD"])
+    if tagged and head and tagged != head:
+        sys.exit(f"tag {tag} 已存在且指向 {tagged[:8]}，当前提交是 {head[:8]}："
+                 f"发出去的附件会和该 tag 的源码不一致。请用新版本号重发，"
+                 f"或确认无误后自行 git tag -f {tag} 再重跑")
+
+    if not args.only_release:
+        app_version_path = os.path.join(PROJECT_ROOT, "managers", "app_version.py")
+        with open(app_version_path, encoding="utf-8") as f:
+            if not re.search(r"(?m)^APP_VERSION = '[^']*'$", f.read()):
+                sys.exit("managers/app_version.py 中找不到 APP_VERSION 定义，无法写入版本号")
+        if args.no_build and not os.path.isdir(
+                os.path.join(PROJECT_ROOT, "dist", "ScreenshotTranslator")):
+            sys.exit("--no-build 需要现成的 dist/ScreenshotTranslator/ 产物")
+
+    if args.only_release:
+        # 正常流程会重新编译安装包，只有"只补发行版"时才要求附件已存在
+        installer = os.path.join(PROJECT_ROOT, "release", "ScreenshotTranslator-Setup.exe")
+        if not os.path.isfile(installer):
+            sys.exit(f"缺少待上传附件: {installer}")
+
+    if not args.only_release and os.environ.get("ST_SIGNTOOL_COMMAND", "").strip():
+        import shlex
+        if "$f" not in shlex.split(os.environ["ST_SIGNTOOL_COMMAND"]):
+            sys.exit("ST_SIGNTOOL_COMMAND 必须包含 $f 占位符（待签名的 Setup.exe 路径）")
+    print("预检通过")
+
+
+PUBLISHER_THUMBPRINT_FILE_NAME = "publisher_thumbprint.txt"
+
+
+def step_sign():
+    """
+    可选的代码签名与发布者指纹固化
+
+    设置 ``ST_SIGNTOOL_COMMAND``（含 ``$f`` 占位符，指向待签名的 Setup.exe）
+    时对安装包签名，验签通过后把证书指纹写进随程序分发的
+    ``resources/publisher_thumbprint.txt``——客户端据此强制校验自动更新的
+    签名者身份。未配置时只警告，保持历史发布可用（仍强制 sha256 摘要）。
+    """
+    print("\n=== 5/7 代码签名（可选） ===")
+    command = os.environ.get("ST_SIGNTOOL_COMMAND", "").strip()
+    if not command:
+        logger.warning("未配置 ST_SIGNTOOL_COMMAND：安装包未做 Authenticode 签名，"
+                       "自动更新只能依赖 Release 附件的 sha256 摘要。"
+                       "配置签名证书后重跑可启用发布者指纹校验")
+        return
+    if sys.platform != "win32":
+        sys.exit("代码签名需要 Windows 上的 signtool / PowerShell")
+
+    import json
+    import shlex
+    installer = os.path.join(PROJECT_ROOT, "release", "ScreenshotTranslator-Setup.exe")
+    argv = [part.replace("$f", installer) for part in shlex.split(command)]
+    run(argv)
+    script = (
+        "$sig = Get-AuthenticodeSignature -LiteralPath $env:ST_SIGN_FILE; "
+        "$thumb = ''; "
+        "if ($sig.SignerCertificate) { "
+        "$thumb = [string]$sig.SignerCertificate.Thumbprint }; "
+        "@{ status = [string]$sig.Status; thumbprint = $thumb } | "
+        "ConvertTo-Json -Compress"
+    )
+    result = subprocess.run(
+        ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+        env=dict(os.environ, ST_SIGN_FILE=installer),
+        capture_output=True, text=True, timeout=30)
+    if result.returncode != 0:
+        sys.exit(f"验签失败：{(result.stderr or '').strip()[:300]}")
+    info = json.loads((result.stdout or '').strip() or '{}')
+    status = str(info.get('status') or '')
+    thumb = str(info.get('thumbprint') or '').replace(' ', '').upper()
+    if status != 'Valid' or len(thumb) != 40:
+        sys.exit(f"安装包签名无效（状态 {status or '未知'}，指纹 {thumb or '空'}），"
+                 f"已中止发版，避免发布客户端校验不过的包")
+
+    thumb_path = os.path.join(PROJECT_ROOT, "resources", PUBLISHER_THUMBPRINT_FILE_NAME)
+    with open(thumb_path, "w", encoding="utf-8") as f:
+        f.write(thumb + "\n")
+    print(f"安装包签名有效，发布者指纹已写入 {thumb_path}")
+
+
 def step_changelog(version):
-    print("\n=== 4/6 CHANGELOG 版本化 ===")
-    path = os.path.join(PROJECT_ROOT, "CHANGELOG.md")
-    with open(path, encoding="utf-8") as f:
-        text = f.read()
+    print("\n=== 2/7 CHANGELOG 版本化 ===")
+    text = read_changelog()
     header = f"## [v{version}] — {date.today():%Y-%m-%d}"
     if header in text:
         print(f"已存在 {header}，跳过")
@@ -148,7 +278,8 @@ def step_changelog(version):
         if "## [Unreleased]" not in text:
             sys.exit("CHANGELOG.md 中没有 '## [Unreleased]' 段，无法自动版本化，请手动处理")
         text = text.replace("## [Unreleased]", header, 1)
-        with open(path, "w", encoding="utf-8") as f:
+        with open(os.path.join(PROJECT_ROOT, "CHANGELOG.md"), "w",
+                  encoding="utf-8") as f:
             f.write(text)
         print(f"[Unreleased] -> {header}")
     return extract_notes(text, version)
@@ -188,10 +319,15 @@ def check_origin():
 
 
 def step_git(version, notes_title):
-    print("\n=== 5/6 git 提交 / tag / 推送 ===")
+    print("\n=== 6/7 git 提交 / tag / 推送 ===")
     tag = f"v{version}"
-    run(["git", "add", "-A"])
-    # release/ 在 .gitignore 内，不会被带入
+    # 显式清单而不是 git add -A：发版提交只包含本次脚本自己改过的文件。
+    # 开发者手边没审查完的改动、未跟踪的在制品都不该被一次发版顺手推上去。
+    release_files = ["CHANGELOG.md", "managers/app_version.py"]
+    thumbprint_file = "resources/publisher_thumbprint.txt"
+    if os.path.isfile(os.path.join(PROJECT_ROOT, thumbprint_file)):
+        release_files.append(thumbprint_file)
+    run(["git", "add", "--", *release_files])
     status = subprocess.run(["git", "diff", "--cached", "--quiet"],
                             cwd=PROJECT_ROOT).returncode
     if status != 0:
@@ -317,6 +453,52 @@ def get_release(tag, token):
     return d if d.get("id") else None
 
 
+def stream_upload(url, path, token, timeout=120):
+    """
+    流式上传附件（几十 MB 的 EXE 不整块读进内存）
+
+    urllib 的 Request.data 会把 bytes 一次性塞进请求体；这里直接用
+    http.client 分块 send，Content-Length 由本地文件大小给出。
+
+    Raises:
+        HTTPError: GitHub 返回非 2xx，错误体交给 error_detail 读出
+    """
+    import http.client
+    import io
+    import json
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(url)
+    target = parts.path + (('?' + parts.query) if parts.query else '')
+    headers = {
+        'Authorization': f'Bearer {token}',
+        'Accept': 'application/vnd.github+json',
+        'User-Agent': 'publish-release/1.0',
+        'X-GitHub-Api-Version': '2022-11-28',
+        'Content-Type': 'application/octet-stream',
+        'Content-Length': str(os.path.getsize(path)),
+    }
+    conn = http.client.HTTPSConnection(parts.hostname, parts.port or 443,
+                                       timeout=timeout)
+    try:
+        conn.putrequest('POST', target)
+        for key, value in headers.items():
+            conn.putheader(key, value)
+        conn.endheaders()
+        with open(path, 'rb') as handle:
+            for chunk in iter(lambda: handle.read(256 * 1024), b''):
+                conn.send(chunk)
+        response = conn.getresponse()
+        raw = response.read()
+        status, response_headers = response.status, response.headers
+    finally:
+        conn.close()
+    if not 200 <= status < 300:
+        raise HTTPError(url, status, '附件上传失败', response_headers,
+                        io.BytesIO(raw))
+    return json.loads(raw.decode('utf-8') or '{}')
+
+
 def upload_attachment(rid, path, token):
     """
     上传单个附件，成功后才删被它顶掉的同名旧附件
@@ -334,13 +516,10 @@ def upload_attachment(rid, path, token):
         print(f"  ⚠ 列不出已有附件（HTTP {e.code}），跳过同名旧附件清理")
         stale = []
 
-    with open(path, "rb") as f:
-        payload = f.read()
     upload_url = (f"{GITHUB_UPLOAD}/repos/{GITHUB_REPO}/releases/{rid}/assets"
                   f"?name={quote(name)}")
     # 上传是几十 MB 的二进制，慢网下单次写可能远超普通 API 的超时
-    resp = api_request(upload_url, token, data=payload,
-                       content_type="application/octet-stream", timeout=120)
+    resp = stream_upload(upload_url, path, token, timeout=120)
     print(f"  已上传 {resp['name']}（{resp.get('size', 0) / 1048576:.1f} MB）")
     print(f"  {resp['browser_download_url']}")
     undeleted = []
@@ -373,7 +552,7 @@ def collect_attachments():
 
 
 def step_release(version, notes, token, no_api):
-    print("\n=== 6/6 GitHub Release ===")
+    print("\n=== 7/7 GitHub Release ===")
     tag = f"v{version}"
     if no_api or not token:
         if not no_api:
@@ -447,19 +626,22 @@ def main():
 
     if not re.fullmatch(r"\d+\.\d+\.\d+", args.version):
         sys.exit("版本号格式应为 x.y.z")
-    check_origin()
+    # 所有只读预检都排在写操作之前：工作树、CHANGELOG、tag、产物、签名配置
+    preflight(args.version, args)
 
     if args.only_release:
-        with open(os.path.join(PROJECT_ROOT, "CHANGELOG.md"), encoding="utf-8") as f:
-            notes = extract_notes(f.read(), args.version)
+        notes = extract_notes(read_changelog(), args.version)
         run_release_step(args.version, notes, read_token(), args.no_api)
         return 0
 
     step_tests(args.skip_tests)
+    # CHANGELOG 版本化是会改文件的那一步里最容易失败的（缺 [Unreleased]），
+    # 放到测试之后、写版本号与构建之前；预检已保证它不会在这里失败
+    notes = step_changelog(args.version)
     step_app_version(args.version)
     step_build(args.version, args.no_build)
     step_assemble(args.version)
-    notes = step_changelog(args.version)
+    step_sign()
     step_git(args.version, f"v{args.version}")
     run_release_step(args.version, notes, read_token(), args.no_api)
     print("\n完成。")

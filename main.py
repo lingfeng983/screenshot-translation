@@ -21,7 +21,7 @@ except ImportError:
 
 from logging.handlers import RotatingFileHandler
 
-from PyQt5.QtCore import QEvent, Qt, QTimer
+from PyQt5.QtCore import QEvent, Qt, QTimer, pyqtSignal
 from PyQt5.QtWidgets import (
     QApplication, QDialog, QVBoxLayout, QLineEdit, QPushButton,
     QComboBox, QCheckBox, QGroupBox, QFormLayout, QMessageBox,
@@ -34,6 +34,7 @@ from managers import (app_paths, autostart, result_render, single_instance,
                       styles, update_checker, update_installer)
 from managers.hotkey_native import parse_hotkey
 from managers.provider_common import redact_url_query
+from managers.toolbar_combo import ChevronComboBox
 
 
 _LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -138,11 +139,138 @@ def _hotkey_identity(value):
     Returns:
         tuple 或 str 或 None: 可哈希的标识；空输入返回 None
     """
-    raw = (value or '').replace(' ', '').lower()
+    # 不能整个去掉空格：'ctrl + caps lock'、'ctrl+page up' 这类具名主键
+    # 本身就带空格，去掉后 parse_hotkey 认不出来，反而退化成字面比较。
+    # parse_hotkey 内部会对每个 '+' 分段做 strip，原样小写传入即可。
+    raw = (value or '').strip().lower()
     if not raw:
         return None
     parsed = parse_hotkey(raw)
     return parsed if parsed is not None else raw
+
+
+# 只按下修饰键还不算一个组合，等主键一起按下再录入
+_HOTKEY_MODIFIER_KEYS = frozenset((
+    Qt.Key_Control, Qt.Key_Alt, Qt.Key_Shift, Qt.Key_Meta, Qt.Key_AltGr,
+))
+# 具名主键 → parse_hotkey 认识的写法（与 hotkey_native._NAMED_KEYS 对齐）
+_HOTKEY_NAMED_KEYS = {
+    Qt.Key_Space: 'space', Qt.Key_Return: 'enter', Qt.Key_Enter: 'enter',
+    Qt.Key_Tab: 'tab', Qt.Key_Backspace: 'backspace',
+    Qt.Key_Delete: 'delete', Qt.Key_Insert: 'insert',
+    Qt.Key_Home: 'home', Qt.Key_End: 'end',
+    Qt.Key_PageUp: 'pageup', Qt.Key_PageDown: 'pagedown',
+    Qt.Key_Up: 'up', Qt.Key_Down: 'down',
+    Qt.Key_Left: 'left', Qt.Key_Right: 'right',
+    Qt.Key_Pause: 'pause', Qt.Key_CapsLock: 'caps lock',
+    Qt.Key_Escape: 'esc',
+}
+_HOTKEY_MODIFIER_MASK = (Qt.ControlModifier | Qt.AltModifier
+                         | Qt.ShiftModifier | Qt.MetaModifier)
+
+
+class HotkeyCaptureEdit(QLineEdit):
+    """快捷键录入框：聚焦后直接按键盘组合，按到什么就改成什么
+
+    不再要求用户手写 'ctrl+alt+z' 这样的文本，也不弹二级选择窗口；
+    按下 Ctrl+Alt+Z 输入框立刻变成 'ctrl+alt+z'。仍保留 QLineEdit 的
+    text()/setText() 接口，保存、查重、回滚逻辑一行都不用改。
+    """
+
+    hotkey_captured = pyqtSignal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        # 只接受真实按键，不接受键盘输入文本；setText 仍可程序化写入
+        self.setReadOnly(True)
+        self.setProperty('hotkeyCapture', 'true')
+        self.setPlaceholderText('点击后直接按下快捷键组合')
+        self.setToolTip('点击后直接按键盘组合（必须含 Ctrl/Alt/Shift/Win，'
+                        '如 Ctrl+Alt+Z）；Esc 取消，Delete/Backspace 清空')
+        self._previous = ''
+        self._waiting = False
+
+    def focusInEvent(self, event):
+        """进入录入态：先清空显示，让占位提示告诉用户「现在按键盘」"""
+        super().focusInEvent(event)
+        self._previous = self.text()
+        self._waiting = True
+        self.clear()
+
+    def focusOutEvent(self, event):
+        """没按任何键就离开：还原原来的组合，别把字段弄丢"""
+        if self._waiting and not self.text():
+            self.setText(self._previous)
+        self._waiting = False
+        self.setPlaceholderText('点击后直接按下快捷键组合')
+        super().focusOutEvent(event)
+
+    def keyPressEvent(self, event):
+        """把一次按键直接翻译成 'ctrl+alt+z' 这样的组合串"""
+        key = event.key()
+        modifiers = event.modifiers()
+        if key == Qt.Key_Escape and not (modifiers & _HOTKEY_MODIFIER_MASK):
+            # 单独按 Esc 是「取消这次录入」；带修饰键的 Ctrl+Esc 仍可录入。
+            # 没在等按键时不做任何事，免得把已经录好的组合清掉。
+            if self._waiting:
+                self.setText(self._previous)
+                self._waiting = False
+                self.clearFocus()
+            return
+        if key in (Qt.Key_Backspace, Qt.Key_Delete) \
+                and not (modifiers & _HOTKEY_MODIFIER_MASK):
+            self.setText('')
+            self._waiting = False
+            self.hotkey_captured.emit('')
+            return
+        if key in _HOTKEY_MODIFIER_KEYS:
+            # 只按住了 Ctrl/Alt/Shift/Win：组合还没成形，继续等主键
+            self.setPlaceholderText('继续按住，再按一个主键…')
+            return
+
+        main_key = self._key_name(event)
+        if main_key is None:
+            return
+        if not (modifiers & _HOTKEY_MODIFIER_MASK):
+            # 裸键（'a'、'f5'、'space'）一旦写进配置，键盘钩子后端会把它注册成
+            # 全局按键，从所有程序里把这个键抢走。录入阶段就挡掉，保存阶段再兜一次。
+            self.setPlaceholderText('必须按住 Ctrl/Alt/Shift/Win 再按主键')
+            return
+        parts = []
+        if modifiers & Qt.ControlModifier:
+            parts.append('ctrl')
+        if modifiers & Qt.AltModifier:
+            parts.append('alt')
+        if modifiers & Qt.ShiftModifier:
+            parts.append('shift')
+        if modifiers & Qt.MetaModifier:
+            parts.append('win')
+        parts.append(main_key)
+        value = '+'.join(parts)
+        self._previous = value
+        self._waiting = False
+        self.setText(value)
+        self.setPlaceholderText('点击后直接按下快捷键组合')
+        self.hotkey_captured.emit(value)
+
+    @staticmethod
+    def _key_name(event):
+        """Qt 键码 → 配置里使用的键名（小写、可被 parse_hotkey 解析）"""
+        key = event.key()
+        if Qt.Key_A <= key <= Qt.Key_Z:
+            return chr(ord('a') + key - Qt.Key_A)
+        if Qt.Key_0 <= key <= Qt.Key_9:
+            return chr(ord('0') + key - Qt.Key_0)
+        if Qt.Key_F1 <= key <= Qt.Key_F24:
+            return f'f{key - Qt.Key_F1 + 1}'
+        named = _HOTKEY_NAMED_KEYS.get(key)
+        if named:
+            return named
+        text = (event.text() or '').strip().lower()
+        if len(text) == 1 and text.isascii() \
+                and (text.isalnum() or text in "`-=,./;'[]\\"):
+            return text
+        return None
 
 
 class MainApp:
@@ -263,6 +391,7 @@ class MainApp:
 
             # 配置管理器先就位，界面固定使用浅色主题
             self.config_manager = ConfigManager()
+            self._apply_privacy_settings()
             styles.apply_app(self.app)
             self._apply_app_icon()
 
@@ -323,8 +452,13 @@ class MainApp:
             QTimer.singleShot(1500, result_render.warm_up_fonts)
 
             # 翻译链路预热：首个请求要付 DNS+TLS 握手（约 0.3 秒），
-            # 趁启动空闲提前付掉，第一次截图就少等这一截
+            # 趁启动空闲提前付掉，第一次截图就少等这一截（默认关闭，见隐私设置）
             QTimer.singleShot(800, self._warm_up_translation)
+
+            # 配置损坏被默认配置覆盖时必须让用户知道备份在哪，否则密钥
+            # 在"设置看起来还在、值却全空了"的状态下悄悄丢掉
+            if self.config_manager.recovery_notice:
+                QTimer.singleShot(2600, self._notify_config_recovery)
 
             # 启动时处理启动行为
             self._handle_startup_behavior()
@@ -698,6 +832,24 @@ class MainApp:
         except Exception as e:
             logger.warning(f"翻译链路预热调度失败: {e}")
 
+    def _apply_privacy_settings(self):
+        """把配置里的缓存开关同步到进程级缓存单例"""
+        try:
+            from managers.cache_manager import cache_manager
+            cache_manager.set_enabled(
+                self.config_manager.is_translation_cache_enabled())
+        except Exception as e:
+            logger.warning(f"应用隐私设置失败: {e}")
+
+    def _notify_config_recovery(self):
+        """配置损坏被覆盖后提示备份位置（密钥可能只在那份备份里）"""
+        try:
+            if self.tray_manager:
+                self.tray_manager.show_notification(
+                    '配置已恢复默认', self.config_manager.recovery_notice)
+        except Exception as e:
+            logger.warning(f"配置恢复提示失败: {e}")
+
     def open_config_window(self):
         """打开配置窗口，非主线程调用时自动调度到主线程执行"""
         logger.info("打开配置窗口")
@@ -899,10 +1051,21 @@ class MainApp:
         """
         try:
             from managers.cache_manager import cache_manager
-            # atexit 不会再跑，翻译缓存必须在这里落盘
-            cache_manager.flush()
+            clear_on_exit = False
+            try:
+                clear_on_exit = bool(
+                    self.config_manager
+                    and self.config_manager.is_clear_cache_on_exit())
+            except Exception:
+                pass
+            if clear_on_exit:
+                # 用户要求退出即清空：磁盘上不留任何明文原文/译文
+                cache_manager.clear_cache()
+            else:
+                # atexit 不会再跑，未清空的翻译缓存必须在这里落盘
+                cache_manager.flush()
         except Exception as e:
-            logger.warning(f"退出前落盘缓存失败: {e}")
+            logger.warning(f"退出前处理翻译缓存失败: {e}")
         try:
             logging.shutdown()
         except Exception as e:
@@ -982,7 +1145,7 @@ class ConfigWindow(QDialog):
         provider_names = provider_registry.names()
 
         # API类型选择（默认Edge免费翻译，国内可直连）
-        self.api_type_combo = QComboBox()
+        self.api_type_combo = ChevronComboBox()
         for name in provider_names:
             self.api_type_combo.addItem(provider_registry.display_name_of(name), name)
         if self.config_manager:
@@ -997,7 +1160,7 @@ class ConfigWindow(QDialog):
         api_layout.addRow("API类型:", self.api_type_combo)
 
         # 目标语言选择
-        self.target_lang_combo = QComboBox()
+        self.target_lang_combo = ChevronComboBox()
         for lang_code, lang_name in self._target_languages():
             self.target_lang_combo.addItem(f"{lang_name} ({lang_code})", lang_code)
         if self.config_manager:
@@ -1011,7 +1174,7 @@ class ConfigWindow(QDialog):
         api_layout.addRow("目标语言:", self.target_lang_combo)
 
         # 降级API：主API失败后自动切换（可选）
-        self.fallback_api_combo = QComboBox()
+        self.fallback_api_combo = ChevronComboBox()
         self.fallback_api_combo.addItem("不降级", "")
         for name in provider_names:
             self.fallback_api_combo.addItem(
@@ -1038,6 +1201,45 @@ class ConfigWindow(QDialog):
 
         api_group.setLayout(api_layout)
         layout.addWidget(api_group)
+
+        # 隐私设置：缓存是明文的，免费兜底/预热会把文本发给第三方，
+        # 这些开关一律显式暴露，不能只在代码里偷偷改默认值
+        privacy_group = QGroupBox("隐私")
+        privacy_layout = _new_form()
+        privacy_tip = QLabel(
+            "翻译缓存会把截图识别出的原文与译文明文写入用户目录；"
+            "API 密钥也以明文保存在 config.ini（建议改用环境变量注入）。"
+            "下面的第三方兜底与启动预热默认关闭，开启即表示同意把文本发给相应服务。")
+        privacy_tip.setObjectName("hintLabel")
+        privacy_tip.setWordWrap(True)
+        privacy_layout.addRow(privacy_tip)
+
+        self.cache_enabled_check = QCheckBox("保存翻译缓存（24 小时，最多 1000 条）")
+        self.clear_cache_on_exit_check = QCheckBox("退出程序时清空翻译缓存")
+        self.free_fallback_check = QCheckBox(
+            "主接口失败时自动改用 Edge / Google 免费接口（会转发原文）")
+        self.warm_up_check = QCheckBox("启动时预热当前免费翻译接口")
+        if self.config_manager:
+            try:
+                self.cache_enabled_check.setChecked(
+                    self.config_manager.is_translation_cache_enabled())
+                self.clear_cache_on_exit_check.setChecked(
+                    self.config_manager.is_clear_cache_on_exit())
+                self.free_fallback_check.setChecked(
+                    self.config_manager.is_free_fallback_allowed())
+                self.warm_up_check.setChecked(
+                    self.config_manager.is_translation_warmup_enabled())
+            except Exception as e:
+                logger.error(f"获取隐私配置失败: {e}")
+        for check in (self.cache_enabled_check, self.clear_cache_on_exit_check,
+                      self.free_fallback_check, self.warm_up_check):
+            privacy_layout.addRow(check)
+
+        self.clear_cache_button = QPushButton("立即清空翻译缓存")
+        self.clear_cache_button.clicked.connect(self._on_clear_cache_clicked)
+        privacy_layout.addRow(self.clear_cache_button)
+        privacy_group.setLayout(privacy_layout)
+        layout.addWidget(privacy_group)
 
         # 按初始选择生成动态字段
         self._on_api_type_changed(self.api_type_combo.currentIndex())
@@ -1108,7 +1310,7 @@ class ConfigWindow(QDialog):
             raw = str(_cap(option, 'true' if default else 'false'))
             return raw.strip().lower() in ('true', '1', 'yes', 'on')
 
-        self.capture_format_combo = QComboBox()
+        self.capture_format_combo = ChevronComboBox()
         for key, label in (('png', 'PNG'), ('jpg', 'JPG'), ('webp', 'WebP')):
             self.capture_format_combo.addItem(label, key)
         self.capture_format_combo.setCurrentIndex(
@@ -1133,7 +1335,7 @@ class ConfigWindow(QDialog):
         self.capture_quick_check.setChecked(_cap_bool('quick_save'))
         capture_layout.addRow(self.capture_quick_check)
 
-        self.capture_after_combo = QComboBox()
+        self.capture_after_combo = ChevronComboBox()
         for key, label in (('none', '仅保存'), ('copy', '保存并复制'),
                            ('close', '保存并关闭'),
                            ('copy_close', '保存、复制并关闭')):
@@ -1167,6 +1369,12 @@ class ConfigWindow(QDialog):
         # 提权窗口/锁屏切换后收不到按键，只等到保存时才说就太晚了。
         hotkey_group = QGroupBox("快捷键配置")
         hotkey_layout = _new_form()
+        hotkey_tip = QLabel(
+            "点击输入框后直接按键盘组合即可录入（必须含 Ctrl/Alt/Shift/Win 修饰键，"
+            "裸键会被拒绝，避免抢走其它程序的按键）；Esc 取消，Delete 清空，保存后生效。")
+        hotkey_tip.setObjectName("hintLabel")
+        hotkey_tip.setWordWrap(True)
+        hotkey_layout.addRow(hotkey_tip)
         hotkey_fields = (
             ('hotkey', '截图翻译快捷键:', 'get_global_hotkey', 'hotkey_status'),
             ('capture_hotkey', '纯截图快捷键:', 'get_capture_hotkey',
@@ -1181,7 +1389,8 @@ class ConfigWindow(QDialog):
              'repeat_hotkey_status'),
         )
         for key, label_text, getter_name, status_key in hotkey_fields:
-            edit = QLineEdit()
+            # 只读录入框：点一下、直接按键盘组合，按到什么就改成什么
+            edit = HotkeyCaptureEdit()
             if self.config_manager:
                 try:
                     edit.setText(getattr(self.config_manager, getter_name)())
@@ -1194,6 +1403,8 @@ class ConfigWindow(QDialog):
             status.setWordWrap(True)
             setattr(self, f'{status_key}_label', status)
             hotkey_layout.addRow(status)
+            edit.hotkey_captured.connect(
+                lambda value, lbl=status: self._on_hotkey_captured(lbl, value))
 
         hotkey_group.setLayout(hotkey_layout)
         layout.addWidget(hotkey_group)
@@ -1293,6 +1504,24 @@ class ConfigWindow(QDialog):
 
         label.setText(text)
         # objectName 决定颜色，改完必须重新 polish，否则 QSS 还是旧的那套
+        label.setObjectName("hotkeyWarning" if warning else "hintLabel")
+        style = label.style()
+        style.unpolish(label)
+        style.polish(label)
+
+    def _on_hotkey_captured(self, label, value):
+        """刚按下的组合立刻在状态行回显；不合法的组合当场提示，别等保存"""
+        if label is None:
+            return
+        if not value:
+            text, warning = "已清空，请点击输入框按下新的组合键（保存后生效）", True
+        elif parse_hotkey(value.strip().lower()) is None:
+            text, warning = (
+                f'已录入 {value}，但缺少 Ctrl/Alt/Shift/Win 修饰键或主键无法识别，'
+                '请重新按一个组合', True)
+        else:
+            text, warning = f'已录入 {value}，点击「保存」后生效', False
+        label.setText(text)
         label.setObjectName("hotkeyWarning" if warning else "hintLabel")
         style = label.style()
         style.unpolish(label)
@@ -1552,6 +1781,16 @@ class ConfigWindow(QDialog):
         cm.set_capture_option('scroll_max_height',
                               str(self.capture_scroll_max_spin.value()))
 
+    def _on_clear_cache_clicked(self):
+        """立即删掉磁盘上的明文原文/译文（不等退出，也不受缓存开关影响）"""
+        from managers.cache_manager import cache_manager
+        try:
+            cache_manager.clear_cache()
+            QMessageBox.information(self, "翻译缓存", "本地翻译缓存已清空。")
+        except Exception as e:
+            logger.warning(f"清空翻译缓存失败: {e}")
+            QMessageBox.warning(self, "翻译缓存", f"清空失败：{e}")
+
     def _apply_hotkey(self, manager, hotkey, label, save_direct):
         """
         注册一条全局快捷键（成功后由管理器自己写配置）
@@ -1615,6 +1854,22 @@ class ConfigWindow(QDialog):
                  self.repeat_hotkey_edit,
                  self.config_manager.get_repeat_hotkey),
             )
+            # 保存是最后一道闸：配置文件可能是旧版本留下的裸键，或用户用
+            # Delete 清空后残留半截组合。裸键会被键盘钩子后端注册成全局按键，
+            # 把字母/功能键从所有程序里抢走，因此这里必须整批拦下（留空=禁用）。
+            invalid = [(label, value, edit)
+                       for label, value, edit, _getter in entries
+                       if value.strip() and parse_hotkey(value.strip().lower()) is None]
+            if invalid:
+                label, value, edit = invalid[0]
+                QMessageBox.warning(
+                    self, "快捷键不合法",
+                    f"{label}「{value}」不是合法的全局快捷键：必须包含 "
+                    "Ctrl / Alt / Shift / Win 中的至少一个修饰键 + 一个主键"
+                    "（如 Ctrl+Alt+Z），留空表示该条快捷键禁用。")
+                edit.setFocus()
+                return
+
             # 按解析结果归一化查重：别名字体/修饰键顺序不同都是同一个组合，
             # 只比字面会漏判，键盘钩子后端会一次按键触发多个动作。
             identities = [identity for identity in
@@ -1644,6 +1899,15 @@ class ConfigWindow(QDialog):
                 self.config_manager.set_auto_start(auto_start)
                 self.config_manager.set_auto_check_update(
                     self.auto_check_update_check.isChecked())
+                # 隐私开关与其它配置一起落盘；控件可能在某些降级 UI 里没建出来
+                for attr, setter in (
+                        ('cache_enabled_check', 'set_translation_cache_enabled'),
+                        ('clear_cache_on_exit_check', 'set_clear_cache_on_exit'),
+                        ('free_fallback_check', 'set_free_fallback_allowed'),
+                        ('warm_up_check', 'set_translation_warmup_enabled')):
+                    widget = getattr(self, attr, None)
+                    if widget is not None:
+                        getattr(self.config_manager, setter)(widget.isChecked())
                 # 全局快捷键：注册成功后由 set_hotkey 负责写配置，失败则不落盘。
                 # 这里必须自己接住异常：让异常穿出 with 块会跳过"快捷键无效"的
                 # 提示路径，用户看到的是笼统的"保存配置失败"，而其他配置其实
@@ -1695,6 +1959,11 @@ class ConfigWindow(QDialog):
 
             # 保存成功：草稿里的值已经写进配置，清掉避免下次切回来又盖回旧输入
             self._api_drafts.clear()
+
+            # 关闭缓存要当场清掉已落盘的明文，不能等下次重启
+            apply_privacy = getattr(self.main_app, '_apply_privacy_settings', None)
+            if apply_privacy is not None:
+                apply_privacy()
 
             # 同步翻译管理器
             if self.main_app.translation_manager:

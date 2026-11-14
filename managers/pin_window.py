@@ -18,7 +18,7 @@ import logging
 logger = logging.getLogger('screenshot-translation')
 
 # 钉住的窗口没有 Qt 父级，需要模块级引用防止被 Python GC 回收
-_pins = set()
+_pins: set = set()
 
 MIN_SCALE = 0.4
 MAX_SCALE = 4.0

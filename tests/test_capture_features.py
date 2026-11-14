@@ -1236,3 +1236,84 @@ def test_nested_no_persist_batches_allowed(tmp_path):
     assert cm.get_target_lang() == 'en'
     assert cm.is_minimize_to_tray() is False
     assert not os.path.exists(path), '不落盘的批次仍然写了文件'
+
+
+# ------------------------------------------- 仅截图按钮顺序 / 长截图结果图
+
+def test_capture_toolbar_copy_is_last_button(qapp):
+    """仅截图编辑态工具条：最右边的按钮必须是「复制到剪贴板」"""
+    toolbar = CaptureToolbar(None)
+    try:
+        layout = toolbar.layout()
+        last = layout.itemAt(layout.count() - 1).widget()
+        assert last is toolbar.copy_button, '最后一个按钮不是复制'
+        assert toolbar.copy_button.toolTip().startswith('复制到剪贴板')
+        # 退出按钮排在复制前面
+        cancel_index = layout.indexOf(toolbar.cancel_button)
+        assert cancel_index == layout.indexOf(toolbar.copy_button) - 1
+    finally:
+        toolbar.deleteLater()
+
+
+def test_overlay_toolbar_capture_only_copy_is_last(qapp):
+    """备用结果工具条的纯截图分支同样以复制收尾，且不会被宽度折叠掉"""
+    from managers.overlay_toolbar import OverlayToolbar
+
+    bar = OverlayToolbar(None, [('zh', '中文')], capture_only=True)
+    try:
+        layout = bar.layout()
+        assert layout.itemAt(layout.count() - 1).widget() \
+            is bar.copy_original_image_button
+        assert bar.copy_original_image_button not in bar._trimmable, \
+            '复制按钮不能被折叠，否则最右边又变成退出'
+    finally:
+        bar.deleteLater()
+
+
+def test_scroll_finish_opens_result_window_instead_of_overlay(qapp, monkeypatch):
+    """长截图成功后展示长图结果窗，遮罩收起而不是回到截图页面"""
+    from managers import scroll_result
+    from managers.screenshot import ScreenshotWidget
+
+    calls = []
+
+    def fake_show(pixmap, config_manager=None):
+        calls.append(pixmap)
+        return object()
+
+    monkeypatch.setattr(scroll_result, 'show_scroll_result', fake_show)
+    monkeypatch.setattr('managers.screenshot.clipboard.set_pixmap_later',
+                        lambda *args, **kwargs: None)
+
+    widget = ScreenshotWidget(capture_only=True)
+    try:
+        long_image = Image.new('RGB', (60, 400), '#336699')
+        widget.on_scroll_finished(long_image)
+
+        assert len(calls) == 1, '没有展示长截图结果图'
+        assert calls[0].width() == 60 and calls[0].height() == 400, \
+            '结果窗拿到的不是整张长图'
+        assert not widget.isVisible(), '遮罩没关掉，又回到了截图页面'
+    finally:
+        widget.close()
+
+
+def test_scroll_result_window_previews_full_long_image(qapp, monkeypatch):
+    """结果窗默认「适合窗口」缩放，复制/保存仍用未缩放的原图"""
+    from PyQt5.QtGui import QPixmap
+    from managers import scroll_result
+
+    pixmap = QPixmap(60, 3000)
+    pixmap.fill()
+    monkeypatch.setattr(scroll_result.clipboard, 'set_pixmap_later',
+                        lambda *args, **kwargs: None)
+    window = scroll_result.LongCaptureResultWindow(pixmap)
+    try:
+        assert window._source.width() == 60 and window._source.height() == 3000
+        window.show()
+        window._fit_to_window()
+        assert window._zoom < 1.0, '超长图没有等比缩小到能看全'
+        assert window.image_label.pixmap().height() <= 3000
+        assert window.copy_button.text() == '复制到剪贴板'
+    finally:
+        window.close()

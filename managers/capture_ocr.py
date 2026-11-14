@@ -19,7 +19,7 @@ from .ocr import is_ocr_notice
 logger = logging.getLogger('screenshot-translation')
 
 # 非模态结果窗没有 Qt 父级之外的引用会被 GC 掉，模块级持有
-_windows = set()
+_windows: set = set()
 
 
 def extract_text(image, ocr_manager=None):

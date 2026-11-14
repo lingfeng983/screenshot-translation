@@ -1,0 +1,26 @@
+# 可复现构建约束：在 Windows + Python 3.14 上跑通全套测试的一组精确版本。
+#
+# requirements.txt 只给兼容范围，方便在不同 Python 版本上安装；需要逐字节
+# 复现（发版排查、CI 缓存、回归对比）时把本文件一起传给 pip：
+#   python -m pip install -r requirements.txt -r requirements-dev.txt -c constraints.txt
+#
+# 约束文件不会主动安装包，只会把被选中的包钉在这些版本上。升级依赖时请同步
+# 更新本文件，并在干净环境里重跑 pytest 与一次 PyInstaller 构建。
+
+PyQt5==5.15.10
+PyQt5-Qt5==5.15.2
+PyQt5_sip==12.18.0
+pillow==12.1.0
+rapidocr==3.10.0
+onnxruntime==1.31.1
+numpy==2.5.4
+opencv-python-headless==5.0.0.93
+requests==2.31.0
+certifi==2026.1.4
+charset-normalizer==3.4.4
+idna==3.20
+urllib3==2.6.3
+pystray==0.19.5
+keyboard==0.13.5
+pytest==9.1.1
+pyinstaller==6.22.3

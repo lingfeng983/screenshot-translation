@@ -1160,3 +1160,168 @@ def test_bing_region_env_visible_in_settings(win, qapp, monkeypatch):
     assert win._env_secret_values.get('bing_region') == 'eastasia', \
         "环境变量提供的区域值不该被回写进 config.ini"
 
+
+# ------------------------------------------------- 下拉箭头 / 快捷键直接录入
+
+def test_all_settings_combos_use_drawn_chevron(win):
+    """设置页所有下拉都换成自绘 V 形箭头，不再用 QSS 拼出的方块"""
+    from PyQt5.QtWidgets import QComboBox
+    from managers.toolbar_combo import ChevronComboBox
+
+    combos = win.findChildren(QComboBox)
+    assert combos, '设置页没有下拉框'
+    for combo in combos:
+        assert isinstance(combo, ChevronComboBox), \
+            f'{combo.objectName() or combo.metaObject().className()} 还是方块下拉'
+
+
+def test_combo_qss_disables_border_triangle():
+    """全局 QSS 里 ::down-arrow 必须关掉，方块不能再出现"""
+    from managers import styles
+
+    sheet = styles.style_sheet()
+    assert 'border-top: 6px' not in sheet, '还在用 border 拼三角'
+    assert 'QComboBox::down-arrow { image: none' in sheet
+    assert 'width: 0px; height: 0px' in sheet
+
+
+def test_hotkey_edit_captures_keys_directly(win, qapp):
+    """点进快捷键框后直接按键盘组合，输入框立刻变成该组合"""
+    from PyQt5.QtCore import Qt
+    from PyQt5.QtGui import QKeyEvent
+    from PyQt5.QtWidgets import QApplication
+    from main import HotkeyCaptureEdit
+
+    edit = win.hotkey_edit
+    assert isinstance(edit, HotkeyCaptureEdit), '快捷键框还是手打文本的普通输入框'
+    assert edit.isReadOnly(), '录入框应只读，避免键盘文本落进字段'
+    original = edit.text()
+
+    edit.setFocus()
+    spin(qapp, duration_ms=30)
+    assert edit.text() == '', '聚焦后没进入「等待按键」态'
+
+    # 用 ctrl+alt+q：默认值里没有这条，避开「六条不能重复」的查重
+    event = QKeyEvent(QKeyEvent.KeyPress, Qt.Key_Q,
+                      Qt.ControlModifier | Qt.AltModifier, 'q')
+    QApplication.sendEvent(edit, event)
+    assert edit.text() == 'ctrl+alt+q', f'按下的组合没被直接录入: {edit.text()}'
+    assert '已录入 ctrl+alt+q' in win.hotkey_status_label.text()
+
+    # 只按修饰键不该覆盖已有组合
+    only_ctrl = QKeyEvent(QKeyEvent.KeyPress, Qt.Key_Control,
+                          Qt.ControlModifier, '')
+    QApplication.sendEvent(edit, only_ctrl)
+    assert edit.text() == 'ctrl+alt+q'
+
+    # 保存链路仍然按 text() 取值，可以直接落配置
+    win._on_save()
+    assert win.config_manager.get_global_hotkey() == 'ctrl+alt+q'
+
+
+def test_hotkey_edit_esc_and_delete(win, qapp):
+    """Esc 取消录入并还原，Delete 清空字段"""
+    from PyQt5.QtCore import Qt
+    from PyQt5.QtGui import QKeyEvent
+    from PyQt5.QtWidgets import QApplication
+
+    edit = win.text_hotkey_edit
+    edit.setText('alt+z')
+    edit.setFocus()
+    spin(qapp, duration_ms=30)
+    QApplication.sendEvent(
+        edit, QKeyEvent(QKeyEvent.KeyPress, Qt.Key_Escape, Qt.NoModifier, ''))
+    assert edit.text() == 'alt+z', 'Esc 没有还原原组合'
+
+    edit.setFocus()
+    spin(qapp, duration_ms=30)
+    QApplication.sendEvent(
+        edit, QKeyEvent(QKeyEvent.KeyPress, Qt.Key_Delete, Qt.NoModifier, ''))
+    assert edit.text() == '', 'Delete 没有清空组合'
+
+
+# ---------------------------------------------------------------- 快捷键安全 / 隐私设置
+
+def test_hotkey_capture_rejects_bare_key(win, qapp):
+    """裸键一旦存进配置就会被键盘钩子全局劫持，录入阶段就要挡掉"""
+    from PyQt5.QtCore import Qt
+    from PyQt5.QtGui import QKeyEvent
+    from PyQt5.QtWidgets import QApplication
+
+    edit = win.capture_hotkey_edit
+    edit.setFocus()
+    spin(qapp, duration_ms=30)
+    QApplication.sendEvent(
+        edit, QKeyEvent(QKeyEvent.KeyPress, Qt.Key_A, Qt.NoModifier, 'a'))
+    assert edit.text() == '', f'裸键被录入了: {edit.text()}'
+    assert 'Ctrl' in edit.placeholderText(), '没有给出修饰键提示'
+
+    # 带修饰键的同一个主键仍可正常录入
+    QApplication.sendEvent(
+        edit, QKeyEvent(QKeyEvent.KeyPress, Qt.Key_A,
+                        Qt.ControlModifier | Qt.AltModifier, 'a'))
+    assert edit.text() == 'ctrl+alt+a', f'带修饰键的组合也没录入: {edit.text()}'
+
+
+def test_save_rejects_bare_hotkey(win, no_modal_boxes):
+    """保存是第二道闸：配置文件里残留的裸键也不能被写回去"""
+    from config import ConfigManager
+
+    before = win.config_manager.get_global_hotkey()
+    win.hotkey_edit.setText('a')
+    win._on_save()
+    assert win.config_manager.get_global_hotkey() == before, \
+        '裸键被保存进配置了'
+    assert ConfigManager(win.config_manager.config_file).get_global_hotkey() == before
+    assert any('快捷键不合法' in str(item) for item in no_modal_boxes), \
+        '没有给出可读的拒绝原因'
+
+
+def test_hotkey_identity_keeps_named_key_spaces():
+    """具名主键带空格时不能再无脑去空格，否则 ctrl+caps lock 查重会失效"""
+    from main import _hotkey_identity
+    from managers.hotkey_native import parse_hotkey
+
+    assert parse_hotkey('ctrl+caps lock') is not None
+    assert parse_hotkey('ctrl+capslock') is None
+    assert _hotkey_identity('ctrl+caps lock') == _hotkey_identity('ctrl + caps lock')
+    assert _hotkey_identity('ctrl+alt+z') == _hotkey_identity('alt+ctrl+z')
+
+
+def test_privacy_controls_persist(win, main_app, monkeypatch):
+    """四个隐私开关都能从设置页保存并读回"""
+    from managers import autostart
+    from managers.cache_manager import cache_manager
+
+    monkeypatch.setattr(autostart, 'apply', lambda enabled: True)
+    try:
+        win.cache_enabled_check.setChecked(False)
+        win.clear_cache_on_exit_check.setChecked(True)
+        win.free_fallback_check.setChecked(True)
+        win.warm_up_check.setChecked(True)
+        win._on_save()
+
+        cm = win.config_manager
+        assert cm.is_translation_cache_enabled() is False
+        assert cm.is_clear_cache_on_exit() is True
+        assert cm.is_free_fallback_allowed() is True
+        assert cm.is_translation_warmup_enabled() is True
+    finally:
+        # 单例是进程级共享的，别把下一条用例的缓存状态带脏
+        cache_manager.set_enabled(True)
+
+
+def test_clear_cache_button_removes_plaintext(win):
+    """「立即清空」直接删掉磁盘上的明文缓存文件"""
+    import json
+    from managers import app_paths
+    from managers.cache_manager import cache_manager
+
+    path = app_paths.cache_file()
+    with open(path, 'w', encoding='utf-8') as handle:
+        json.dump({'secret': {'text': '截图原文', 'translation': '译文'}}, handle)
+    cache_manager.enabled = True
+    win.clear_cache_button.click()
+    assert not os.path.exists(path), '明文缓存文件没被删掉'
+    assert cache_manager.get_cache_stats()['total_entries'] == 0
+

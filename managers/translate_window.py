@@ -8,14 +8,18 @@
 接口、降级与缓存策略完全一致。
 
 界面固定浅色、只用一列纵向布局，尽量少控件。
+
+默认「自动识别」：原文是中文就译成英文，原文是英文就译成中文；
+也可以在右上角手动指定目标语言。
 """
 
 import logging
+import re
 
 from PyQt5.QtCore import QEvent, QRectF, Qt, QTimer
 from PyQt5.QtGui import QColor, QPainter, QPen
 from PyQt5.QtWidgets import (
-    QApplication, QComboBox, QDialog, QFrame, QHBoxLayout, QLabel,
+    QApplication, QDialog, QFrame, QHBoxLayout, QLabel,
     QPlainTextEdit, QPushButton, QVBoxLayout, QWidget
 )
 
@@ -23,9 +27,20 @@ from . import clipboard, styles
 from .providers.base import TARGET_LANGUAGES
 from .qt_dispatcher import qt_dispatcher
 from .thread_pool import thread_pool_manager
+from .toolbar_combo import ChevronComboBox
 from .translation import is_translation_failure
 
 logger = logging.getLogger('screenshot-translation')
+
+# 目标语言下拉里的「自动识别」项：按原文语种决定中译英 / 英译中
+AUTO_LANGUAGE = 'auto'
+# 汉字（基本区 + 扩展 A + 兼容表意文字）
+_HAN_RE = re.compile(r'[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]')
+# 拉丁字母（含常见带音标字母）
+_LATIN_RE = re.compile(r'[A-Za-z\u00c0-\u024f]')
+# 日文假名 / 韩文谚文：都不属于本页的中英互译，别把日文里的汉字误判成中文
+_KANA_RE = re.compile(r'[\u3040-\u30ff\u31f0-\u31ff\uff66-\uff9f]')
+_HANGUL_RE = re.compile(r'[\u1100-\u11ff\u3130-\u318f\uac00-\ud7af]')
 
 # 加载动画：小圆环，26px 一帧，肉眼看着就是连续转动
 _SPINNER_INTERVAL = 33      # 帧间隔（毫秒）
@@ -167,7 +182,7 @@ class TranslateWindow(QDialog):
         layout.setContentsMargins(20, 16, 20, 16)
         layout.setSpacing(10)
 
-        # 标题行：页面名 + 目标语言
+        # 标题行：页面名 + 目标语言（首项「自动识别」为默认）
         header = QHBoxLayout()
         header.setSpacing(8)
         title = QLabel("文本翻译")
@@ -177,8 +192,10 @@ class TranslateWindow(QDialog):
         to_label = QLabel("译为")
         to_label.setObjectName("sectionLabel")
         header.addWidget(to_label)
+        self.to_label = to_label
 
-        self.lang_combo = QComboBox()
+        self.lang_combo = ChevronComboBox()
+        self.lang_combo.addItem("自动识别", AUTO_LANGUAGE)
         for lang_code, lang_name in self._target_languages():
             self.lang_combo.addItem(lang_name, lang_code)
         self._select_initial_language()
@@ -196,7 +213,8 @@ class TranslateWindow(QDialog):
         self.source_edit = QPlainTextEdit()
         self.source_edit.setObjectName("sourceEdit")
         self.source_edit.setPlaceholderText(
-            "在这里输入或粘贴要翻译的文本…\n（停止输入后自动翻译，Ctrl + Enter 立即翻译）")
+            "在这里输入或粘贴要翻译的文本…\n"
+            "（自动识别：中文→英文，英文→中文；Ctrl + Enter 立即翻译）")
         self.source_edit.installEventFilter(self)
         self.source_edit.textChanged.connect(self._on_source_changed)
         layout.addWidget(self.source_edit, 3)
@@ -204,8 +222,9 @@ class TranslateWindow(QDialog):
         # 操作行：提示 + 清空 + 翻译
         action_row = QHBoxLayout()
         action_row.setSpacing(8)
-        self.hint_label = QLabel("自动翻译 · Ctrl + Enter 立即翻译")
+        self.hint_label = QLabel("")
         self.hint_label.setObjectName("sectionLabel")
+        self._refresh_hint()
         action_row.addWidget(self.hint_label)
         action_row.addStretch()
 
@@ -267,18 +286,86 @@ class TranslateWindow(QDialog):
         return TARGET_LANGUAGES
 
     def _select_initial_language(self):
-        """初始目标语言跟随全局配置（这里改只影响本窗口）"""
+        """默认选中「自动识别」；下拉里没有该项时回落到全局目标语言"""
+        index = self.lang_combo.findData(AUTO_LANGUAGE)
+        if index < 0:
+            index = self.lang_combo.findData(self._fallback_language())
+        if index >= 0:
+            self.lang_combo.setCurrentIndex(index)
+
+    def _fallback_language(self):
+        """纯数字/符号看不出语种时用的兜底目标语言（跟随全局配置）"""
         try:
             current = self.main_app.config_manager.get_target_lang()
         except Exception:
             current = 'zh'
-        index = self.lang_combo.findData(current)
-        if index >= 0:
-            self.lang_combo.setCurrentIndex(index)
+        return current if current in ('zh', 'en') else 'zh'
 
-    def current_language(self):
-        """当前选中的目标语言代码"""
-        return self.lang_combo.currentData() or 'zh'
+    @staticmethod
+    def _detect_source_language(text):
+        """
+        按字符占比判断原文语种
+
+        旧实现"出现一个汉字就算中文、否则出现一个字母就算英文"，中文夹英文、
+        日文、韩文、纯数字符号都会判错。这里按汉字与拉丁字母的数量比判断，
+        假名/谚文直接放弃自动识别（交给全局目标语言或用户手动选择）。
+
+        Returns:
+            str 或 None: 'zh' / 'en' / 看不出时 None
+        """
+        value = text or ''
+        if _KANA_RE.search(value) or _HANGUL_RE.search(value):
+            return None
+        han = len(_HAN_RE.findall(value))
+        latin = len(_LATIN_RE.findall(value))
+        # 中文夹少量英文（"这是 Windows 快捷键"）仍按中文译英；反过来
+        # 英文句子里夹一两个汉字（"这是 a test" 之类）按英文译中。
+        if han and han * 2 >= max(latin, 1):
+            return 'zh'
+        if latin:
+            return 'en'
+        return None
+
+    def _detect_target_language(self, text):
+        """自动识别方向：中文→英文，英文→中文，无法判断时按全局配置"""
+        source = self._detect_source_language(text)
+        if source == 'zh':
+            return 'en'
+        if source == 'en':
+            return 'zh'
+        return self._fallback_language()
+
+    def current_language(self, text=None):
+        """本次请求的目标语言代码
+
+        Args:
+            text (str): 本次要翻译的原文；None 时取输入框当前内容。
+                选中「自动识别」时按原文语种决定 zh / en。
+        """
+        selected = self.lang_combo.currentData() or AUTO_LANGUAGE
+        if selected != AUTO_LANGUAGE:
+            return selected
+        return self._detect_target_language(
+            self._source_text() if text is None else text)
+
+    def _refresh_hint(self):
+        """操作行提示：显示当前识别出的翻译方向，或手动指定的目标语言"""
+        selected = self.lang_combo.currentData() or AUTO_LANGUAGE
+        # 自动识别时「译为 自动识别」读着别扭，把标签收起来只留下拉
+        self.to_label.setVisible(selected != AUTO_LANGUAGE)
+        suffix = " · Ctrl + Enter 立即翻译"
+        if selected != AUTO_LANGUAGE:
+            name = dict(self._target_languages()).get(selected, selected)
+            self.hint_label.setText(f"译为{name}{suffix}")
+            return
+        source = self._detect_source_language(self._source_text())
+        if source is None:
+            self.hint_label.setText(
+                "自动识别 · 中文→英文 / 英文→中文" + suffix)
+        else:
+            from_name, to_name = (("中文", "英文") if source == 'zh'
+                                 else ("英文", "中文"))
+            self.hint_label.setText(f"已识别 {from_name} → 译为{to_name}{suffix}")
 
     # ------------------------------------------------------------------
     # 交互
@@ -294,7 +381,8 @@ class TranslateWindow(QDialog):
         return super().eventFilter(obj, event)
 
     def _on_source_changed(self):
-        """原文变化（键入或粘贴）：停止输入后再自动翻译"""
+        """原文变化（键入或粘贴）：刷新识别方向，停止输入后再自动翻译"""
+        self._refresh_hint()
         if not self._source_text():
             self._auto_timer.stop()
             return
@@ -305,7 +393,7 @@ class TranslateWindow(QDialog):
         text = self._source_text()
         if not text:
             return
-        if (text, self.current_language()) == self._last_request:
+        if (text, self.current_language(text)) == self._last_request:
             return
         if self._busy:
             # 已有请求在飞：立刻再发一次只会被 _on_translate 挡掉，
@@ -315,7 +403,8 @@ class TranslateWindow(QDialog):
         self._on_translate()
 
     def _on_language_changed(self, _index):
-        """换语言：有原文就按新语言翻译，免得用户再点一次"""
+        """换语言：刷新方向提示，有原文就按新语言翻译，免得用户再点一次"""
+        self._refresh_hint()
         if self._busy:
             # 结果还在飞：记下待办，等回填后按新语言补译一次，
             # 否则用户看到的是旧语言的译文却以为已经切换了
@@ -325,12 +414,20 @@ class TranslateWindow(QDialog):
             self._on_translate()
 
     def _on_clear(self):
-        """清空原文与译文"""
+        """清空原文与译文，并作废所有在飞请求
+
+        只清控件不够：忙碌时点清空，旧请求回来仍会把译文贴回去（实测可复现），
+        而 _busy 要等那次回填才复位，期间「翻译」按钮一直是灰的。做法与
+        closeEvent 一致——递增请求序号让旧结果过期，同时立刻结束忙碌态。
+        """
         self._auto_timer.stop()
         self._auto_pending = False
+        self._request_id += 1
+        self._set_busy(False)
         self._last_request = None
         self.source_edit.clear()
         self.result_edit.clear()
+        self._refresh_hint()
         self._set_status('')
         self.copy_button.setEnabled(False)
         self.source_edit.setFocus()
@@ -379,7 +476,8 @@ class TranslateWindow(QDialog):
 
         self._request_id += 1
         request_id = self._request_id
-        target_lang = self.current_language()
+        # 自动识别在这里定型：同一份原文 + 同一个方向才允许去重复请求
+        target_lang = self.current_language(text)
         self._set_busy(True)
         self._set_status('')
 
@@ -437,7 +535,8 @@ class TranslateWindow(QDialog):
         if self._auto_pending:
             self._auto_pending = False
             pending_text = self._source_text()
-            if pending_text and (pending_text, self.current_language()) != self._last_request:
+            if pending_text and (pending_text, self.current_language(pending_text)) \
+                    != self._last_request:
                 self._auto_timer.start()
                 self._set_status('内容已变化，正在重新翻译…')
                 return

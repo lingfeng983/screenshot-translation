@@ -2,6 +2,61 @@
 
 所有显著改动记录于此。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [Unreleased]
+
+### 新增
+- **文本翻译自动识别**：目标语言默认「自动识别」，按原文字符占比判定中文→英文 /
+  英文→中文，纯数字与符号回落到全局目标语言，日文假名与韩文谚文不误判；
+  操作行实时显示识别出的方向，也可在右上角手动指定目标语言
+  （`managers/translate_window.py`）
+- **下拉箭头与快捷键直接录入**：新增 `ChevronComboBox`（QPainter 画细 V 形箭头，
+  修复旧 QSS 把 down-arrow 渲染成方块的问题），设置页与文本翻译页的下拉全部替换；
+  快捷键改为点输入框后直接按组合键录入，Esc 取消、Delete 清空、只按修饰键继续等
+  （`managers/toolbar_combo.py`、`managers/styles.py`、`main.py`）
+- **长截图结果预览窗**：拼接完成后打开可滚动 / 等比缩放的非模态结果窗，复制与保存
+  都使用未缩放原图；快速保存直接写盘，避开已销毁遮罩的关闭回调
+  （`managers/scroll_result.py`、`managers/screenshot.py`）
+- **仅截图工具条排序**：输出组统一为 保存→钉住→取消→复制，纯截图分支的复制按钮
+  移到公共尾部之后且不再可折叠
+  （`managers/capture_toolbar.py`、`managers/overlay_toolbar.py`）
+
+### 安全
+- **自动更新链**：远端 `tag_name` 整串严格校验（`v?x.y.z` + 可选短后缀），下载目录
+  再做白名单与 `commonpath` 越界检查；附件名与直链协议/域名同样校验
+  （`managers/update_checker.py`、`managers/update_installer.py`）
+- **强制 sha256 摘要**：附件缺 digest、算法不是 sha256 或格式不对时不再静默跳过，
+  下载前就拒绝；新增可选的 Authenticode 发布者签名校验，发版签名成功后把证书
+  指纹写入随包分发的 `publisher_thumbprint.txt`，客户端据此强制核对签名者
+  （`managers/update_installer.py`、`scripts/publish_release.py`、
+  `scripts/setup.iss`、`screenshot-translator.spec`）
+- **快捷键必须带修饰键**：录入框、保存校验与键盘钩子后端三处都拒绝裸键，避免
+  全局劫持普通按键；具名键校验不再无脑去掉空格（`main.py`、`managers/hotkey.py`）
+- **发版预检前置**：干净工作树、CHANGELOG、tag/HEAD 一致性、版本号可写等只读检查
+  全部排在所有写操作之前；git 提交改为显式文件清单，附件改为流式上传
+  （`scripts/publish_release.py`）
+
+### 修复
+- 迟到的长截图结果不再清掉新一轮的完成/取消令牌；翻译页「清空」会作废在飞请求
+  并结束忙碌态；长截图 BitBlt/GetDIBits 失败路径恢复旧 GDI 对象
+  （`managers/screenshot.py`、`managers/translate_window.py`、
+  `managers/capture_scroll.py`）
+- 配置损坏时的备份改为带时间戳、不覆盖历史备份；旧版配置与缓存迁移成功后清理
+  程序目录里的明文副本，删不掉时给出明确告警（`config.py`、`managers/app_paths.py`）
+- 证书回退下载不再把 5 秒连接超时当成每次 socket 读的限时
+  （`managers/update_installer.py`）
+
+### 隐私与工程
+- 设置页新增「隐私」分组：翻译缓存开关、退出时清空、立即清空、免费第三方兜底
+  与启动预热开关；未显式开启时主接口失败不再自动把原文发给第三方
+  （`main.py`、`config.py`、`managers/translation.py`、`managers/cache_manager.py`）
+- 依赖增加可复现的 `constraints.txt` 与 `pytest.ini`，补 CI 工作流
+  （语法检查 + ruff + mypy + 全量测试）；修正 README 与实现漂移，文本翻译页的
+  语种识别支持中文夹英文/日文/韩文/纯符号
+  （`requirements*.txt`、`.github/workflows/ci.yml`、`pyproject.toml`、
+  `README.md`、`managers/translate_window.py`）
+- 明文翻译缓存落盘前收紧文件权限（POSIX 下 `0o600`），与 `config.ini` 一致
+  （`managers/cache_manager.py`）
+
 ## [v1.13.0] — 2026-11-12
 
 ### 变更

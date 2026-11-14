@@ -10,6 +10,7 @@
   这样装到只读位置、整目录覆盖升级都不会丢配置
 """
 
+import hashlib
 import logging
 import os
 import shutil
@@ -103,12 +104,29 @@ def data_dir() -> str:
     return path
 
 
+def _same_content(src, dst):
+    """逐块比对两个文件，确认副本完整后才允许删除原件"""
+    try:
+        def digest(path):
+            hasher = hashlib.sha256()
+            with open(path, 'rb') as handle:
+                for chunk in iter(lambda: handle.read(256 * 1024), b''):
+                    hasher.update(chunk)
+            return hasher.hexdigest()
+        return digest(src) == digest(dst)
+    except OSError as e:
+        logger.warning(f"比对迁移副本失败: {e}")
+        return False
+
+
 def migrate_legacy_data():
     """
     把旧版放在 exe 旁边的可写文件搬进用户目录（只补缺，不覆盖）
 
     升级路径上必须留这条：早期版本把配置写在 exe 同目录，用户已经填过密钥，
-    直接改读取位置会让设置回到默认值。
+    直接改读取位置会让设置回到默认值。确认副本一致后会删除程序目录里的旧
+    文件：Program Files 通常对所有用户可读，留一份 config.ini / 缓存等于把
+    明文密钥和截图原文公开摆着。删不掉时打一条明确的告警，请用户手动处理。
 
     Returns:
         list[str]: 实际搬迁的文件名
@@ -129,6 +147,16 @@ def migrate_legacy_data():
             moved.append(name)
         except OSError as e:
             logger.warning(f"旧数据迁移失败 {name}: {e}")
+            continue
+        if not _same_content(src, dst):
+            logger.warning(f"旧数据 {src} 的副本校验不通过，保留原件供人工核对")
+            continue
+        try:
+            os.remove(src)
+        except OSError as e:
+            logger.warning(
+                f"旧数据已迁到 {dst}，但无法删除程序目录里的明文副本 {src}：{e}。"
+                f"该文件可能包含 API 密钥或截图原文，请手动删除。")
     if moved:
         logger.info(f"已从程序目录迁移到 {target}: {', '.join(moved)}")
     return moved

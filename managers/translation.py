@@ -4,7 +4,7 @@
 翻译管理器
 负责处理翻译相关功能，基于 provider 注册表分发到具体翻译API
 
-内置提供者：Edge翻译(免费,国内可直连)、谷歌翻译(免费)、LibreTranslate、必应、百度、有道、大模型(LLM)
+内置提供者：Edge翻译(免费,国内可直连)、谷歌翻译(免费)、LibreTranslate、必应、百度、有道
 扩展方式：在 managers/providers/ 下新建符合约定的模块即可自动注册
 """
 
@@ -54,7 +54,9 @@ class TranslationManager(ProviderChainManager):
     _default_provider_name = 'edge_free'
     _failure_prefix = TRANSLATION_FAILURE_PREFIX
 
-    # 配置API全挂时依次尝试的免密钥接口（顺序即优先级）
+    # 配置API全挂时依次尝试的免密钥接口（顺序即优先级）。
+    # 是否参与由 allow_free_fallback 控制：默认不在用户未同意的情况下把
+    # 截图原文自动转交给另一个第三方服务商。
     _FREE_FALLBACKS = ('edge_free', 'google_free')
     # 单次请求的 (连接, 读取) 超时：requests 的超时是按每次 socket 操作算的，
     # 单个数字（原来 30 秒）配上重试与四级降级最坏能等到几分钟
@@ -87,6 +89,9 @@ class TranslationManager(ProviderChainManager):
         self.api_type = 'edge_free'     # 默认使用Edge免费翻译（微软翻译，国内可直连）
         self.fallback_api_type = ''     # 主API失败后的降级API（空为不降级）
         self.target_lang = 'zh'         # 目标语言
+        # 没有配置对象时保持编程式调用的原有行为；实际应用总是带配置，
+        # 由 [Translation] allow_free_fallback 决定（默认关闭）。
+        self.allow_free_fallback = True
         # (连接, 读取) 分开限时：连不上很快放弃，读取给足慢接口的时间
         self.timeout = (self._CONNECT_TIMEOUT, self._READ_TIMEOUT)
         # 单次翻译（含降级与重试）的整体时限；调用方传入 deadline 时以它为准
@@ -112,6 +117,15 @@ class TranslationManager(ProviderChainManager):
     # 不能在用户还没截图时就替用户花钱
     _WARMUP_PROVIDERS = ('edge_free', 'google_free')
 
+    def _free_fallback_names(self):
+        """
+        本次允许自动兜底的免费接口
+
+        关闭时返回空元组：主接口失败只报失败，不再把原文悄悄发给
+        Edge/Google 的免费端点。用户可在设置页「隐私」分组里显式开启。
+        """
+        return self._FREE_FALLBACKS if self.allow_free_fallback else ()
+
     def warm_up(self):
         """
         预热翻译链路（供启动后在后台线程调用）
@@ -125,6 +139,12 @@ class TranslationManager(ProviderChainManager):
             bool: 预热请求是否成功；未预热（当前接口非免费接口）也返回 False
         """
         try:
+            # 预热只发固定的 'Hello'，但仍是在用户没截图时向第三方发起请求：
+            # 有配置对象时必须有显式开关（默认关闭）。
+            if self.config_manager is not None and \
+                    not self.config_manager.is_translation_warmup_enabled():
+                logger.debug("启动预热已按隐私设置关闭")
+                return False
             if self.api_type not in self._WARMUP_PROVIDERS:
                 logger.debug(f"当前接口 {self.api_type} 不做启动预热")
                 return False
@@ -144,8 +164,13 @@ class TranslationManager(ProviderChainManager):
             self.api_type = self.config_manager.get_api_type()
             self.fallback_api_type = self.config_manager.get_fallback_api_type()
             self.target_lang = self.config_manager.get_target_lang()
+            free_fallback_getter = getattr(
+                self.config_manager, 'is_free_fallback_allowed', None)
+            self.allow_free_fallback = (bool(free_fallback_getter())
+                                        if free_fallback_getter else True)
             logger.info(f"从配置加载: api_type={self.api_type}, "
-                        f"fallback={self.fallback_api_type}, target={self.target_lang}")
+                        f"fallback={self.fallback_api_type}, target={self.target_lang}, "
+                        f"free_fallback={self.allow_free_fallback}")
         except Exception as e:
             logger.error(f"加载配置失败: {e}")
 
@@ -282,7 +307,7 @@ class TranslationManager(ProviderChainManager):
         """
         names = []
         for name in (self.api_type, self.fallback_api_type,
-                     *self._FREE_FALLBACKS):
+                     *self._free_fallback_names()):
             if not name or name in names:
                 continue
             if provider_registry.get(name) is None:
@@ -388,13 +413,16 @@ class TranslationManager(ProviderChainManager):
                 if served is not None:
                     return result, served
 
-        # 2) 最后兜底：依次尝试免密钥的免费接口（Edge国内可直连，Google质量更好）
+        # 2) 用户显式同意后才兜底免密钥的免费接口（Edge国内可直连，Google质量更好）
         #    已经试过的引擎不再重复走：配置的降级API本身就可以填 edge_free，
         #    只跟主API去重的话同一个引擎要在链上被跑两遍，时限白烧一半
         tried = {provider_cls.name}
         if self.fallback_api_type:
             tried.add(self.fallback_api_type)
-        for free_name in self._FREE_FALLBACKS:
+        free_fallbacks = self._free_fallback_names()
+        if not free_fallbacks:
+            logger.info("免费第三方兜底已按隐私设置关闭，不再转发原文")
+        for free_name in free_fallbacks:
             if not self._chain_open(deadline, cancel_event):
                 logger.warning("翻译链时限已用尽或被取消，跳过剩余兜底接口")
                 break

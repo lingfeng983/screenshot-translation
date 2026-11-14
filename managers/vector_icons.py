@@ -18,7 +18,7 @@ _DEFAULT_COLOR = '#e8e8e8'
 _BADGE_TEXT_COLOR = '#ffffff'
 _BADGE_CENTER = (18.0, 18.0)
 
-_CACHE = {}
+_CACHE: dict = {}
 
 
 def icon(name, color=_DEFAULT_COLOR, badge=None, on_color=None):

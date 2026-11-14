@@ -610,13 +610,21 @@ class ScreenshotManager:
                 # 退出），就只能靠 widget 上的兜底定时器复位编辑态了。
                 qt_dispatcher.dispatch_to_main_thread(
                     self._apply_scroll_result, widget, None, request_id,
-                    cancel_event)
+                    cancel_event, True)
             except Exception:
                 logger.exception("滚动截图恢复调度再次失败")
 
-    def _apply_scroll_result(self, widget, long_image, request_id, cancel_event):
-        # 先校验归属：迟到的旧结果不能把新一轮滚动的令牌清掉
+    def _apply_scroll_result(self, widget, long_image, request_id, cancel_event,
+                             force=False):
+        # 先校验归属：迟到的旧结果不能把新一轮滚动的令牌清掉。
+        # 只比 widget 不够——同一个遮罩上先取消再开一轮长截图时，widget 仍是
+        # 同一个，旧结果到达就会把新轮的 finish/cancel 令牌清空，此后「完成」
+        # 与「取消」都失灵。令牌身份才是这一轮的唯一凭据。
         if widget is None or widget is not self._screenshot_widget:
+            return
+        # force 只用于「回投失败后当场清过令牌」的兜底恢复
+        if not force and self._scroll_cancel is not cancel_event:
+            logger.debug("迟到的长截图结果，保留新一轮的滚动令牌")
             return
         # 任务已收手：清掉在途标记
         self._scroll_finish = None
@@ -2265,30 +2273,65 @@ class ScreenshotWidget(QWidget):
             logger.exception("展示 OCR 结果失败")
         self._show_capture_toast(f'已提取 {len(text)} 个字符')
 
-    def on_scroll_finished(self, image, canceled=False):
-        """长截图结果回投（主线程）：恢复遮罩、复制长图并按配置保存"""
+    def _restore_after_scroll(self):
+        """长截图期间遮罩是隐藏的：取消/失败时把编辑态完整恢复回来"""
         self.show()
         self.raise_()
         # 隐藏期间键盘焦点已经丢了，不重新抢回来的话 ESC / Ctrl+S 全部失灵
         self.activateWindow()
         self.setFocus()
+
+    def on_scroll_finished(self, image, canceled=False):
+        """长截图结果回投（主线程）：成功后直接展示长图，而不是回到截图页面
+
+        取消或没拼出图时仍恢复原编辑态，方便重新选区或重试；成功时把长图
+        交给独立预览窗（可滚动/缩放/复制/保存），遮罩随即收起并释放。
+        """
         self.hide_scroll_banner()
         self.set_capture_busy(False)
-        if canceled:
-            self._show_capture_toast('已取消长截图')
-            return
-        if image is None or image.width <= 0 or image.height <= 0:
-            self._show_capture_toast('长截图未完成')
+        if canceled or image is None or image.width <= 0 or image.height <= 0:
+            self._restore_after_scroll()
+            self._show_capture_toast('已取消长截图' if canceled else '长截图未完成')
             return
         pixmap = result_render.pil_to_qpixmap(image)
         if pixmap is None:
+            self._restore_after_scroll()
             self._show_capture_toast('长图生成失败')
             return
         clipboard.set_pixmap_later(pixmap, on_done=None)
         if self.capture_option_bool('quick_save'):
-            self._save_capture_pixmap(pixmap, title='保存长截图')
-        self._show_capture_toast(
-            f'长截图 {image.width}×{image.height} 已复制到剪贴板', 2600)
+            # 只写盘、不跑「保存后动作」：遮罩马上要关，那里面排的关闭回调
+            # 会打在一个已经销毁的窗口上。保存入口仍在结果窗的「保存…」按钮。
+            try:
+                capture_output.save_pixmap(
+                    pixmap,
+                    fmt=self.capture_option('format', 'png'),
+                    quality=self.capture_option_int('jpg_quality', 90, 1, 100),
+                    directory=self.capture_option('save_dir', '') or None,
+                    template=self.capture_option('filename_template', ''),
+                    quick=True, parent=None, title='保存长截图')
+            except Exception:
+                logger.exception('长截图快速保存失败')
+
+        try:
+            from .scroll_result import show_scroll_result
+            window = show_scroll_result(pixmap, config_manager=self.config_manager)
+        except Exception:
+            logger.exception('展示长截图结果窗失败，退回截图编辑态')
+            self._restore_after_scroll()
+            self._show_capture_toast('长图预览打开失败，长图已复制到剪贴板')
+            return
+        if window is None:
+            self._restore_after_scroll()
+            self._show_capture_toast('长图生成失败')
+            return
+        # 结果窗是独立窗口，不随遮罩关闭。这里借 screenshot_canceled 让管理器
+        # 释放遮罩引用并恢复弹窗能力（它是唯一的「遮罩已结束」信号）。
+        self._hide_toolbar()
+        self.hide()
+        self.screenshot_canceled.emit()
+        self.close()
+        logger.info(f'长截图完成：{image.width}×{image.height}，已切换到结果图预览')
 
     def _save_capture_pixmap(self, pixmap, title='保存截图'):
         """统一走 capture_output：格式/质量/目录/模板/快速保存/保存后动作"""

@@ -23,7 +23,7 @@ import keyboard
 from .hotkey_native import (
     HOTKEY_ID, HOTKEY_ID_CAPTURE, HOTKEY_ID_TEXT,
     HOTKEY_ID_FULLSCREEN, HOTKEY_ID_WINDOW, HOTKEY_ID_REPEAT,
-    NativeHotkeyBackend)
+    NativeHotkeyBackend, parse_hotkey)
 from .qt_dispatcher import qt_dispatcher
 
 logger = logging.getLogger('screenshot-translation')
@@ -208,6 +208,14 @@ class HotkeyManager:
         Returns:
             bool: 注册是否成功
         """
+        # 原生后端会拒绝裸键，键盘钩子却会老老实实把 'a' 注册成全局热键，
+        # 之后这个字母在所有程序里都打不出来。两个后端必须共用同一份校验。
+        if parse_hotkey(self.hotkey) is None:
+            self.last_error = (
+                f"快捷键 {self.hotkey} 缺少修饰键或主键无法识别，已拒绝注册")
+            logger.warning(self.last_error)
+            self._backend = None
+            return False
         try:
             self._hotkey_handle = keyboard.add_hotkey(
                 self.hotkey,
@@ -463,6 +471,18 @@ class HotkeyManager:
         """
         previous_hotkey = self.hotkey
         try:
+            if not hotkey:
+                # 空值 = 用户主动禁用这条快捷键：注销当前注册并清掉配置，
+                # 不能把空串交给 keyboard.add_hotkey 去碰运气
+                self._unregister_hotkey()
+                self.hotkey = ''
+                self.last_error = ''
+                if self.config_manager:
+                    setter = getattr(self.config_manager,
+                                     self._CONFIG_SETTERS[self.action])
+                    setter('')
+                logger.info(f"快捷键已禁用: {self.action}")
+                return True
             self.hotkey = hotkey
             self.last_error = ''
             if not self._register_hotkey():

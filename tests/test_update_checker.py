@@ -7,6 +7,7 @@
 手动检查确认后自动下载与安装。网络请求全部用假响应/假函数替换，离线可跑。
 """
 
+import hashlib
 import os
 import urllib.request
 
@@ -19,6 +20,15 @@ from managers import update_installer as ui
 # 真连 GitHub 的用例默认不跑（与其他模块同一套开关）
 ONLINE = os.environ.get('ST_RUN_ONLINE') == '1'
 online = pytest.mark.skipif(not ONLINE, reason='需要真实网络：ST_RUN_ONLINE=1 才跑')
+
+# 下载路径会校验直链域名，测试统一用 GitHub 系的假地址
+ASSET_URL = ('https://github.com/lingfeng983/screenshot-translation/releases/'
+             'download/v1.9.0/ScreenshotTranslator-Setup.exe')
+
+
+def digest_of(payload):
+    """构造发行版附件的 sha256 摘要（现在缺摘要会直接拒绝下载）"""
+    return 'sha256:' + hashlib.sha256(payload).hexdigest()
 
 
 class _FakeResponse:
@@ -350,13 +360,13 @@ def test_download_writes_installer_and_reports_progress(tmp_path, monkeypatch):
     monkeypatch.setattr(requests, 'get', fake_get)
 
     progress = []
-    info = uc.ReleaseInfo('1.9.0', asset_url='https://example.test/setup.exe',
+    info = uc.ReleaseInfo('1.9.0', asset_url=ASSET_URL,
                           asset_name='ScreenshotTranslator-Setup.exe',
-                          asset_size=len(payload))
+                          asset_size=len(payload), asset_digest=digest_of(payload))
     path = ui.download(info, directory=str(tmp_path),
                        progress=lambda d, t: progress.append((d, t)))
 
-    assert seen['url'] == 'https://example.test/setup.exe'
+    assert seen['url'] == ASSET_URL
     assert seen['stream'] is True, "必须流式下载，否则大包会整块进内存"
     assert os.path.basename(path) == 'ScreenshotTranslator-Setup.exe'
     with open(path, 'rb') as handle:
@@ -401,8 +411,9 @@ def test_download_cancel_removes_partial_file(tmp_path, monkeypatch):
     monkeypatch.setattr(requests, 'get', lambda *a, **k: _CancelAfterFirst())
 
     with pytest.raises(ui.UpdateCancelled):
-        ui.download(uc.ReleaseInfo('1.9.0', asset_url='https://example.test/s.exe',
-                                   asset_name='s.exe', asset_size=512),
+        ui.download(uc.ReleaseInfo('1.9.0', asset_url=ASSET_URL,
+                                   asset_name='s.exe', asset_size=512,
+                                   asset_digest=digest_of(b'cancel')),
                     directory=str(tmp_path), cancel=cancel)
     assert os.listdir(tmp_path) == [], "取消后残留了半截安装包"
 
@@ -414,8 +425,9 @@ def test_download_rejects_non_executable(tmp_path, monkeypatch):
     monkeypatch.setattr(requests, 'get',
                         lambda *a, **k: _FakeStream([b'<html>rate limited</html>']))
     with pytest.raises(ui.UpdateError):
-        ui.download(uc.ReleaseInfo('1.9.0', asset_url='https://example.test/s.exe',
-                                   asset_name='s.exe'),
+        ui.download(uc.ReleaseInfo('1.9.0', asset_url=ASSET_URL,
+                                   asset_name='s.exe',
+                                   asset_digest=digest_of(b'html')),
                     directory=str(tmp_path))
 
 
@@ -451,8 +463,9 @@ def test_download_falls_back_to_system_trust_on_cert_error(tmp_path, monkeypatch
     monkeypatch.setattr(requests, 'get', fail)
     monkeypatch.setattr(urllib.request, 'urlopen', lambda *a, **k: _FakeUrlopen(payload))
 
-    info = uc.ReleaseInfo('1.9.0', asset_url='https://example.test/s.exe',
-                          asset_name='s.exe', asset_size=len(payload))
+    info = uc.ReleaseInfo('1.9.0', asset_url=ASSET_URL,
+                          asset_name='s.exe', asset_size=len(payload),
+                          asset_digest=digest_of(payload))
     path = ui.download(info, directory=str(tmp_path))
     with open(path, 'rb') as handle:
         assert handle.read() == payload
@@ -467,7 +480,7 @@ def test_download_rejects_digest_mismatch(tmp_path, monkeypatch):
     payload = b'MZ' + b'\x00' * 64
     monkeypatch.setattr(requests, 'get', lambda *a, **k: _FakeStream([payload]))
     info = uc.ReleaseInfo(
-        '1.9.0', asset_url='https://example.test/s.exe', asset_name='s.exe',
+        '1.9.0', asset_url=ASSET_URL, asset_name='s.exe',
         asset_size=len(payload),
         asset_digest='sha256:' + hashlib.sha256(b'other').hexdigest())
     with pytest.raises(ui.UpdateError):
@@ -476,11 +489,18 @@ def test_download_rejects_digest_mismatch(tmp_path, monkeypatch):
 
     # 摘要对得上时正常通过
     good = uc.ReleaseInfo(
-        '1.9.0', asset_url='https://example.test/s.exe', asset_name='s.exe',
+        '1.9.0', asset_url=ASSET_URL, asset_name='s.exe',
         asset_size=len(payload),
         asset_digest='sha256:' + hashlib.sha256(payload).hexdigest())
     path = ui.download(good, directory=str(tmp_path))
     assert os.path.getsize(path) == len(payload)
+
+    # 摘要缺失或算法不是 sha256：连下载都不该发起
+    for bad_digest in ('', 'md5:' + 'a' * 32, 'sha256:not-a-hex'):
+        with pytest.raises(ui.UpdateError):
+            ui.download(uc.ReleaseInfo(
+                '1.9.0', asset_url=ASSET_URL, asset_name='s.exe',
+                asset_digest=bad_digest), directory=str(tmp_path))
 
 
 def test_launch_installer_uses_silent_flags(tmp_path, monkeypatch):
@@ -496,6 +516,8 @@ def test_launch_installer_uses_silent_flags(tmp_path, monkeypatch):
             seen['argv'] = argv
 
     monkeypatch.setattr(ui.subprocess, 'Popen', _FakePopen)
+    # 签名查询走 PowerShell；单测只关心启动参数，注入"当前环境无法验签"
+    monkeypatch.setattr(ui, '_authenticode_status', lambda path: None)
     ui.launch(str(installer))
 
     argv = seen['argv']
@@ -561,3 +583,163 @@ def test_tray_menu_check_update_is_interactive():
     tray = SystemTrayManager(main_app=FakeApp())
     tray._on_check_update()
     assert tray.main_app.calls == [True]
+
+
+# ---------------------------------------------------------------- 更新链安全加固
+
+def test_release_tag_is_strictly_validated():
+    """tag_name 整串校验：只放 v?x.y.z + 可选短后缀，路径分隔符一律拒绝"""
+    assert uc.normalize_release_tag('v1.9.0') == '1.9.0'
+    assert uc.normalize_release_tag('1.14.0-beta.2') == '1.14.0-beta.2'
+    assert uc.normalize_release_tag('v2.0.0+build.7') == '2.0.0+build.7'
+    for bad in ('v1.9.0/../../../Public/pwned', r'v1.9.0\..\..\pwned',
+                'v1.9.0;rm -rf /', '1.9', 'vX.Y.Z', 'v1.9.0 beta', ''):
+        assert uc.normalize_release_tag(bad) is None, bad
+    # 首尾空白按常规规范化，不影响安全性
+    assert uc.normalize_release_tag('  v1.9.0  ') == '1.9.0'
+    # 版本比较仍保持宽松（预发布后缀只取数字段）
+    assert uc.parse_version('1.9.0-beta.2') == (1, 9, 0)
+
+
+def test_fetch_latest_release_rejects_unsafe_tag(monkeypatch):
+    """伪造的 tag_name 不能进入 ReleaseInfo（会被拿去拼下载目录）"""
+    import requests
+
+    response = _FakeResponse({
+        'tag_name': 'v1.9.0/../../../Public/pwned',
+        'html_url': 'https://example.test/release',
+        'assets': [],
+    })
+    monkeypatch.setattr(requests, 'get', lambda *a, **k: response)
+    with pytest.raises(ValueError):
+        uc.fetch_latest_release()
+
+
+def test_download_dir_rejects_path_traversal(tmp_path, monkeypatch):
+    """下载目录净化 + commonpath 兜底，任何输入都逃不出临时根目录"""
+    monkeypatch.setattr(ui.tempfile, 'gettempdir', lambda: str(tmp_path))
+    for bad in ('1.9.0/../../../pwned', r'1.9.0\..\..\pwned',
+                '..', 'a/b', 'v1.9.0;echo pwned'):
+        with pytest.raises(ui.UpdateError):
+            ui.download_dir(bad)
+    expected = tmp_path / 'screenshot-translator-update' / '1.9.0'
+    assert os.path.normcase(ui.download_dir('1.9.0')) == os.path.normcase(str(expected))
+    assert expected.is_dir()
+    assert not (tmp_path / 'pwned').exists()
+
+
+def test_asset_name_and_url_are_validated():
+    """远端附件名与直链都不可信：目录穿越、非 exe、file://、异域一律拒绝"""
+    assert ui._safe_asset_name('ScreenshotTranslator-Setup.exe') == \
+        'ScreenshotTranslator-Setup.exe'
+    for bad in (r'..\evil.exe', '../evil.exe', '..', 'setup.bat',
+                'a' * 200 + '.exe'):
+        with pytest.raises(ui.UpdateError):
+            ui._safe_asset_name(bad)
+    for bad in ('file:///C:/Windows/explorer.exe', 'http://github.com/x.exe',
+                'https://evil.example/setup.exe',
+                'https://github.com.evil.test/setup.exe'):
+        with pytest.raises(ui.UpdateError):
+            ui._validate_asset_url(bad)
+    ui._validate_asset_url(ASSET_URL)
+
+
+def test_publisher_signature_verification(tmp_path, monkeypatch):
+    """配置了发布者指纹时强制验签；未配置的历史发行版只告警放行"""
+    path = str(tmp_path / 'setup.exe')
+    with open(path, 'wb') as handle:
+        handle.write(b'MZ')
+    monkeypatch.setattr(ui, 'expected_publisher_thumbprint', lambda: '')
+    monkeypatch.setattr(ui, '_authenticode_status',
+                        lambda p: {'status': 'NotSigned', 'thumbprint': ''})
+    assert ui.verify_publisher_signature(path) is False
+
+    thumb = 'A' * 40
+    monkeypatch.setattr(ui, 'expected_publisher_thumbprint', lambda: thumb)
+    with pytest.raises(ui.UpdateError):
+        ui.verify_publisher_signature(path)          # 要求签名但文件未签名
+
+    monkeypatch.setattr(ui, '_authenticode_status',
+                        lambda p: {'status': 'Valid', 'thumbprint': 'B' * 40})
+    with pytest.raises(ui.UpdateError):
+        ui.verify_publisher_signature(path)          # 签名者不是发布者
+
+    monkeypatch.setattr(ui, '_authenticode_status',
+                        lambda p: {'status': 'Valid', 'thumbprint': thumb})
+    assert ui.verify_publisher_signature(path) is True
+
+    monkeypatch.setattr(ui, '_authenticode_status',
+                        lambda p: {'status': 'HashMismatch', 'thumbprint': thumb})
+    with pytest.raises(ui.UpdateError):
+        ui.verify_publisher_signature(path)          # 签名存在但内容被改过
+
+    monkeypatch.setattr(ui, 'expected_publisher_thumbprint', lambda: 'BAD')
+    with pytest.raises(ui.UpdateError):
+        ui.verify_publisher_signature(path)          # 指纹配置格式错误不能静默放行
+
+
+def test_launch_refuses_untrusted_signature(tmp_path, monkeypatch):
+    """签名校验没过就绝不 Popen 安装包"""
+    installer = tmp_path / 'setup.exe'
+    installer.write_bytes(b'MZ')
+    seen = []
+
+    class _FakePopen:
+        pid = 1
+
+        def __init__(self, argv, **kwargs):
+            seen.append(argv)
+
+    def deny(path):
+        raise ui.UpdateError('签名不受信任')
+
+    monkeypatch.setattr(ui.subprocess, 'Popen', _FakePopen)
+    monkeypatch.setattr(ui, 'verify_publisher_signature', deny)
+    with pytest.raises(ui.UpdateError):
+        ui.launch(str(installer))
+    assert seen == [], "验签失败却启动了安装程序"
+
+
+def test_expected_publisher_thumbprint_reads_bundled_file(tmp_path, monkeypatch):
+    """发版签出的指纹文件在源码态与打包态都能被读到，环境变量优先"""
+    from managers import app_paths
+
+    thumb = 'A' * 40
+    (tmp_path / 'resources').mkdir()
+    (tmp_path / 'resources' / ui.PUBLISHER_THUMBPRINT_FILE).write_text(
+        thumb.lower() + '\n', encoding='utf-8')
+    monkeypatch.delenv(ui.PUBLISHER_THUMBPRINT_ENV, raising=False)
+    monkeypatch.setattr(app_paths, 'resource_path',
+                        lambda *parts: str(tmp_path.joinpath(*parts)))
+    assert ui.expected_publisher_thumbprint() == thumb
+
+    monkeypatch.setenv(ui.PUBLISHER_THUMBPRINT_ENV, 'B' * 40)
+    assert ui.expected_publisher_thumbprint() == 'B' * 40
+
+
+def test_urllib_fallback_uses_read_timeout(tmp_path, monkeypatch):
+    """证书回退不能用 5 秒连接值当每次 socket 读的限时"""
+    import urllib.request
+
+    seen = {}
+
+    class _EmptyResponse:
+        headers = {}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return False
+
+        def read(self, size):
+            return b''
+
+    def fake_urlopen(request, timeout=None):
+        seen['timeout'] = timeout
+        return _EmptyResponse()
+
+    monkeypatch.setattr(urllib.request, 'urlopen', fake_urlopen)
+    ui._fetch_with_urllib(ASSET_URL, str(tmp_path / 'x.bin'), None, None,
+                          (5, 30), 0)
+    assert seen['timeout'] == 30, "慢网下 5 秒读超时会误判下载失败"

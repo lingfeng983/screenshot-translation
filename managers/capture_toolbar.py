@@ -4,7 +4,7 @@
 截图编辑态浮动工具条
 
 贴在选区下沿：标注工具、颜色/线宽/字号、撤销重做清空、取色、OCR 取字、
-滚动截图，以及复制/保存/钉住/取消。用真实 QPushButton 而非自绘，命中测试
+滚动截图，以及保存/钉住/取消/复制（复制放在最后）。用真实 QPushButton 而非自绘，命中测试
 与键盘可达性交给 Qt；图标由 vector_icons 程序化绘制。
 
 只发信号，不直接碰截图流程。
@@ -34,7 +34,7 @@ _COLOR_SWATCH_SIZE = 14
 _CUSTOM_COLOR_LABEL = '自定义…'
 # 取消（退出截图）用红色叉号，与「清空标注」的垃圾桶一眼分开
 _CANCEL_COLOR = '#ff6b6b'
-_SWATCH_CACHE = {}
+_SWATCH_CACHE: dict = {}
 
 
 def _swatch_icon(hex_color):
@@ -218,10 +218,8 @@ class CaptureToolbar(QWidget):
         layout.addWidget(self.scroll_button)
         layout.addSpacing(5)
 
-        # 5) 输出动作
-        self.copy_button = self._icon_button('copy', '复制到剪贴板 (Ctrl+C)')
-        self.copy_button.clicked.connect(self.copy_clicked.emit)
-        layout.addWidget(self.copy_button)
+        # 5) 输出动作：最后一个按钮固定为「复制到剪贴板」，
+        #    用户顺着从左到右扫过去，最右端就是最常用的收尾动作。
         self.save_button = self._icon_button('save', '保存 (Ctrl+S)')
         self.save_button.clicked.connect(self.save_clicked.emit)
         layout.addWidget(self.save_button)
@@ -233,6 +231,9 @@ class CaptureToolbar(QWidget):
         self.cancel_button.setObjectName('CaptureCancel')
         self.cancel_button.clicked.connect(self.cancel_clicked.emit)
         layout.addWidget(self.cancel_button)
+        self.copy_button = self._icon_button('copy', '复制到剪贴板 (Ctrl+C)')
+        self.copy_button.clicked.connect(self.copy_clicked.emit)
+        layout.addWidget(self.copy_button)
 
         # 宽度不够时按「先省次要、后省核心」的顺序折叠
         self._trimmable = [

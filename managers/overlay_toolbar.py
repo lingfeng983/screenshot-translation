@@ -179,9 +179,9 @@ class OverlayToolbar(QWidget):
                 'save', None, '保存截图', self.image_save_clicked, 'original')
             layout.addWidget(self.save_original_button)
 
+            # 纯截图：复制按钮等公共尾部之后再加，保证它是最后一个按钮
             self.copy_original_image_button = self._make_icon_button(
                 'copy', None, '复制截图到剪贴板', self.image_copy_clicked, 'original')
-            layout.addWidget(self.copy_original_image_button)
 
             self.save_translated_button = None
             self.copy_translated_image_button = None
@@ -202,9 +202,10 @@ class OverlayToolbar(QWidget):
         layout.addWidget(self.close_button)
 
         if self.capture_only:
-            # 宽度不够时依次折叠复制、保存、钉住；只有关闭按钮始终保留
+            # 纯截图时最后一个按钮必须是「复制到剪贴板」
+            layout.addWidget(self.copy_original_image_button)
+            # 宽度不够时依次折叠保存、钉住；关闭与复制两个按钮始终保留
             self._trimmable = [
-                self.copy_original_image_button,
                 self.save_original_button,
                 self.pin_button,
             ]

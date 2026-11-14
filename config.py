@@ -11,10 +11,20 @@ import logging
 import os
 import shutil
 import threading
+from datetime import datetime
 
 from managers import app_paths
 
 logger = logging.getLogger('screenshot-translation')
+
+# [Translation] 段的隐私相关开关及默认值（老配置升级时按这张表补齐）
+_PRIVACY_DEFAULTS = {
+    'cache_enabled': 'true',
+    'clear_cache_on_exit': 'false',
+    'allow_free_fallback': 'false',
+    'warm_up': 'false',
+}
+
 
 class ConfigManager:
     """
@@ -45,6 +55,8 @@ class ConfigManager:
         # 最近一次落盘是否成功：写盘失败会被 _write_config 兜住（不能让设置
         # 窗口直接崩），但用户必须知道改动没进文件
         self.write_ok = True
+        # 配置损坏被默认配置覆盖时留给用户看的说明（由主程序弹托盘通知）
+        self.recovery_notice = ''
         self._load_config()
 
     @contextlib.contextmanager
@@ -106,11 +118,22 @@ class ConfigManager:
                     self.save_config()
             except Exception as e:
                 logger.error(f"配置文件加载失败，回退默认配置: {e}")
-                # 先留一份再修：直接写回默认值会把用户那份"只是某行写坏了"的
-                # 文件彻底顶掉，键值再无处可查（固定名，允许覆盖——修好后这个
-                # 分支就进不来了，再进来说明用户又把文件弄坏了一次）
+                # 先留一份再修：备份名带时间戳与 PID，连着坏两次也不会把上一份
+                # 还能恢复的配置顶掉（旧实现固定写 config.ini.bak，第二次损坏
+                # 就把唯一一份备份覆盖成了同样坏的内容）。文件里有明文密钥，
+                # 覆盖前必须让用户有机会找回。
+                # 微秒 + PID：同一秒内连续损坏两次也不会互相覆盖
+                backup = (f"{self.config_file}."
+                          f"{datetime.now():%Y%m%d-%H%M%S-%f}-{os.getpid()}.bak")
+                saved = ''
                 with contextlib.suppress(OSError):
-                    shutil.copy2(self.config_file, self.config_file + '.bak')
+                    shutil.copy2(self.config_file, backup)
+                    saved = backup
+                self.recovery_notice = (
+                    '配置文件损坏，已用默认配置覆盖。'
+                    + (f'原文件已备份到 {saved}，可手动找回密钥与快捷键。'
+                       if saved else '原文件备份失败，请检查目录权限。'))
+                logger.warning(self.recovery_notice)
                 # 半截解析会留下几个"存在但缺键"的段，而各段的默认值填充器
                 # 见段即跳，修出来的文件会整段整段缺键；先扔掉半成品
                 self.config = configparser.ConfigParser(interpolation=None)
@@ -191,6 +214,13 @@ class ConfigManager:
                     not in ('zh', 'en'):
                 self.config.set('Translation', 'target_lang', 'zh')
                 migrated = True
+        # 老配置里 [Translation] 段已经存在，_set_translation_defaults 见段即
+        # 跳，新加的隐私开关必须在这里逐项补齐，否则读侧永远拿 fallback。
+        self._ensure_section('Translation')
+        for option, default in _PRIVACY_DEFAULTS.items():
+            if not self.config.has_option('Translation', option):
+                self.config.set('Translation', option, default)
+                migrated = True
         return migrated
 
     def _ensure_section(self, section):
@@ -265,6 +295,11 @@ class ConfigManager:
         self.config.set('Translation', 'baidu_app_id', '')
         self.config.set('Translation', 'youdao_api_key', '')
         self.config.set('Translation', 'youdao_app_id', '')
+        # 隐私选项：缓存默认开（历史行为），其余一律默认关。
+        # 免费兜底与启动预热都会在用户没截图时把文本发给第三方接口，
+        # 必须显式同意才启用。
+        for option, default in _PRIVACY_DEFAULTS.items():
+            self.config.set('Translation', option, default)
 
     def _set_hotkey_defaults(self):
         """设置 [Hotkey] 段默认配置值"""
@@ -763,6 +798,63 @@ class ConfigManager:
         """
         self._set('Update', 'last_notified_version', version)
         self.save_config()
+
+    # ---- 隐私配置 ----
+    #
+    # 翻译缓存以明文保存截图识别出的原文与译文；免费兜底/预热会把文本发给
+    # 第三方。四个开关都能在设置页「隐私」分组里改，读侧对缺项与坏值都
+    # 按上表的默认值处理，老配置升级时由 _migrate_values 补齐。
+
+    def _privacy_bool(self, option):
+        """
+        读取 [Translation] 里的布尔开关
+
+        configparser 的 fallback 只兜"缺项/缺段"，值写坏了照样抛 ValueError；
+        这里统一收成默认值，别让一处手误把整个启动流程带崩。
+        """
+        default = _PRIVACY_DEFAULTS[option].strip().lower() == 'true'
+        try:
+            return self.config.getboolean('Translation', option, fallback=default)
+        except ValueError:
+            logger.warning(f"Translation.{option} 不是合法布尔值，按默认 {default} 处理")
+            return default
+
+    def _set_privacy_bool(self, option, enabled):
+        """写入 [Translation] 里的布尔开关"""
+        self._set('Translation', option, str(bool(enabled)).lower())
+        self.save_config()
+
+    def is_translation_cache_enabled(self):
+        """是否把原文/译文写入本地翻译缓存"""
+        return self._privacy_bool('cache_enabled')
+
+    def set_translation_cache_enabled(self, enabled):
+        """开关本地翻译缓存（关闭时会由主程序清掉已落盘的明文）"""
+        self._set_privacy_bool('cache_enabled', enabled)
+
+    def is_clear_cache_on_exit(self):
+        """退出时是否清空翻译缓存"""
+        return self._privacy_bool('clear_cache_on_exit')
+
+    def set_clear_cache_on_exit(self, enabled):
+        """设置退出时清空翻译缓存"""
+        self._set_privacy_bool('clear_cache_on_exit', enabled)
+
+    def is_free_fallback_allowed(self):
+        """主接口失败时是否允许自动改用免费第三方接口"""
+        return self._privacy_bool('allow_free_fallback')
+
+    def set_free_fallback_allowed(self, enabled):
+        """设置是否允许自动切换到免费第三方接口"""
+        self._set_privacy_bool('allow_free_fallback', enabled)
+
+    def is_translation_warmup_enabled(self):
+        """启动时是否预热当前免费翻译接口"""
+        return self._privacy_bool('warm_up')
+
+    def set_translation_warmup_enabled(self, enabled):
+        """设置启动预热开关"""
+        self._set_privacy_bool('warm_up', enabled)
 
     # 其他API配置方法
     #

@@ -35,6 +35,10 @@ datas = [
     ('resources/icon.ico', 'resources'),
     ('config.example.ini', '.'),
 ]
+# 发版脚本签名成功后写下的发布者证书指纹；客户端自动更新会强制核对它。
+# 未启用代码签名时文件不存在，不能放进静态清单，否则构建直接失败。
+if os.path.isfile('resources/publisher_thumbprint.txt'):
+    datas.append(('resources/publisher_thumbprint.txt', '.'))
 
 # RapidOCR 的模型、默认配置与语言字典不是 py 模块，静态分析收不到；
 # 只收 yaml 与 models/，不要把 pytorch 分支的架构配置等无关文件带进来
@@ -235,6 +239,10 @@ exe = EXE(
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
+    # Windows 的 Authenticode 签名不在这里做：codesign_identity 只对 macOS
+    # 有效。最终交付物是 Inno Setup 编出来的 Setup.exe，由
+    # scripts/publish_release.py 的 step_sign() 签名并固化发布者指纹，
+    # 客户端更新时再用 update_installer.verify_publisher_signature 校验。
     codesign_identity=None,
     entitlements_file=None,
     icon='resources/icon.ico',

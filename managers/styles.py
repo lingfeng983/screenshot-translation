@@ -104,6 +104,13 @@ QLineEdit:disabled, QTextEdit:disabled {{
     color: {p['text_sub']};
     background-color: {p['input_pressed']};
 }}
+/* 快捷键录入框：只读、直接按键盘组合。聚焦时整块高亮，提示「正在接收按键」 */
+QLineEdit[hotkeyCapture="true"] {{ font-weight: 600; }}
+QLineEdit[hotkeyCapture="true"]:focus {{
+    background-color: #eef4ff;
+    border: 1px solid {p['accent']};
+    color: {p['accent']};
+}}
 
 QPushButton {{
     background-color: {p['input_bg']};
@@ -136,13 +143,9 @@ QComboBox {{
 QComboBox:hover {{ border-color: {p['accent_hover']}; }}
 QComboBox:focus {{ border-color: {p['accent']}; }}
 QComboBox::drop-down {{ border: none; width: 22px; }}
-QComboBox::down-arrow {{
-    image: none;
-    border-left: 5px solid transparent;
-    border-right: 5px solid transparent;
-    border-top: 6px solid {p['text_sub']};
-    margin-right: 8px;
-}}
+/* border 拼三角在 Qt 里只会渲染成方块：箭头统一由 ChevronComboBox 自绘，
+   样式表这里把箭头彻底关掉，避免方块和自绘箭头叠在一起 */
+QComboBox::down-arrow {{ image: none; border: none; width: 0px; height: 0px; }}
 QComboBox QAbstractItemView {{
     background-color: {p['panel_bg']};
     border: 1px solid {p['border']};

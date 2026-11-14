@@ -1,0 +1,36 @@
+# 工程工具配置（不参与打包，PyInstaller 只读 screenshot-translator.spec）
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+exclude = [
+    "build", "dist", "release", "scratch", ".workbuddy",
+    "__pycache__", "tests/_runner.py",
+]
+
+[tool.ruff.lint]
+# 只把"一定会出问题"的规则设为默认门禁：语法错误、 Star 导入错误、
+# 断言/语法层面的坏写法、未定义名。风格类规则留给人工取舍。
+select = ["E9", "F63", "F7", "F82"]
+
+[tool.mypy]
+# 与 CI 的解释器保持一致：设 3.10 时 numpy 2.x 的 PEP 695 stub 会让 mypy
+# 在解析第三方类型时就报错，连第一方代码都检查不到。
+python_version = "3.12"
+ignore_missing_imports = true
+follow_imports = "skip"
+check_untyped_defs = false
+warn_unused_ignores = false
+exclude = ["build/", "dist/", "release/", "scratch/", "tests/"]
+
+[tool.coverage.run]
+source = ["managers"]
+branch = false
+omit = ["tests/*", "build/*", "dist/*", "release/*"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.:",
+    "raise NotImplementedError",
+]

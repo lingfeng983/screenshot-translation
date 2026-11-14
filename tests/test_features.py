@@ -1643,9 +1643,24 @@ def test_config_defaults_in_memory():
         assert broken.get_api_type() == 'edge_free'
         with open(path, encoding='utf-8') as f:
             assert '[Translation]' in f.read(), "坏配置未被修复"
-        assert os.path.exists(path + '.bak'), "修复前没留原文件备份"
-        with open(path + '.bak', encoding='utf-8') as f:
+        # 备份名带时间戳与 PID：连着坏两次也必须各自留一份，不能互相顶掉
+        import glob
+        backups = sorted(glob.glob(path + '.*.bak'))
+        assert len(backups) == 1, "修复前没留原文件备份"
+        with open(backups[0], encoding='utf-8') as f:
             assert f.read() == '这不是配置文件', "备份里不是那份坏文件"
+        assert broken.recovery_notice and backups[0] in broken.recovery_notice, \
+            "没有把备份位置告诉用户"
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write('又坏了一次')
+        ConfigManager(path)
+        backups = sorted(glob.glob(path + '.*.bak'))
+        assert len(backups) == 2, "第二次损坏覆盖了第一份备份"
+        contents = []
+        for backup_path in backups:
+            with open(backup_path, encoding='utf-8') as f:
+                contents.append(f.read())
+        assert '这不是配置文件' in contents and '又坏了一次' in contents
     print("✅ 默认配置只驻内存测试通过\n")
 
 
@@ -3227,7 +3242,15 @@ def test_stale_attachment_delete_failure_is_fatal():
     import tempfile
     from urllib.error import HTTPError
     mod = _load_script('publish_release.py')
-    saved = mod.api_request
+    saved = (mod.api_request, mod.stream_upload)
+    uploaded = []
+
+    def fake_stream_upload(url, path, token, timeout=120):
+        uploaded.append((url, path, timeout))
+        return {'name': os.path.basename(path), 'size': os.path.getsize(path),
+                'browser_download_url': 'https://x/y'}
+
+    mod.stream_upload = fake_stream_upload
     try:
         with tempfile.TemporaryDirectory() as tmp:
             artifact = os.path.join(tmp, 'ScreenshotTranslator-Setup.exe')
@@ -3262,8 +3285,10 @@ def test_stale_attachment_delete_failure_is_fatal():
             # 404 = 旧附件早就不在了，目的已达成，不算失败
             mod.api_request = make_api(404)
             mod.upload_attachment(1, artifact, 't')
+        assert len(uploaded) == 2, "附件应经流式上传发出两次"
+        assert all('uploads.github.com' in url for url, _p, _t in uploaded)
     finally:
-        mod.api_request = saved
+        mod.api_request, mod.stream_upload = saved
     print("✅ 同名旧附件清理失败语义测试通过\n")
 
 

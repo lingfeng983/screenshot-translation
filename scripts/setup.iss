@@ -11,6 +11,18 @@
 ;      ISCC.exe /DMyAppVersion=1.2.0 scripts\setup.iss
 ; 产物：
 ;   release/ScreenshotTranslator-Setup.exe（单文件标准安装器）
+;
+; 代码签名（强烈建议启用）：
+;   本脚本只负责编译，最终 Setup.exe 由 scripts/publish_release.py 的
+;   step_sign() 用环境变量 ST_SIGNTOOL_COMMAND 做 Authenticode 签名，
+;   验签通过后把证书指纹写进随程序分发的
+;   resources/publisher_thumbprint.txt；客户端自动更新据此强制校验签名者。
+;   手工编译时请用同一条命令签名，否则客户端只能按 sha256 摘要校验：
+;     signtool sign /fd sha256 /sha1 <证书指纹> /tr <RFC3161时间戳> /td sha256 \
+;       release\ScreenshotTranslator-Setup.exe
+;   若希望连卸载程序一起签，可改用 Inno 原生 SignTool：给 iscc 传
+;     /Scustom="signtool sign /fd sha256 /sha1 <指纹> /tr <时间戳> /td sha256 $f"
+;   并在 [Setup] 段加 SignTool=custom 与 SignedUninstaller=yes。
 
 #define MyAppName "ScreenshotTranslator"
 #define MyAppNameZh "截图翻译"

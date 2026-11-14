@@ -47,7 +47,7 @@ FONT_MIN_PX = 9
 FONT_MAX_PX = 40
 
 # 结果态排版缓存：只服务当前这一张选区图（见 _layout_cache_for）
-_LAYOUT_CACHE = {}
+_LAYOUT_CACHE: dict = {}
 _LAYOUT_OWNER = None
 _LAYOUT_SCALE = None
 

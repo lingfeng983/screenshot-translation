@@ -25,13 +25,14 @@
 git clone https://github.com/lingfeng983/screenshot-translation.git
 cd screenshot-translation
 
-# 2. 安装依赖
-pip install -r requirements.txt
+# 2. 安装依赖（加 -c constraints.txt 可复现发版时验证过的精确版本）
+pip install -r requirements.txt -c constraints.txt
+#    开发/发版另装：pip install -r requirements-dev.txt -c constraints.txt
 
 # 3. 创建本地配置（含API密钥，不入库）
 copy config.example.ini config.ini
 
-# 4. 启动
+# 4. 启动（Windows 10/11；本项目依赖随 Python 3.14 验证，3.10+ 可跑）
 python main.py
 ```
 
@@ -40,13 +41,14 @@ python main.py
 > 也不需要系统装 Tesseract。模型文件缺失时会提示本地 OCR 组件不完整。
 
 ### 启动程序
-```bash
-# 方法1: 使用批处理脚本（推荐）
-run_fixed.bat
+仓库里没有启动批处理脚本，装好依赖后直接运行：
 
-# 方法2: 直接运行Python
+```bash
 python main.py
 ```
+
+> 若机器上装了多个 Python，请用装了依赖的那个解释器（例如 `py -3.14 main.py`），
+> 或先建并激活虚拟环境；PATH 上默认的解释器缺 pytest/PyQt5 时会报导入错误。
 
 ## 🎯 主要功能
 
@@ -106,7 +108,9 @@ python main.py
 - 十种工具：选择/移动选区、矩形、椭圆、直线、箭头、画笔、荧光笔、文字、序号标记、马赛克
 - 8 色色盘 + **屏幕吸管取色**，线宽 2~8 px 逐像素一档、字号 8~32 px 每 2 px 一档；
   `Ctrl+Z` 撤销、`Ctrl+Y` 重做、清空（垃圾桶图标，与取消的红叉区分）
-- 标注为**烧录语义**：画上即合成进像素，不提供单选/移动单个对象，但可整步撤销
+- 标注默认仍是**烧录语义**（画上即合成进像素），但**最近一次落笔的图元保持可编辑**：
+  可拖动移动、拖手柄缩放、滚轮调线宽/字号，点别处取消选中；橡皮擦可擦掉自己画的图元。
+  更早的图元不再能单独选中，靠 `Ctrl+Z` 整步撤销
 - 选区四边四角都能拖拽缩放，也能整体平移；**移动或缩放后按新范围重新取景**，
   旧标注属于旧画面会一并清空（有提示），不会把旧内容搬到新位置上
 - **提取文字**：工具条「取字」用内置本地 RapidOCR 识别图中文字，按阅读顺序整理后
@@ -115,6 +119,9 @@ python main.py
   任何滚轮消息。后台定时抓帧，用相邻帧的条带模板匹配求重叠量拼成一张长图；
   选区外的横幅实时显示已拼接高度与段数，滚太快出现断层或往回滚都会给出提示。
   点横幅「完成」（或再按一次截图快捷键）结束并复制到剪贴板，点「取消」丢弃。
+  **完成后还会打开独立的长图结果预览窗**（等比缩放看全图、滚轮/Ctrl+滚轮缩放，
+  可在原图上复制、保存）；快速保存开启时同时按 `[Capture]` 配置自动存盘。
+  结果窗是非模态的，遮罩关闭后仍可继续操作。
   滚动期间遮罩会暂时隐藏，否则它会盖住要滚动的页面、也会被拍进长图
 
 **输出**：`Ctrl+C` 复制、`Ctrl+S` 保存、`P` 钉到屏幕、`ESC` 退出；工具条另有
@@ -145,11 +152,15 @@ python main.py
   再查一次，托盘常驻期间也能收到提醒，不阻塞界面
 - 发现新版本时弹**托盘通知**（同一版本只推一次）；右键托盘「检查更新」可随时手动检查
 - 确认更新后**全程在程序内完成**：自动下载安装包（带进度、可取消）→ 校验大小、
-  可执行文件头与 GitHub 附件的 sha256 摘要 → 静默启动安装程序并退出本体 → 装完
-  自动重新打开。不需要去发布页手动下载；发行版没挂安装包时会直接提示"暂无可下载
-  的安装包"
+  可执行文件头与 GitHub 附件的 sha256 摘要（缺失/算法不对直接拒绝）→ 校验发布者
+  签名 → 静默启动安装程序并退出本体 → 装完自动重新打开。不需要去发布页手动下载；
+  发行版没挂安装包时会直接提示"暂无可下载的安装包"
+- 远端 `tag_name`、附件名、下载直链都会先做白名单校验，下载目录再做越界检查，
+  避免被伪造的 Release 响应把文件写到临时目录之外或读到本地文件
 - 下载先用 requests（跟随重定向、读环境代理），证书链校验不过时改用系统信任库
   重试，两条路都失败才报错——不会为了"能装上"而跳过证书校验
+- 发版时若配置了代码签名（见「打包」），客户端会强制核对签名状态与发布者证书指纹；
+  未签名的历史发行版仍只按强制 sha256 摘要放行，并在日志里给出告警
 - 设置页「启动时检查更新」可关闭自动检查（手动检查始终可用）
 - 当前版本来自 `managers/app_version.py`，发版脚本会自动写入本次版本号
 
@@ -166,9 +177,34 @@ python main.py
 
 还可配置：
 - **目标语言** - 中文 / 英语
-- **降级API** - 主API失败后自动切换的备用API；整条降级链的最后会依次兜底尝试 Edge 免费翻译、谷歌免费翻译
+- **降级API** - 主API失败后自动切换的备用API。默认情况下降级链到此为止，
+  **不会**再自动把原文转给 Edge / 谷歌免费接口；需要该行为请在设置页「隐私」分组
+  勾选「主接口失败时自动改用免费接口」（或设 `allow_free_fallback = true`）
 - **测试翻译** - 保存前先验证当前API配置是否可用（后台线程执行，不会卡住设置窗口）
 - **截图遮罩** - 磁吸阈值（`snap_threshold`，0~48px，选区吸附窗口边缘的距离）与暗角透明度（`dim_opacity`，0~180），滑条调节，下次截图生效
+
+### 隐私与数据
+设置页「隐私」分组集中管理四个开关，默认按最小外发/最小留存配置：
+
+| 开关 | 默认 | 说明 |
+| --- | --- | --- |
+| 保存翻译缓存 | 开 | `translation_cache.json` 以**明文**保存截图识别出的原文与译文，24 小时过期、最多 1000 条；关闭时会立即清掉内存与磁盘文件 |
+| 退出时清空缓存 | 关 | 每次退出清空，磁盘上不留明文 |
+| 免费接口兜底 | 关 | 开启后主接口失败才会把原文自动发给 Edge / Google 免费端点 |
+| 启动预热 | 关 | 开启后在启动时向当前免费接口发一次固定的 `Hello` 请求，换取首译更快 |
+
+- **立即清空翻译缓存**按钮随时清除已落盘的明文，不需要重启。缓存文件与
+  `config.ini` 一样在写盘前收紧权限（POSIX 下 `0o600`），避免同机其它用户读到明文。
+- API 密钥优先从环境变量读取（`BING_API_KEY` / `BAIDU_API_KEY` / `BAIDU_APP_ID` /
+  `YOUDAO_API_KEY` / `YOUDAO_APP_ID`）；在设置页手填的密钥会以**明文**写入
+  `config.ini`，该文件已排除出版本库与安装包，建议改用环境变量注入。
+- 谷歌免费接口用表单编码的 **POST** 把原文放在请求体，不再拼进 URL 查询串
+  （查询串会被代理/CDN/访问日志原样记录）。
+- 配置文件损坏时会先备份成带时间戳的 `config.ini.<时间>-<PID>.bak` 再覆盖，
+  并通过托盘通知告知备份位置；旧版留在安装目录的明文配置/缓存迁移成功后会删除，
+  删不掉时给出明确告警。
+- 自动更新强制校验 sha256 摘要、净化远端标签与路径，并支持强制核对
+  Authenticode 发布者指纹（见「打包」）。
 
 ### OCR识别
 识别引擎**固定为本地 RapidOCR**，代码里写死，设置窗口不再提供引擎选择：
@@ -297,11 +333,13 @@ set ST_ALLOW_MULTI_INSTANCE=1 && python main.py
 ScreenshotTranslation/
 ├── main.py              # 主程序入口（含设置窗口）
 ├── config.py            # 配置管理（[Translation]/[OCR]/[Overlay]/[Capture]/[Hotkey]/[Startup]/[Update]）
-├── config.ini           # 配置文件（旧版本自动迁移补齐新段）
+├── config.ini           # 配置文件（改过设置才生成，旧版本自动迁移补齐新段）
 ├── CHANGELOG.md         # 更新日志
-├── requirements.txt     # 依赖列表（跑程序）
-├── requirements-dev.txt # 开发/发版工具（pytest、PyInstaller）
-├── run_fixed.bat        # 启动脚本
+├── requirements.txt     # 依赖列表（跑程序，兼容范围）
+├── requirements-dev.txt # 开发/发版工具（pytest / ruff / PyInstaller）
+├── constraints.txt      # 已验证的精确版本（配合 -c 复现）
+├── pytest.ini / pyproject.toml  # 测试标记、ruff / mypy / coverage 配置
+├── .github/workflows/ci.yml     # CI：语法检查、ruff、mypy、全量测试
 ├── screenshot-translator.spec  # PyInstaller onedir 打包配置（含依赖裁剪）
 ├── scripts/
 │   ├── publish_release.py       # 一条命令出包＋发版（测试→构建→Setup→发 Release）
@@ -334,6 +372,8 @@ ScreenshotTranslation/
 │   ├── capture_output.py    # ★ 截图输出（格式/质量/目录/模板/快速保存）
 │   ├── capture_ocr.py       # ★ 本地 OCR 取字 + 可编辑结果窗
 │   ├── capture_scroll.py    # ★ 长截图（手动滚动/选区抓帧/条带模板匹配/长图拼接）
+│   ├── scroll_result.py     # ★ 长图结果预览窗（缩放/复制/保存）
+│   ├── update_checker.py / update_installer.py  # 更新检查、下载校验与签名核对
 │   ├── vector_icons.py      # ★ 程序化矢量图标（提取/保存/复制 + 标注工具）
 │   ├── pin_window.py        # ★ 结果钉屏浮窗（可多开、置顶、右键菜单）
 │   ├── styles.py            # ★ 浅色 QSS（调色板驱动）
@@ -383,6 +423,26 @@ iscc.exe /DMyAppVersion=1.7.0 scripts\setup.iss
 > 上面两步 `python scripts/publish_release.py --version 1.7.0` 一条命令串完，
 > 顺带提交、打 tag、发 Release。编译安装脚本需要 Inno Setup 7。
 
+### 发版预检与代码签名
+`publish_release.py` 在**任何写操作之前**先做全只读预检：干净工作树、CHANGELOG
+是否有 `[Unreleased]`（没有会立刻退出，不会再出现"包都编完了才失败"）、tag 与
+HEAD 一致、版本号常量可写、复用产物是否齐备、origin 是否为发布目标仓库。
+提交时只 `git add` 显式清单（CHANGELOG、版本号、指纹文件），不会把工作区里
+没审查完的改动带进发布。
+
+发布包建议做 Authenticode 签名：设置环境变量 `ST_SIGNTOOL_COMMAND`，命令里用
+`$f` 代表待签名的 Setup.exe，例如
+
+```powershell
+$env:ST_SIGNTOOL_COMMAND = 'signtool sign /fd sha256 /sha1 <证书指纹> /tr http://timestamp.digicert.com /td sha256 "$f"'
+python scripts/publish_release.py --version 1.7.0
+```
+
+发版脚本编译后签名、验签，并把证书指纹写进 `resources/publisher_thumbprint.txt`
+（随包分发、纳入提交）；客户端自动更新会强制核对签名状态与指纹。未配置签名时
+只打印告警，仍按强制 sha256 摘要放行历史发行版。手工编译时请自行对
+`release/ScreenshotTranslator-Setup.exe` 执行同一条签名命令。
+
 RapidOCR 的 PP-OCRv6 检测/识别/方向分类模型（约 30MB）与 ONNX Runtime 都打进
 `_internal/`，安装时不再下载任何组件、也不需要系统装 Tesseract：装完即可断网识别。
 安装器用 `lzma2/ultra64` 压缩换取更小的下载体积（约 250MB 目录 → 约 83MB 安装包）。
@@ -399,7 +459,8 @@ exe 启动即加载本目录下的 `_internal`，不再解包到临时目录。�
 你**改过设置之后**才生成，默认配置全程在内存里用，不会凭空丢一个文件出来。
 产物目录保持只读——放进
 Program Files 或整目录覆盖升级都不会丢配置；旧版本留在 exe 同目录的配置与缓存
-首次启动会自动搬进该目录（只补缺，不覆盖已有文件）。源码运行仍在项目根。
+首次启动会自动搬进该目录（只补缺，不覆盖已有文件），副本校验一致后会删除程序
+目录里的明文原件，删不掉时打明确告警。源码运行仍在项目根。
 
 ### 测试
 ```powershell
@@ -408,10 +469,18 @@ $env:PYTHONIOENCODING = "utf-8"
 python -m pytest tests/ -q -rs                 # 全程离线，发版前必跑
 $env:ST_RUN_ONLINE = "1"; python -m pytest tests/ -q -m ""   # 追加真连各翻译接口
 $env:ST_RUN_SMOKE = "1"; python -m pytest tests/ -q -m ""    # 追加真拉起 main.py（会注册全局热键）
+ruff check --select E9,F63,F7,F82 .           # CI 同款零误报静态检查
+mypy -p managers                              # CI 同款类型检查（配置见 pyproject.toml）
+python -m pytest tests/ --cov=managers --cov-report=term-missing  # 覆盖率
 ```
+
+> 机器上装了多个 Python 时，用装依赖的那个解释器跑（如
+> `py -3.14 -m pytest tests/ -q -rs`）；默认 PATH 上的解释器可能缺
+> pytest/PyQt5。CI（`.github/workflows/ci.yml`）在 Windows + Python 3.12 上
+> 依次跑依赖一致性检查、语法检查、ruff、mypy 与全量离线测试。
 不跑 pytest 也能直接 `python tests/test_features.py`：用例由 `tests/_runner.py`
 按模块命名空间发现（不再手抄名单），需要 pytest fixture 的那几条会列出名字而不是
-静默跳过。开发/发版工具装在 `requirements-dev.txt`（pytest、PyInstaller）。
+静默跳过。开发/发版工具装在 `requirements-dev.txt`（pytest、pytest-cov、ruff、mypy、PyInstaller）。
 界面用例跑在临时数据目录里：配置、缓存、日志、OCR 路径都被重定向到 tmp，
 不碰项目根的 `config.ini`；模态弹窗换成记录型假弹窗，所以保存流程会真的走一遍。
 遮罩断言用真实平台的 `grab()` 取像素（offscreen 平台没有中文字体，绘制会静默失败），

@@ -18,7 +18,7 @@ _COLOR_TOP = (41, 128, 236)
 _COLOR_BOTTOM = (26, 92, 200)
 _COLOR_BUBBLE = (255, 255, 255, 235)
 
-_ICON_CACHE = {}
+_ICON_CACHE: dict = {}
 
 
 def _rounded_gradient(size):

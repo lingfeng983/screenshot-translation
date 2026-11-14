@@ -527,7 +527,8 @@ def test_non_json_response_is_classified():
     from managers.providers.edge_free import EdgeFreeProvider
     from managers.providers.google_free import GoogleFreeProvider
 
-    for cls, verb in ((EdgeFreeProvider, 'post'), (GoogleFreeProvider, 'get')):
+    # 谷歌免费接口改用 POST：原文放请求体，不进 URL 查询串
+    for cls, verb in ((EdgeFreeProvider, 'post'), (GoogleFreeProvider, 'post')):
         provider = cls()
         resp = mock.Mock()
         resp.status_code = 200

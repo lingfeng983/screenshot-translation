@@ -321,3 +321,116 @@ def test_overlay_loading_spinner_replaces_text(qapp):
     assert '_draw_loading_spinner(painter, rect)' in source, '加载态没有画转圈'
     assert "_draw_pill(painter, rect, '识别并翻译中" not in source, \
         '加载态又出现了文字提示'
+
+
+# ---------------------------------------------------------------- 自动识别中英互译
+
+def test_auto_detect_translates_chinese_to_english(qapp, monkeypatch):
+    """默认自动识别：中文原文提交的目标语言是英文"""
+    pool = _FakePool()
+    _use_pool(monkeypatch, pool)
+    window = _make_window(qapp, _FakeTranslationManager())
+    try:
+        assert window.lang_combo.currentData() == 'auto', '默认应为自动识别'
+        window.source_edit.setPlainText('你好，世界')
+        assert window.current_language('你好，世界') == 'en'
+        assert '中文 → 译为英文' in window.hint_label.text()
+        window._on_translate()
+        _func, args = pool.calls[0]
+        assert args == ('你好，世界', 'en', 1), f'中文没译为英文: {args}'
+    finally:
+        window.close()
+
+
+def test_auto_detect_translates_english_to_chinese(qapp, monkeypatch):
+    """英文原文提交的目标语言是中文；同一份文本不重复自动翻译"""
+    pool = _FakePool()
+    _use_pool(monkeypatch, pool)
+    window = _make_window(qapp, _FakeTranslationManager())
+    try:
+        window.source_edit.setPlainText('Hello, world')
+        assert window.current_language('Hello, world') == 'zh'
+        assert '英文 → 译为中文' in window.hint_label.text()
+        window._on_auto_translate()
+        window._on_auto_translate()
+        assert len(pool.calls) == 1, '自动识别结果没参与去重'
+        assert pool.calls[0][1][1] == 'zh'
+    finally:
+        window.close()
+
+
+def test_manual_language_overrides_auto_detection(qapp, monkeypatch):
+    """手动选定目标语言时不再按原文自动切换"""
+    pool = _FakePool()
+    _use_pool(monkeypatch, pool)
+    window = _make_window(qapp, _FakeTranslationManager())
+    try:
+        window.source_edit.setPlainText('你好，世界')
+        window.lang_combo.setCurrentIndex(window.lang_combo.findData('zh'))
+        window._on_auto_translate()
+        assert window.current_language('你好，世界') == 'zh'
+        assert pool.calls[0][1] == ('你好，世界', 'zh', 1)
+    finally:
+        window.close()
+
+
+def test_translate_page_combo_has_drawn_chevron(qapp):
+    """文本翻译页的下拉也要用自绘箭头控件，不能是样式表方块"""
+    from managers.toolbar_combo import ChevronComboBox
+    window = _make_window(qapp, _FakeTranslationManager())
+    try:
+        assert isinstance(window.lang_combo, ChevronComboBox)
+    finally:
+        window.close()
+
+
+def test_clear_invalidates_inflight_request(qapp, monkeypatch):
+    """忙碌时点清空：作废请求序号、立刻结束忙碌态，旧译文不得回填"""
+    pool = _FakePool()
+    _use_pool(monkeypatch, pool)
+    window = _make_window(qapp, _FakeTranslationManager('迟到的译文'))
+    try:
+        window.source_edit.setPlainText('Hello')
+        window._on_translate()
+        _func, args = pool.calls[0]
+        request_id = args[2]
+        assert window._busy is True
+
+        window._on_clear()
+        assert window._busy is False, '清空后按钮还灰着'
+        assert window._request_id > request_id, '没有作废在飞请求'
+
+        window._apply_result(request_id, '迟到的译文', '')
+        assert window.result_edit.toPlainText() == '', '清空后旧译文又冒出来了'
+        assert window.copy_button.isEnabled() is False
+
+        # 清空后仍能正常发起新请求
+        window.source_edit.setPlainText('World')
+        window._on_translate()
+        assert len(pool.calls) == 2 and pool.calls[1][1][2] == window._request_id
+    finally:
+        window.close()
+
+
+def test_source_language_detection_handles_mixed_and_other_scripts(qapp):
+    """中文夹英文按比例判方向；日文/韩文/纯符号不再被误判成中文或英文"""
+    from managers.translate_window import TranslateWindow
+
+    cases = (
+        ('你好，世界', 'zh'),
+        ('Hello, world', 'en'),
+        ('这是 Windows 快捷键', 'zh'),
+        ('This is 中文 test', 'en'),
+        ('こんにちは世界', None),      # 假名 + 汉字，不该当成中文
+        ('안녕하세요', None),          # 谚文
+        ('12345 !@#', None),          # 纯数字/符号
+    )
+    for text, expected in cases:
+        assert TranslateWindow._detect_source_language(text) == expected, text
+
+    window = _make_window(qapp, _FakeTranslationManager())
+    try:
+        # 认不出语种时按全局目标语言兜底
+        assert window._detect_target_language('12345 !@#') == 'zh'
+    finally:
+        window.close()

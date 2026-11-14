@@ -22,6 +22,7 @@ import logging
 import pkgutil
 import re
 import time
+from typing import Any
 
 from .retry_handler import (
     ChainExpiredError, NonRetryableError, default_retry_handler)
@@ -326,7 +327,8 @@ class BaseProvider:
     name = ''
     display_name = ''
     # (字段名, UI显示名, 是否密码框)；字段名同时是对应配置段中的选项名
-    config_fields = ()
+    # 显式标注元组元素类型：否则子类赋非空元组会被静态检查判成类型不兼容
+    config_fields: tuple[tuple[str, str, bool], ...] = ()
 
     # 单次请求的读超时上限（秒）：接口真挂了要的是尽快降级，而不是干等
     _READ_TIMEOUT = 10
@@ -539,7 +541,9 @@ class ProviderChainManager:
     并可覆盖 _default_retry_handler() 指定默认重试器。
     """
 
-    _registry = None
+    # 子类会赋成各自的 ProviderRegistry；Any 让"基类只约定存在、具体类型由子类定"
+    # 这件事对 mypy 显式成立，而不是被推断成 NoneType
+    _registry: Any = None
     _default_provider_name = ''
     _failure_prefix = '[失败'
 

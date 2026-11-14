@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt -r requirements-dev.txt
+          python -m pip check
+
+      - name: Syntax check (first-party sources)
+        run: python -m compileall -q main.py config.py managers scripts tests
+
+      - name: Lint (fatal rules only)
+        run: ruff check --select E9,F63,F7,F82 main.py config.py managers scripts tests
+
+      - name: Type check (mypy)
+        run: mypy -p managers
+
+      - name: Tests
+        env:
+          # 不设 QT_QPA_PLATFORM=offscreen：遮罩冻结、就地覆盖等用例要用真实
+          # 平台的 grab() 取像素，offscreen 下绘制会静默失败导致伪阳性。
+          PYTHONIOENCODING: utf-8
+        run: python -m pytest tests -q -rs
